@@ -11,5 +11,8 @@
   },
   "dependencies": {
     "@cankan/cli": "workspace:*"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

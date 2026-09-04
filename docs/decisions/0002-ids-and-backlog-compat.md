@@ -523,6 +523,35 @@ output.
   Separately (Decision point 5): frontmatter `id:` values must be
   compared case-insensitively (`ck-1` == `CK-1`) but serialized with
   whatever casing was actually read from disk.
+- **M2.2** (`ticket/id.ts`, and wherever the `backlog/tasks/<ID> -
+  <title>.md` filename is constructed) must sanitize the title segment
+  before it ever reaches a filesystem path, and validate the resulting
+  path stays inside the board's tickets directory. Neither this ADR nor
+  0001 mentions sanitization or path containment anywhere before this
+  note, and this repo's ticket-file layout (`backlog/tasks/<ID> -
+  <title>.md`, Context above) puts an attacker-influenceable string
+  directly into a filename. The title is attacker-influenceable in
+  realistic paths, not only a contrived one: a ticket created from a
+  PR description, an agent prompted (deliberately or not) into minting a
+  ticket with a hostile title, and `cankan import` minting filenames
+  directly from **remote issue titles** it does not control. A title
+  containing `/`, `\`, or `..` can write outside `backlog/tasks/`; the
+  `.md` suffix narrows the useful targets but does not contain the
+  write - a traversal can still land inside another directory and simply
+  end in `.md`, and not every consumer of a directory tree cares about
+  that suffix. Separately, `tickets_dir` is itself checked-in, repo-level
+  config (`CONCEPT.md:281`), so a hostile repo can retarget where ticket
+  writes land in the clone even with a fully sanitized title. Required:
+  (1) a slug sanitizer for the title segment - strip `/`, `\`, NUL and
+  other control characters, reject or strip a leading `.`, and cap
+  length; (2) a realpath containment check on the fully-constructed
+  path, verifying it resolves inside a `tickets_dir` that itself
+  resolves inside the board root, before any write. **`cankan adopt
+  backlog` and `cankan import` inherit this requirement** - both mint
+  filenames from data CanKan does not itself author (pre-existing
+  `task-N` titles on adopt; remote issue titles on import) and must run
+  through the same sanitizer and containment check as any other ticket
+  write, not a separate or looser path.
 - **M4.10** (`packages/core/test/backlog-compat.test.ts`): pin
   **`backlog.md@1.51.0`** for the CI install referenced there and in
   PLAN.md's "CI installs a pinned version" note. The test must also set

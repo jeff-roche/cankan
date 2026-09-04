@@ -331,8 +331,47 @@ for no additional correctness benefit.
 
 ### M2.6 (`git/adapter.ts`) must implement
 
-- **`readRef(ref)`**: `git rev-parse --verify <ref>`, returning `null` if
-  the ref doesn't exist (spike's `git-plumbing.ts:102`).
+- **`readRef(ref)`**: `git rev-parse --verify --end-of-options <ref>`,
+  returning `null` if the ref doesn't exist (spike's `git-plumbing.ts:102`
+  did not use `--end-of-options`; see the argument-injection hygiene note
+  below).
+- **The `ref` argument must be validated before it reaches `readRef`,
+  `updateRefCAS`, `readBlobFromRef`, `commitTreeToRef`, or either side of
+  any push/fetch refspec (steady-state or reconciliation).** CONCEPT.md's
+  config schema (`CONCEPT.md:290-292`) sources this value as
+  `coordination.ref` in `.cankan/config.yml` — checked-in, repo-level
+  config that a hostile or merely misconfigured repo controls, not
+  something M2.6 can trust by construction. Direct verification for this
+  ADR reproduced the abuse on git 2.55: pointing the configured ref at
+  `refs/heads/main` makes `readRef` return `main`'s tip as `oldSha`, the
+  off-tree tree-build preserve `main`'s tree as the base, `commitTree`
+  parent onto it, and the mandated `<ref>:<ref>` refspec push deliver the
+  result to the remote as an ordinary fast-forward — a commit silently
+  appended to `main`, indistinguishable from a legitimate commit once
+  pushed. `HEAD` works identically, since `update-ref` dereferences it.
+  **M2.6 must reject any ref that does not match
+  `^refs/cankan/[A-Za-z0-9._/-]+$` and also pass it through `git
+  check-ref-format`, before it reaches any of the git invocations
+  above.** `check-ref-format` alone is not sufficient — confirmed:
+  `refs/heads/main` is itself a syntactically valid ref name and passes
+  it — the prefix anchor is the actual guard; `check-ref-format` only
+  catches malformed syntax within an already-namespaced value. **The
+  config layer that loads `.cankan/config.yml` (M2.3) is jointly
+  responsible**: it should reject an out-of-namespace `coordination.ref`
+  at load time, not leave M2.6 as the only backstop.
+- **Every git invocation that takes a ref, path, or commit derived from
+  config or from the coordination ref's own content should pass
+  `--end-of-options`** immediately before that argument, in addition to
+  the ref validation above — `git rev-parse --verify --end-of-options
+  <ref>` and `git update-ref --end-of-options <ref> <sha> <old>` both
+  verified working on git 2.55. Array-form argv (already used throughout
+  the spike's `git-plumbing.ts`) stops shell-metacharacter injection but
+  not argument injection: a value beginning with `-` could otherwise be
+  parsed as a flag instead of the intended ref/path/commit. A
+  leading-dash ref currently fails closed regardless (git rejects it as
+  an invalid ref name before this would matter), so this is hygiene, not
+  a live gap — but it is mechanical, costs nothing, and belongs in the
+  spec now, before config-fed values are wired through it.
 - **`updateRefCAS(ref, newSha, oldSha)`** — new value second, old value
   third; see "PLAN.md notation should be revised" below for why this
   order is stated explicitly. Implementation: `git update-ref <ref>
@@ -358,17 +397,44 @@ for no additional correctness benefit.
   working tree (spike's `git-plumbing.ts:64`, `coordination.ts:102`).
 - **`readBlobFromRef(ref, path)`** (named in `PLAN.md`'s M2.6 line, not
   given its own spec by the spike directly): resolve `ref` to a commit,
-  then read `<path>` at that commit — `git cat-file -p <commit>:<path>`,
-  exactly the spike's `readFileAtCommit` (`git-plumbing.ts:129`). Return
-  the blob's content as a string when it exists; return `null`, not
-  throw, when the path doesn't exist at that commit — the spike's version
-  keys this off `cat-file`'s exit code, treating any non-zero exit as
-  "not found" (`git-plumbing.ts:134-135`) rather than distinguishing
-  "file missing" from other errors, which is adequate for what this is
-  used for here: reading a specific month's JSONL file (which may not
-  exist yet — no claims that month is not an error) and reading it at a
-  specific historical commit (rebuilding state at a point in time).
-  Callers must treat `null` as "empty," not "failure."
+  then read `<path>` at that commit. **Do not key this off `cat-file`'s
+  exit code the way the spike's `readFileAtCommit` does**
+  (`git-plumbing.ts:129`, `134-135`): `git cat-file -p <commit>:<path>`
+  exits 128 both for a genuinely absent path and for every other kind of
+  failure — confirmed directly, indistinguishable by exit code alone.
+  Treating any non-zero exit as "not found" turns a real read failure
+  (e.g., a blobless partial clone that can't lazy-fetch that month's blob
+  while offline) into "no claims this month" — silently granting a claim
+  on a held ticket, the exact mutual-exclusion guarantee this whole
+  design exists to provide, failing open. Worse: if `<path>` names a tree
+  (mode `040000`) or a symlink (`120000`) rather than a blob, `cat-file
+  -p` succeeds at exit 0 and prints a directory listing or the symlink's
+  link target, respectively — confirmed directly — which then reaches
+  the unguarded `JSON.parse` at `coordination.ts:56` (see failure mode 8,
+  widened below). Implement a three-way check instead: run `git ls-tree
+  <commit> -- <path>` first (confirmed: this exits 0 whether or not the
+  path exists — check the *output*, not the exit code); empty output
+  means no entry, return `null`; a `100644` blob entry means read it via
+  `cat-file`; any other mode (`040000` tree, `120000` symlink, `160000`
+  submodule) or any non-zero exit from either command is a typed hard
+  error that **aborts the caller's operation** — never silently treated
+  as "empty." **This is inherited by every consumer of
+  `readBlobFromRef`**: M2.6 (the primitive itself), M2.7 (every
+  claim/event read), and M2.8 (fold reads via M2.7) must all propagate
+  the hard-error case rather than defaulting to "no data."
+
+  Separately, for M2.7: **git's own path-traversal guard (`verify_path`,
+  rejecting `../`, `.git/…`, and absolute paths) applies only on the
+  tree-*write* side** (`update-index --cacheinfo` — confirmed it rejects
+  `../outside.txt` with `error: Invalid path`) — **not on the read
+  side**, where `<rev>:../path` is meaningful git syntax for navigating
+  within a tree rather than a filesystem escape, and is not rejected the
+  way a cacheinfo write of the same string would be. M2.7 must neither
+  duplicate the write-side check where it doesn't apply, nor assume the
+  read side carries protection it doesn't have — the three-way
+  `ls-tree`/mode check above is what governs what a read path may
+  resolve to; it is not a substitute for `verify_path`, and `verify_path`
+  is not a substitute for it.
 - **Retry/backoff policy on CAS contention**: on rejection, **re-read the
   ref and re-check the claim state before retrying the write** — never
   blindly retry the same write. This is what the spike's `claimViaCAS`
@@ -442,6 +508,62 @@ for no additional correctness benefit.
   build commit off-tree → `updateRefCAS` → on rejection, re-read and
   re-check rather than blind-retry) from "claim" events to the full event
   union.
+- **The event union this ADR asks M2.7 to generalize to is not fully
+  named here or by CONCEPT.md.** CONCEPT.md §3 (`CONCEPT.md:160`) names
+  five event types — `claim | release | renew | move | comment` — but
+  0002 (M1.3's ADR, `0002` Decision point 2 and Consequences) assumes
+  `alias` and `external-write` events also exist, for Backlog.md-adoption
+  relabeling and for detecting a foreign write to a ticket file,
+  respectively. 0002 hedges its own reliance on them, but M2.7 must not
+  build `events/schema.ts` strictly to CONCEPT.md's five-type union — it
+  needs at least `alias` and `external-write` alongside the five
+  CONCEPT.md names. **`alias` is a redirect primitive living in the same
+  unvalidated log the next bullet addresses**: a pushed `alias` event
+  from a legitimate ticket id to an attacker-chosen ticket id would
+  reroute `cankan show <id>` (and any other alias-resolving lookup) to
+  the attacker's ticket, under the same untrusted-writer conditions as
+  below — schema validation must apply to `alias` events with the same
+  rigor as `claim` events, not treat redirect events as lower-risk.
+- **Every event must be validated against `events/schema.ts` at the
+  boundary — before it enters the log or the fold — not merely cast.**
+  The spike's `parseEvents` does `JSON.parse(line) as ClaimEvent`
+  (`coordination.ts:51-57`): a TypeScript cast, not a runtime parse, over
+  data written by whoever has push access to the ref — a
+  mutually-distrusting peer, not a trusted process. `append`/`read` must
+  validate every field's type and shape, and bound `ts` to a sane window,
+  before an event is usable by anything downstream. **Ordering authority
+  is the event's position in the append-only chain, not a
+  remote-supplied `ts`.** Implemented literally against untrusted `ts`
+  values: a backdated `ts` would win any "earliest timestamp" tie-break
+  (claim theft), and a far-future `ts` would defeat a lease-expiry check
+  that trusted it (a permanently unclaimable ticket) — see the
+  reconciliation tie-break bullet below, revised accordingly. **Duplicate
+  event ids must be resolved by rejecting the duplicate when its content
+  differs from the existing event, not by silently picking one** — this
+  ADR's "dedupe by event id" language (below) never specified which copy
+  survives, and a differing-content duplicate is itself a sign of a
+  hostile or buggy peer, not a benign coincidence. Also record: **`actor`
+  is not an authenticated identity.** It is whatever string the writer
+  put in the event, bounded only by who has push access to the ref —
+  nothing here binds it to a git identity, a signed commit, or any other
+  credential. `state/fold.ts` (M2.8) will surface `actor` as though it
+  identifies who made a claim; it does not, and M2.8's design should
+  account for that rather than treating a claim's `actor` field as
+  trustworthy attribution.
+- **Ticket IDs must be canonicalized before use as an event-log or
+  coordination-ref key — this ADR did not previously say where.** 0002
+  established that Backlog.md writes uppercase `id: CK-1` while CanKan's
+  own convention and filenames stay lowercase, and assigned
+  case-insensitive lookup with casing-preserving write to M2.2's ticket
+  store — but the spike's `findClaim` (`coordination.ts:70`) does exact
+  string equality on `ticket`, and neither M2.6's nor M2.7's Consequences
+  mentioned normalization until now. A claim appended under `ck-1` and a
+  lookup for `CK-1` (or vice versa) would silently fail to match — the
+  same double-claim class as failure mode 9, via casing instead of a
+  month boundary. **M2.7's `append`/`read` must canonicalize the
+  `ticket` field (lowercase, matching CanKan's on-disk convention) before
+  using it as a key, on both write and read**, so casing never affects
+  whether two references to the same ticket collide in the log.
 - **Monthly JSONL layout** under the ref, unchanged from the spike:
   `events/<yyyy-mm>.jsonl`, one JSON object per line, appended in order.
   **The claim-lookup logic built on top of this layout must not be
@@ -470,10 +592,16 @@ for no additional correctness benefit.
   from two machines that were both offline, `append`/`log.ts` must
   **preserve both events** (never silently drop one during reconciliation
   — the log is append-only) so that `state/fold.ts` (M2.8) can apply a
-  deterministic tie-break (e.g., earliest timestamp wins) and the losing
-  claimant can be told. This ADR does not design that tie-break — it only
-  flags that the event log's reconciliation step must not be the place
-  that silently resolves the conflict by dropping data.
+  deterministic tie-break and the losing claimant can be told. **That
+  tie-break must not use "earliest timestamp wins"**: `ts` is a
+  remote-supplied field (see above), and a backdated one would win every
+  time under that rule; the tie-break must key on something the
+  reconciliation process itself controls (e.g., position in the rebuilt
+  commit chain, or an explicit ordering rule M2.8 defines) instead of
+  trusting either side's clock. This ADR does not design that tie-break —
+  it only flags that the event log's reconciliation step must not be the
+  place that silently resolves the conflict by dropping data, and that
+  whatever M2.8 does design must not be `ts`-based.
 
 ### CONCEPT.md should be revised
 
@@ -523,6 +651,30 @@ Consequences above). `PLAN.md:243`'s notation is the one that should be
 revised to match — an implementer reading both documents together should
 not have to guess which argument order is authoritative on a
 compare-and-swap, where getting it backwards silently inverts the check.
+
+`PLAN.md:244` scopes M2.6's *Depends on* to M2.1 and M1.2 only, and
+`PLAN.md:250` scopes M2.7's *Depends on* to M2.6 only — neither lists
+M1.3 (0002, this repo's IDs-and-Backlog.md-compatibility ADR). Followed
+literally, an implementer working from the dependency graph alone would
+never read 0002 and would miss the ticket-ID casing-canonicalization
+requirement this ADR now states in M2.7's Consequences above (0002
+established the casing behavior; this ADR is the one that says where it
+must be applied as an event-log/coordination-ref key). `PLAN.md:244` and
+`PLAN.md:250` should be revised to add M1.3 to both *Depends on* lines.
+
+`PLAN.md:248` (M2.7's *Creates* line) already lists `mode: branch-scan`
+fallback reads as a deliverable: "`events/ref.ts` (initialize the ref;
+`mode: branch-scan` fallback reads `.cankan/events/` in-tree instead)."
+This conflicts with this ADR's Alternatives considered (above), which
+directs that `branch-scan` remain documented as a fallback and "not
+[be] implemented speculatively now." `PLAN.md:248` should be revised to
+match this ADR's decision. Stated plainly, so M2.7 does not have to
+adjudicate the conflict itself: **M2.7 does not need to implement or
+stub the `branch-scan` mode switch.** `shared-ref` passed every scenario
+this spike tested, with no result here motivating the fallback (see
+Alternatives considered); M2.7 may defer `branch-scan` entirely until a
+concrete blocker to `shared-ref` actually appears, rather than building
+a mode switch for a path with no current evidence behind it.
 
 ## Known failure modes
 
@@ -598,13 +750,21 @@ inferred from the mechanism):
    its lease expired still reports `already_claimed`. Code must: implement
    the expiry check as part of M2.6/M2.7's claim-lookup logic, not assume
    the spike's unconditional "latest claim wins" lookup is the full spec.
-8. **Malformed JSONL entry in the event log — reasoned, not tested.** A
-   corrupted or partially-written line in a monthly event file would
-   throw on `JSON.parse` (spike's `coordination.ts:56`, unguarded). User
-   sees: a hard crash reading board state instead of a clear error. Code
-   should: skip-and-warn with file/line context, or fail with a
-   diagnosable error identifying the offending ref/commit/file, rather
-   than an unguarded parse exception.
+8. **Malformed or non-blob event-log content — partly observed, partly
+   reasoned.** Two distinct issues reach the same unguarded `JSON.parse`
+   (`coordination.ts:56`): (a) a corrupted or partially-written *line*
+   within an otherwise-valid monthly JSONL blob — reasoned, not tested —
+   throws a `JSON.parse` syntax error; (b) the month path resolving to
+   something other than a blob (a tree or a symlink), or a genuine read
+   failure being misread as "not found" — confirmed directly (see
+   `readBlobFromRef` in Consequences) — feeds a directory listing or a
+   symlink target into the same parser. User sees: a hard crash reading
+   board state (a), or a silently-granted double-claim (b), instead of a
+   clear error either way. Code must: validate the path resolves to a
+   blob before parsing at all (`readBlobFromRef`'s three-way `ls-tree`
+   check), and, for (a), skip-and-warn with file/line context or fail
+   with a diagnosable error identifying the offending ref/commit/file,
+   rather than an unguarded parse exception.
 9. **Cross-month claim blindness — reasoned, not implemented; this is a
    substantive gap, not an edge case.** `eventFilePath()` defaults to the
    current UTC month (`coordination.ts:26`), and both `claimViaCAS` and
@@ -624,3 +784,37 @@ inferred from the mechanism):
    more generally at least as many trailing months as the longest
    configurable lease can span — never assume the current month's file is
    a complete picture of active claims.
+10. **Coordination ref configured outside its namespace — observed,
+    confirmed by direct verification for this ADR.** `coordination.ref` in
+    `.cankan/config.yml` is checked-in, repo-level config
+    (`CONCEPT.md:290-292`); nothing before M2.3's config loader or
+    M2.6's own validation (see Consequences) stops it from naming
+    `refs/heads/main`, `HEAD`, or any other ref. Reproduced directly:
+    with the ref pointed at `refs/heads/main`, the CAS mechanism reads
+    `main`'s tip, builds a new commit preserving `main`'s tree and
+    parented on it, and the CAS write succeeds — a claim event is
+    silently appended as a commit on `main`, which the mandated
+    `<ref>:<ref>` push then delivers to the remote as an ordinary
+    fast-forward. User sees: an extra commit on `main` (or whatever
+    branch was named) with no attribution to CanKan and no error
+    anywhere in the claim flow. Code must: validate `ref` against
+    `^refs/cankan/[A-Za-z0-9._/-]+$` and `git check-ref-format` before it
+    reaches any git invocation — in both M2.6 (defense at the point of
+    use) and M2.3's config loader (defense at load time, so a bad
+    config value never reaches a working board at all).
+11. **Untrusted event fields accepted at face value — reasoned, not
+    tested; directly derivable from the spike's own code.** The spike
+    parses events with `JSON.parse(line) as ClaimEvent`
+    (`coordination.ts:51-57`) — a cast, not a validated parse — over a
+    log anyone with push access to the ref can write to. User sees:
+    nothing wrong-looking. A backdated `ts` silently wins a
+    reconciliation tie-break meant to resolve an honest race (claim
+    theft); a far-future `ts` can defeat a lease-expiry check that
+    trusts it (a ticket that never becomes reclaimable); a duplicate
+    event id with different content silently substitutes for the real
+    event if "dedupe by id" doesn't specify which copy survives. Code
+    must: validate every event against `events/schema.ts` at the
+    boundary (see Consequences), treat position in the append-only
+    chain — not `ts` — as ordering authority, reject rather than
+    silently pick between duplicate ids with differing content, and
+    never treat `actor` as an authenticated identity.

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+coverage/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+.cankan/local.yml
+.superpowers/

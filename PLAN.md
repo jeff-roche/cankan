@@ -38,7 +38,6 @@ Every piece of the system and the single task that creates it. If a piece isn't 
 | Coordination-ref spike (throwaway) | M1.1 | — |
 | Spike findings + go/no-go decision doc | M1.2 | — |
 | Backlog.md ID-tolerance finding | M1.3 | — |
-| Upstream issue on Backlog.md | M1.4 | — |
 | `@cankan/core` package shell + public `index.ts` | M2.1 | M2.1 |
 | Ticket schema (zod) + frontmatter parse/serialize | M2.2 | M2.5 (store) |
 | Config schema + layer loader + policy resolution | M2.3 | M2.4 (board resolver), M3.1 (CLI context) |
@@ -187,6 +186,11 @@ Runs after M6.6.
 
 ## M1 — Spike and upstream probe
 
+Originally had a fourth task, M1.4, proposing a leased `claim` command as
+an issue on MrLesk/Backlog.md upstream. Dropped 2026-09-04 - user decision,
+not wanting to file on a third party's repo. Nothing else in the plan
+depended on it.
+
 ### M1.1 Coordination-ref spike
 - **Creates:** `spikes/coordination-ref/` (explicitly throwaway, not a workspace package): a script that creates an orphan ref, appends JSONL events, and has three worktrees race to claim the same ticket.
 - **Depends on:** M0.4
@@ -201,11 +205,6 @@ Runs after M6.6.
 - **Creates:** `docs/decisions/0002-ids-and-backlog-compat.md`: does real Backlog.md parse `ck-a1b2c3` IDs and our `cankan:` block? Decides whether `adopt backlog` must renumber.
 - **Depends on:** M0.4 (fixture with Backlog.md installed)
 - **Done when:** ADR merged with the actual `backlog` version tested.
-
-### M1.4 Upstream issue
-- **Creates:** an issue on MrLesk/Backlog.md proposing a leased `claim` command; link recorded in `docs/decisions/0002-…`.
-- **Depends on:** —
-- **Done when:** issue opened; response (or 2 weeks of silence) noted in the ADR.
 
 ---
 

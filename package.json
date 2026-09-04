@@ -1,0 +1,14 @@
+{
+  "name": "cankan-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "bun run --filter '*' build"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

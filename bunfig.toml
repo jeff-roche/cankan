@@ -1,0 +1,3 @@
+# Bun configuration for the cankan monorepo.
+[install]
+peer = true

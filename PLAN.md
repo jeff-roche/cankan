@@ -57,7 +57,7 @@ Every piece of the system and the single task that creates it. If a piece isn't 
 | Hooks runner (`on <event>`) | M2.16 | **M2.17 [wire]** |
 | Hooks fired from claims/move/close code paths | **M2.17 [wire]** | — |
 | Actor identity resolution (config → git author → default) | M2.18 | M3.1 (CLI context) |
-| `@cankan/cli` package shell, command registry, `--json/--plain` output layer | M3.1 | M3.1 |
+| `@jeff-roche/cankan-cli` package shell, command registry, `--json/--plain` output layer | M3.1 | M3.1 |
 | CLI context object (config + board + actor + core handle) | M3.1 | every M3 command |
 | `init` command + detection | M3.2 | **M3.11 [wire]** |
 | `config` commands | M3.3 | — |
@@ -106,7 +106,7 @@ Every piece of the system and the single task that creates it. If a piece isn't 
 
 ### M0.2 Monorepo skeleton
 - **Creates:** root `package.json` with Bun workspaces; `packages/core`, `packages/cli`, `packages/mcp`, `packages/backers/` (empty index), `packages/test-utils`; root `tsconfig.base.json` and per-package `tsconfig.json` extending it; `bunfig.toml`; each package has a `package.json`, `src/index.ts` exporting nothing, and builds.
-- **Wires:** package cross-references (`@cankan/cli` depends on `@cankan/core`, etc.) via workspace protocol.
+- **Wires:** package cross-references (`@jeff-roche/cankan-cli` depends on `@cankan/core`, etc.) via workspace protocol.
 - **Depends on:** M0.1
 - **Done when:** `bun install && bun run --filter '*' build` succeeds with empty packages.
 
@@ -121,7 +121,7 @@ Every piece of the system and the single task that creates it. If a piece isn't 
 - **Done when:** a sample test creates a temp repo with two worktrees and a bare remote, pushes between them, and cleans up.
 
 ### M0.5 Versioning and publish config
-- **Creates:** changesets config, `publishConfig` in each publishable package, `bun run release:version` and `release:publish` scripts, `@cankan` npm scope reserved via a placeholder `@cankan/cli@0.0.0` publish (the unscoped `cankan` name is blocked by npm's name-similarity policy - "too similar to canvas" - so distribution is scoped from here on; see M5.1).
+- **Creates:** changesets config, `publishConfig` in each publishable package, `bun run release:version` and `release:publish` scripts, `@cankan` npm scope reserved via a placeholder `@jeff-roche/cankan-cli@0.0.0` publish (the unscoped `cankan` name is blocked by npm's name-similarity policy - "too similar to canvas" - so distribution is scoped from here on; see M5.1).
 - **Depends on:** M0.2
 - **Done when:** `bun run release:version` produces a changelog from a sample changeset.
 
@@ -439,9 +439,9 @@ All M3 tasks live in `packages/cli`. **M3.1 owns the command registry and the co
 ## M5 — Release (Phase 1 ships here)
 
 ### M5.1 Binaries and shims
-- **Creates:** `packages/cli/bin/cankan` entry, `bun build --compile` targets (linux-x64, linux-arm64, darwin-arm64, darwin-x64, win-x64), publishes `@cankan/cli` (scoped - the unscoped `cankan` name is blocked by npm's name-similarity policy, see `docs/decisions/`) with a `bin` field (command name stays `cankan`) and platform-package fallback so `bunx @cankan/cli`/`npx @cankan/cli` work.
+- **Creates:** `packages/cli/bin/cankan` entry, `bun build --compile` targets (linux-x64, linux-arm64, darwin-arm64, darwin-x64, win-x64), publishes `@jeff-roche/cankan-cli` (scoped - the unscoped `cankan` name is blocked by npm's name-similarity policy, see `docs/decisions/`) with a `bin` field (command name stays `cankan`) and platform-package fallback so `bunx @jeff-roche/cankan-cli`/`npx @jeff-roche/cankan-cli` work.
 - **Depends on:** M3.11, M4.4
-- **Done when:** `npx @cankan/cli --version` works from a clean machine in CI.
+- **Done when:** `npx @jeff-roche/cankan-cli --version` works from a clean machine in CI.
 
 ### M5.2 Release pipeline
 - **Creates:** completes `release.yml`: changesets version PR → tag → build binaries → npm publish → GitHub release with assets → Homebrew tap formula bump (tap repo created here).
@@ -457,7 +457,7 @@ All M3 tasks live in `packages/cli`. **M3.1 owns the command registry and the co
 ### M5.4 Repo goes public; Phase 1 release
 - **Wires:** finally delivers M0.1's branch protection (blocked until now - GitHub's free plan only allows branch protection on public repos): required PR review, CI required, no force-push/deletion on `main`.
 - **Depends on:** M5.1–M5.3, M4.10
-- **Done when:** `@cankan/cli@0.1.0` on npm; branch protection active on `main`; announcement drafted.
+- **Done when:** `@jeff-roche/cankan-cli@0.1.0` on npm; branch protection active on `main`; announcement drafted.
 
 ---
 

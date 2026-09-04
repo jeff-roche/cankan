@@ -19,7 +19,7 @@
       },
     },
     "packages/cli": {
-      "name": "@cankan/cli",
+      "name": "@jeff-roche/cankan-cli",
       "version": "0.0.0",
       "dependencies": {
         "@cankan/core": "workspace:*",
@@ -33,7 +33,7 @@
       "name": "@cankan/mcp",
       "version": "0.0.0",
       "dependencies": {
-        "@cankan/cli": "workspace:*",
+        "@jeff-roche/cankan-cli": "workspace:*",
       },
     },
     "packages/test-utils": {
@@ -61,8 +61,6 @@
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.12", "", { "os": "win32", "cpu": "x64" }, "sha512-B1R/l+CwEpKFSuqiwePzPNRk1EiJN8kc0UhdafNz6MZN9v5OFP9HYP1irptvWzHrwVI4blVNGMbxc5zt70m3IA=="],
 
     "@cankan/backers": ["@cankan/backers@workspace:packages/backers"],
-
-    "@cankan/cli": ["@cankan/cli@workspace:packages/cli"],
 
     "@cankan/core": ["@cankan/core@workspace:packages/core"],
 
@@ -103,6 +101,8 @@
     "@clack/core": ["@clack/core@1.4.3", "", { "dependencies": { "fast-wrap-ansi": "^0.2.0", "sisteransi": "^1.0.5" } }, "sha512-/kr3UWNtdJfxZtPgDqUOmG2pvwlmcLGheex5yiZKdwbzZJxhV+HMNR9QNmyY5cGwTNV6LrR7Jtp+KjhUAP1qBQ=="],
 
     "@clack/prompts": ["@clack/prompts@1.7.0", "", { "dependencies": { "@clack/core": "1.4.3", "fast-string-width": "^3.0.2", "fast-wrap-ansi": "^0.2.0", "sisteransi": "^1.0.5" } }, "sha512-y7/yvZ2TPAnR9+jnc00klvNNLkJiXFFrQA/hlLCcxA9a2A4zQIOimyFQ9XfwYKiGD1fb5GY8vbKIIgO8d5Tb2A=="],
+
+    "@jeff-roche/cankan-cli": ["@jeff-roche/cankan-cli@workspace:packages/cli"],
 
     "@manypkg/find-root": ["@manypkg/find-root@3.1.0", "", { "dependencies": { "@manypkg/tools": "^2.1.0" } }, "sha512-BcSqCyKhBVZ5YkSzOiheMCV41kqAFptW6xGqYSTjkVTl9XQpr+pqHhwgGCOHQtjDCv7Is6EFyA14Sm5GVbVABA=="],
 

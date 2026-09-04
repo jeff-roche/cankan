@@ -17,8 +17,8 @@ pass and writes alias events." Nobody had run real Backlog.md against
 either assumption before this task.
 
 `backlog.md` is not a dependency of this repo (a known gap in M0.4's
-fixture) and must not become one for this task - per the controller
-ruling, it was installed only into a scratch directory outside the repo.
+fixture) and must not become one to answer this decision, so it was
+installed only into a scratch directory outside the repo.
 
 ### Method
 
@@ -540,14 +540,98 @@ output.
   write - a traversal can still land inside another directory and simply
   end in `.md`, and not every consumer of a directory tree cares about
   that suffix. Separately, `tickets_dir` is itself checked-in, repo-level
-  config (`CONCEPT.md:281`), so a hostile repo can retarget where ticket
+  config (`CONCEPT.md:282`), so a hostile repo can retarget where ticket
   writes land in the clone even with a fully sanitized title. Required:
-  (1) a slug sanitizer for the title segment - strip `/`, `\`, NUL and
-  other control characters, reject or strip a leading `.`, and cap
-  length; (2) a realpath containment check on the fully-constructed
-  path, verifying it resolves inside a `tickets_dir` that itself
-  resolves inside the board root, before any write. **`cankan adopt
-  backlog` and `cankan import` inherit this requirement** - both mint
+
+  1. **A slug sanitizer for the title segment** - strip `/`, `\`, NUL and
+     other control characters, reject or strip a leading `.`, and cap
+     length.
+  2. **A containment check that is satisfiable on a path that does not
+     exist yet.** `fs.realpath` throws `ENOENT` on any path whose final
+     component is absent - confirmed - which describes every ticket file
+     at the moment it is about to be created and, on a fresh `cankan
+     init`, `tickets_dir` itself. Realpathing the fully-constructed file
+     path therefore cannot be the check, and the improvisation it invites
+     looks like a containment check while providing none: `path.resolve`
+     is string arithmetic that resolves no symlink at all, so
+     `path.resolve("/a/b", "../../etc/passwd")` yields `/etc/passwd`
+     without complaint - confirmed. The check must be staged instead, in
+     this order:
+
+     a. Resolve the board root with `fs.realpath` (it exists) and assert
+        that `path.resolve(boardRoot, tickets_dir)` is the board root or
+        lies beneath it - **before creating any directory**. Creating
+        `tickets_dir` first and realpathing it afterwards would let a
+        checked-in `tickets_dir: ../../../victim` cause `mkdir` to
+        materialize directories outside the board before any check ran.
+     b. Once `tickets_dir` exists, `fs.realpath` it and assert the
+        resolved result is still inside the realpath'd board root. This
+        is the step that catches a `tickets_dir` that is a symlink, which
+        step (a)'s string arithmetic cannot see.
+
+        **"Lies beneath" in (a) and (b) means a path-component
+        relationship, never a string prefix** - reasoned, but the failure
+        is concrete: `resolved.startsWith(boardRoot)` is the obvious
+        implementation and it is wrong, because with a board root of
+        `/home/u/repo` a checked-in `tickets_dir: ../repo-evil/x`
+        resolves to `/home/u/repo-evil/x`, which passes a prefix test and
+        then gets created outside the board. Compare by components
+        instead: `path.relative(boardRoot, resolved)` must be neither
+        absolute nor beginning with a `..` segment.
+     c. Assert `tickets_dir` does not resolve inside the repository's git
+        directory, comparing against both `git rev-parse
+        --path-format=absolute --git-dir` and `git rev-parse
+        --path-format=absolute --git-common-dir` - both, because a linked
+        worktree has two and only the common one is shared, and
+        `--path-format=absolute` on both because plain `git rev-parse
+        --git-common-dir` returns a path relative to the current
+        directory: it prints `.git` from a main worktree and an absolute
+        path from a linked one (confirmed on git 2.55). Compared against a
+        realpath'd `tickets_dir`, the bare `.git` never matches, so this
+        check would be silently inert from a main worktree - the ordinary
+        case - exactly where it is meant to fire. Realpath both git
+        directories before comparing, and compare by components as in (b).
+     d. Assert the constructed **basename** contains no path separator
+        (`/` or `\`) and is neither `.` nor `..`, so a sanitizer bug
+        cannot reintroduce a directory component after containment was
+        established on the directory.
+  3. **A containment or basename failure aborts the caller's operation**
+     with a typed error and writes nothing - the same disposition 0001
+     requires of a read whose path does not resolve to the expected blob.
+     "Before any write" on its own would be satisfied by warning and
+     writing anyway, which is not the intent.
+
+  Step (c) resolves a tension between two passages of this bullet that
+  would otherwise be left to the implementer. The observation above that
+  the `.md` suffix "does not contain the write" is about **traversal**: a
+  traversal can land in an arbitrary directory and still end in `.md`, so
+  the suffix constrains nothing there. It says nothing about
+  **fixed-name targets**, which is the separate question a checked-in
+  `tickets_dir: .git/hooks` raises - and that value passes steps (a) and
+  (b) honestly, because `.git` genuinely is inside the board root. What
+  blocks it today is the filename pattern: a writer that always emits
+  `<ID> - <title>.md` cannot produce `pre-commit`, whose name is fixed
+  and suffix-less, so this is **not a live write-a-git-hook exposure**.
+  That argument, though, has to be re-derived against every future git
+  file whose name the pattern might happen to match, while the explicit
+  check does not have to be re-derived at all. Take the explicit check;
+  do not rely on the naming pattern as the containment.
+
+  **The `<ID>` segment is safe by construction and must stay that way.**
+  Every ticket carries a CanKan-minted `ck-` hash ID
+  (`CONCEPT.md:153`) - that is what the event log and coordination ref
+  key on - while an origin ID such as `#123` or `PROJ-45` is display-only,
+  living in `cankan.display_id` and the alias table, never in a path. The
+  sanitization scope above is therefore deliberately the title segment
+  alone rather than an oversight about the other one, and `cankan import`
+  must mint a local `ck-` ID rather than inherit a remote-supplied id
+  into the filename it constructs. An implementation that put an origin
+  ID in the path would widen the attacker-influenced portion from one
+  segment to two, which is a second reason it is out of spec beyond the
+  ID-scheme reasons in Decision above.
+
+  **`cankan adopt backlog` and `cankan import` inherit this
+  requirement** - both mint
   filenames from data CanKan does not itself author (pre-existing
   `task-N` titles on adopt; remote issue titles on import) and must run
   through the same sanitizer and containment check as any other ticket

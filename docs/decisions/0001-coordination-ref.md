@@ -352,18 +352,45 @@ for no additional correctness benefit.
   **M2.6 must reject any ref that does not match
   `^refs/cankan/[A-Za-z0-9._/-]+$` and also pass it through `git
   check-ref-format`, before it reaches any of the git invocations
-  above.** `check-ref-format` alone is not sufficient — confirmed:
-  `refs/heads/main` is itself a syntactically valid ref name and passes
-  it — the prefix anchor is the actual guard; `check-ref-format` only
-  catches malformed syntax within an already-namespaced value. **The
-  config layer that loads `.cankan/config.yml` (M2.3) is jointly
-  responsible**: it should reject an out-of-namespace `coordination.ref`
-  at load time, not leave M2.6 as the only backstop.
+  above.** Neither check is sufficient alone; each catches what the
+  other admits, which is why both are mandated rather than one being
+  belt-and-braces for the other. `check-ref-format` does not
+  confine the ref to CanKan's namespace — confirmed: `refs/heads/main` is
+  a syntactically valid ref name and passes it, so the prefix anchor is
+  what keeps the value inside `refs/cankan/`. The regex does not confine
+  it either: `.` and `/` are both members of its character class, so
+  `refs/cankan/../heads/main` matches
+  `^refs/cankan/[A-Za-z0-9._/-]+$` — confirmed — and is namespaced only
+  lexically, not structurally. `check-ref-format` rejects that value (exit
+  1 — confirmed), which is why it is mandated alongside the regex rather
+  than dropped as redundant syntax-checking of an already-namespaced
+  string. Recorded accurately rather than overstated: git's own ref-name
+  validation independently refuses a `..` component at every point of use
+  tested — `update-ref` (`fatal: ... refusing to update ref with bad name
+  'refs/cankan/../heads/main'`), `rev-parse --verify` (exit 128), and
+  refspec parsing (`fatal: invalid refspec ...`) — so mandating
+  `check-ref-format` is defense in depth that converts those scattered
+  fatals into one typed rejection at CanKan's own boundary, not the
+  closing of a live hole. **The config layer that loads
+  `.cankan/config.yml` (M2.3) is jointly responsible**: it should reject
+  an out-of-namespace `coordination.ref` at load time, not leave M2.6 as
+  the only backstop. The **must**/**should** asymmetry in that pair is
+  deliberate, not loose wording. M2.6's validation is a **must** because
+  M2.6 is the enforcing backstop: it is the last point before the value
+  reaches git, and it is reached by every caller, including callers that
+  obtain a ref without passing through M2.3's loader (tests, a future
+  `--ref` flag, a board whose config was hand-edited). M2.3's is a
+  **should** because it is a fail-early convenience — it improves which
+  error the user sees and when — and a board whose loader was bypassed
+  must still be safe. M2.6 may never assume validation already happened
+  upstream.
 - **Every git invocation that takes a ref, path, or commit derived from
   config or from the coordination ref's own content should pass
-  `--end-of-options`** immediately before that argument, in addition to
-  the ref validation above — `git rev-parse --verify --end-of-options
-  <ref>` and `git update-ref --end-of-options <ref> <sha> <old>` both
+  `--end-of-options`** immediately before the first such **positional**
+  argument, in addition to the ref validation above — `git rev-parse
+  --verify --end-of-options <ref>`, `git update-ref --end-of-options
+  <ref> <sha> <old>`, `git cat-file -p --end-of-options <commit>:<path>`
+  and `git ls-tree --full-tree --end-of-options <commit> -- <path>` all
   verified working on git 2.55. Array-form argv (already used throughout
   the spike's `git-plumbing.ts`) stops shell-metacharacter injection but
   not argument injection: a value beginning with `-` could otherwise be
@@ -371,12 +398,60 @@ for no additional correctness benefit.
   leading-dash ref currently fails closed regardless (git rejects it as
   an invalid ref name before this would matter), so this is hygiene, not
   a live gap — but it is mechanical, costs nothing, and belongs in the
-  spec now, before config-fed values are wired through it.
+  spec now, before config-fed values are wired through it. Every command
+  template in the bullets below carries the marker, the push and fetch
+  templates included — `git fetch --end-of-options origin <refspec>` and
+  `git push --end-of-options origin <refspec>` are both confirmed working
+  on git 2.55, and a refspec is built from the same config-derived ref the
+  validation bullet above governs. Templates are what an implementer
+  copies, so the rule is not left standing in prose alone.
+
+  **The rule is scoped to positionals because `--end-of-options` cannot
+  protect an option's own argument.** `git commit-tree` passes the parent
+  commit as `-p <old>`, and no placement of the marker guards `<old>`:
+  putting it before the tree pushes the subsequent `-p` into positional
+  position instead — confirmed on git 2.55, `git commit-tree
+  --end-of-options <tree> -p <old> -m <msg>` fails with `fatal: must give
+  exactly one tree`. The working form, and the one the `commitTreeToRef`
+  bullet below specifies, puts the options first and the marker
+  immediately before the single positional it can protect: `git
+  commit-tree -p <old> -m <msg> --end-of-options <tree>` (confirmed
+  working, same git version). `<old>` is deliberately left uncovered: it
+  is a 40-hex sha that M2.6 obtained from its own `rev-parse` on an
+  already-validated ref, never a config-derived or log-derived string, so
+  it cannot begin with `-`.
+
+- **Every git invocation in M2.6 must run with its working directory set
+  to the board's repository root**, resolved once per board with `git
+  rev-parse --show-toplevel` (confirmed: run from `<root>/ev/sub`, it
+  prints `<root>`). Git's commands do not agree on what an argument is
+  relative to, and `readBlobFromRef` below composes two that disagree:
+  `git ls-tree`'s pathspec is interpreted relative to the process's
+  current directory, while `git cat-file -p <commit>:<path>` is always
+  interpreted relative to the tree root. A CLI is normally invoked from
+  somewhere inside a repository rather than at its root, so an unpinned
+  cwd makes the two halves of that guard read two different paths — see
+  the `readBlobFromRef` bullet for the observed consequence, which is a
+  granted claim on a held ticket. The spike does not exhibit this only
+  because `git-plumbing.ts:13` takes `cwd` as a caller-supplied parameter
+  and every spike caller happens to pass a test repo's root; M2.6 must
+  pin the value rather than inherit whatever it was launched from.
+  Pinning the cwd and passing `--full-tree` are both required and neither
+  substitutes for the other: `--full-tree` fixes only the one command
+  that has such a flag, and the pin is what makes every other
+  path-taking or ref-taking invocation cwd-insensitive.
+
+  `git rev-parse --show-toplevel` is itself resolved from the process's
+  own current directory; that single bootstrap call is the one exception,
+  and every later invocation uses its result. If it fails — not a git
+  repository, or a bare repository with no working tree — that is a typed
+  hard error. M2.6 must never fall back to the process's cwd.
 - **`updateRefCAS(ref, newSha, oldSha)`** — new value second, old value
   third; see "PLAN.md notation should be revised" below for why this
-  order is stated explicitly. Implementation: `git update-ref <ref>
-  <newSha> <oldSha ?? ZERO_SHA>` (the 40-zero sha for "ref must not exist
-  yet") — the trailing old-value argument to `update-ref` *is* the entire
+  order is stated explicitly. Implementation: `git update-ref
+  --end-of-options <ref> <newSha> <oldSha ?? ZERO_SHA>` (the 40-zero sha
+  for "ref must not exist yet") — the trailing old-value argument to
+  `update-ref` *is* the entire
   CAS mechanism; no separate locking is needed around it. Return both
   success/failure and the exact stderr on failure (spike's
   `git-plumbing.ts:113`), since the retry policy below depends on being
@@ -393,8 +468,12 @@ for no additional correctness benefit.
   `git hash-object -w --stdin`, tree via a private temp index
   (`GIT_INDEX_FILE` pointed at a fresh `mkdtemp()` directory per call, so
   concurrent callers never collide on one index file), commit via `git
-  commit-tree <tree> -p <old> -m <msg>` — never touching the real index or
-  working tree (spike's `git-plumbing.ts:64`, `coordination.ts:102`).
+  commit-tree -p <old> -m <msg> --end-of-options <tree>` — never touching
+  the real index or working tree (spike's `git-plumbing.ts:64`,
+  `coordination.ts:102`). The argument order in that last command is
+  load-bearing, not stylistic: the marker must follow the options and
+  precede the tree, for the reason given in the `--end-of-options` bullet
+  above.
 - **`readBlobFromRef(ref, path)`** (named in `PLAN.md`'s M2.6 line, not
   given its own spec by the spike directly): resolve `ref` to a commit,
   then read `<path>` at that commit. **Do not key this off `cat-file`'s
@@ -411,14 +490,79 @@ for no additional correctness benefit.
   -p` succeeds at exit 0 and prints a directory listing or the symlink's
   link target, respectively — confirmed directly — which then reaches
   the unguarded `JSON.parse` at `coordination.ts:56` (see failure mode 8,
-  widened below). Implement a three-way check instead: run `git ls-tree
-  <commit> -- <path>` first (confirmed: this exits 0 whether or not the
-  path exists — check the *output*, not the exit code); empty output
-  means no entry, return `null`; a `100644` blob entry means read it via
-  `cat-file`; any other mode (`040000` tree, `120000` symlink, `160000`
-  submodule) or any non-zero exit from either command is a typed hard
-  error that **aborts the caller's operation** — never silently treated
-  as "empty." **This is inherited by every consumer of
+  widened below). Implement a checked resolution instead, on `git ls-tree
+  --full-tree --end-of-options <commit> -- <path>` (confirmed: this exits
+  0 whether or not the path exists — check the *output*, not the exit
+  code):
+
+  - **Empty output**: no entry. Return `null`.
+  - **Exactly one entry, whose mode is `100644` and whose path field is
+    byte-identical to the requested `<path>`**: read it with `git cat-file
+    -p --end-of-options <commit>:<path>`.
+  - **Anything else** — more than one entry, a single entry whose path
+    field differs from the requested path, any other mode (`040000` tree,
+    `120000` symlink, `160000` submodule), or a non-zero exit from either
+    command — is a typed hard error that **aborts the caller's
+    operation**, never silently treated as "empty."
+
+  **`--full-tree` is not optional.** `ls-tree`'s pathspec is interpreted
+  relative to the process's current directory; `cat-file -p
+  <commit>:<path>` is always interpreted relative to the tree root.
+  Confirmed on git 2.55, in a repository whose blob is at
+  `ev/2026-09.jsonl`:
+
+  ```
+  $ cd ev/ && git ls-tree $C -- ev/2026-09.jsonl
+  (exit 0, no output)
+  $ git cat-file -p "$C:ev/2026-09.jsonl"
+  {"a":1}
+  $ git ls-tree --full-tree $C -- ev/2026-09.jsonl
+  100644 blob 0187f3b…  ev/2026-09.jsonl
+  ```
+
+  Without `--full-tree`, a `claim` invoked from any subdirectory of the
+  repository — the ordinary case for a CLI, which a user runs from
+  wherever they happen to be — sees empty `ls-tree` output, concludes "no
+  claims this month," and grants a claim on a held ticket. That is the
+  same fail-open double-claim this guard exists to prevent, reachable
+  with no hostile input at all, and it would be a regression against a
+  `cat-file`-only read, which is cwd-insensitive for a tree-root-relative
+  path. The cwd pin specified above closes the same class of trap for
+  commands that have no `--full-tree` equivalent; both are required, and
+  neither substitutes for the other.
+
+  **The "exactly one entry, path equal" condition is likewise not
+  optional**, and a mode check alone does not replace it: the mode on the
+  first output line says nothing about *which* object was resolved. Two
+  observed cases where that first line reads `100644` while the object is
+  not the requested blob:
+
+  ```
+  $ git ls-tree --full-tree $C -- ev/
+  100644 blob 0187f3b…  ev/2026-09.jsonl
+  040000 tree 9ae38d4…  ev/sub
+  $ git cat-file -p "$C:ev/"
+  100644 blob 0187f3b…  2026-09.jsonl
+  040000 tree 9ae38d4…  sub
+
+  $ git ls-tree --full-tree $C -- ev/sub/../2026-09.jsonl
+  100644 blob 0187f3b…  ev/2026-09.jsonl
+  $ git cat-file -p "$C:ev/sub/../2026-09.jsonl"
+  fatal: path 'ev/sub/../2026-09.jsonl' exists on disk, but not in '<commit>'
+  ```
+
+  In the first, a trailing-slash path makes `ls-tree` emit a multi-line
+  listing whose leading line is a `100644` blob, while `cat-file` exits 0
+  and prints a directory listing — both reach the unguarded `JSON.parse`.
+  In the second, `ls-tree` silently normalizes the `..` component out of
+  the pathspec and reports a *different* path than the one requested,
+  while `cat-file` on the identical string fails at exit 128. The path
+  equality test rejects both: no emitted path equals `ev/`, and
+  `ev/2026-09.jsonl` is not the requested `ev/sub/../2026-09.jsonl`.
+  Comparing the emitted path against the requested one is what forces the
+  two commands to agree on which object is under discussion; a mode check
+  alone leaves them free to disagree. **This is inherited by every
+  consumer of
   `readBlobFromRef`**: M2.6 (the primitive itself), M2.7 (every
   claim/event read), and M2.8 (fold reads via M2.7) must all propagate
   the hard-error case rather than defaulting to "no data."
@@ -431,10 +575,12 @@ for no additional correctness benefit.
   within a tree rather than a filesystem escape, and is not rejected the
   way a cacheinfo write of the same string would be. M2.7 must neither
   duplicate the write-side check where it doesn't apply, nor assume the
-  read side carries protection it doesn't have — the three-way
-  `ls-tree`/mode check above is what governs what a read path may
-  resolve to; it is not a substitute for `verify_path`, and `verify_path`
-  is not a substitute for it.
+  read side carries protection it doesn't have — the `ls-tree`
+  mode-and-path-equality check above is what governs what a read path may
+  resolve to, and it governs it precisely because it compares the
+  resolved path against the requested one rather than only inspecting a
+  mode. It is not a substitute for `verify_path`, and `verify_path` is
+  not a substitute for it.
 - **Retry/backoff policy on CAS contention**: on rejection, **re-read the
   ref and re-check the claim state before retrying the write** — never
   blindly retry the same write. This is what the spike's `claimViaCAS`
@@ -472,7 +618,8 @@ for no additional correctness benefit.
   free.
 - **Fetch-side reconciliation when local and remote have both advanced**:
   fetch the remote ref into a **distinct local ref name** — `git fetch
-  origin refs/cankan/coordination:refs/cankan/coordination-remote` —
+  --end-of-options origin
+  refs/cankan/coordination:refs/cankan/coordination-remote` —
   never the working ref directly, since a plain fetch of the working
   ref's own refspec is itself rejected as non-fast-forward once both
   sides have diverged (confirmed by direct testing; see Evidence,
@@ -496,7 +643,13 @@ for no additional correctness benefit.
   expired" is not implemented anywhere in the spike (its `findClaim`
   always honors the latest claim event, unconditionally). M2.6/M2.7 must
   add the expiry check themselves; do not treat the spike's claim-lookup
-  logic as the full spec.
+  logic as the full spec. **The clock that check reads is fully specified
+  in failure mode 7** and is not a choice left to the implementer:
+  reader-local first-observation time, recorded per clone under
+  `$XDG_STATE_HOME/cankan/` (`CONCEPT.md:270`). No timestamp carried in
+  the coordination ref is an admissible input to it — not an event's
+  `ts`, and not the CAS commit's committer or author date, which the same
+  appender writes.
 - **`listWorktrees`**: not covered by the concurrency decision itself, but
   needed for whatever M2.6 does with the worktree-path problem noted
   above if any lock-adjacent tooling is ever added; not otherwise
@@ -537,7 +690,16 @@ for no additional correctness benefit.
   values: a backdated `ts` would win any "earliest timestamp" tie-break
   (claim theft), and a far-future `ts` would defeat a lease-expiry check
   that trusted it (a permanently unclaimable ticket) — see the
-  reconciliation tie-break bullet below, revised accordingly. **Duplicate
+  reconciliation tie-break bullet below, revised accordingly, and failure
+  mode 7 for the expiry clock. **Bounding `ts` is schema hygiene, not the
+  expiry defense.** It keeps an absurd value out of anything that
+  displays or sorts by it, but no bound makes a peer-supplied clock
+  trustworthy: a window wide enough to tolerate honest clock skew is
+  wide enough to hold a ticket hostage for the width of the window.
+  Expiry must be measured against the reader-local first-observation
+  clock that failure mode 7 specifies, with `ts` never an input to it.
+  The same disqualification covers the CAS commit's committer and author
+  timestamps, which the appending peer supplies just as freely. **Duplicate
   event ids must be resolved by rejecting the duplicate when its content
   differs from the existing event, not by silently picking one** — this
   ADR's "dedupe by event id" language (below) never specified which copy
@@ -602,6 +764,41 @@ for no additional correctness benefit.
   it only flags that the event log's reconciliation step must not be the
   place that silently resolves the conflict by dropping data, and that
   whatever M2.8 does design must not be `ts`-based.
+
+  **The property that tie-break must have is determinism, not fairness**,
+  and M2.8 should not spend design effort on the latter. What is needed
+  is that both peers, independently reconciling the same union of events,
+  compute the same winner — so that the board does not disagree with
+  itself about who holds a ticket. No *fair* tie-break exists among
+  mutually-distrusting peers: every input a peer supplies is an input it
+  can choose, which is the same reasoning that disqualifies `ts`.
+  Position in the rebuilt commit chain is not fair either — it is
+  determined by whichever side happens to reconcile first — and it is
+  admissible anyway, because it is deterministic and locally verifiable
+  from the union both sides hold. An attempt to make the outcome
+  equitable would either reintroduce a peer-supplied input or require an
+  authority this design deliberately does not have.
+
+- **A poisoned coordination ref has no recovery path, and defining one is
+  M2.7's obligation.** Every read obligation this ADR adds fails closed:
+  a schema-invalid event aborts, a month path resolving to a non-blob
+  aborts, a duplicate event id whose content differs is rejected rather
+  than resolved. That is the correct trade for a mutual-exclusion
+  primitive — a board that refuses to answer is safer than one that
+  grants a double-claim — but it carries a direct consequence,
+  **reasoned, not tested**: any peer with push access can append a single
+  event that makes every subsequent read abort, rendering the board
+  unreadable for everyone who fetches it, with no technique more
+  sophisticated than one push. Nothing in this ADR, in 0002, or in
+  PLAN.md names how a board gets out of that state. **M2.7 must define
+  and test that recovery path** — how an operator sees which event is
+  offending, and how the ref is returned to a readable state (for
+  instance by quarantining the offending events behind an audit record,
+  or by CASing the working ref back to a known-good ancestor and
+  re-appending only the events that validate). This ADR does not design
+  it. It records that fail-closed reads are a complete design only once
+  the way out of the closed state exists, and that the obligation to
+  build that exit belongs to the milestone that builds the reads.
 
 ### CONCEPT.md should be revised
 
@@ -743,13 +940,81 @@ inferred from the mechanism):
    (`refs/cankan/coordination:refs/cankan/coordination`) into the working
    ref, and lazily initialize the ref if `readRef` returns `null` where a
    board is expected to have one.
-7. **Lease expiry not enforced — reasoned, not implemented anywhere
-   yet.** CONCEPT.md §4 specifies expired claims return to Ready; neither
-   the spike's `findClaim` nor anything else in this codebase implements
-   that check today. User sees: a ticket that should be reclaimable after
-   its lease expired still reports `already_claimed`. Code must: implement
-   the expiry check as part of M2.6/M2.7's claim-lookup logic, not assume
-   the spike's unconditional "latest claim wins" lookup is the full spec.
+7. **Lease expiry not enforced, and no clock reachable from the ref is
+   trustworthy — reasoned, not implemented anywhere yet.** CONCEPT.md §4
+   specifies expired claims return to Ready; neither the spike's
+   `findClaim` nor anything else in this codebase implements that check
+   today. The hard part is not the comparison but the clock it reads.
+   Every timestamp reachable from the coordination ref is written by
+   whoever appended the event: the event's own `ts` field, and equally
+   the CAS commit's committer and author dates, which the same appender
+   supplies. A peer with push access can set any of them arbitrarily, and
+   a far-future value defeats an expiry check that consults it — a ticket
+   no other actor can ever reclaim. Bounding `ts` to a plausible window
+   does not repair this: a window wide enough for honest clock skew is
+   wide enough to hold a ticket hostage for the width of the window.
+   User sees: a ticket that should have become reclaimable when its lease
+   expired still reports `already_claimed`, with no error and no
+   indication why.
+
+   **Code must: measure lease expiry against a reader-local
+   first-observation time, and against no timestamp carried in the log.**
+   Specifically, and not as a menu M2.7 chooses from:
+
+   - **The clock.** When a reader first encounters a lease-bearing event
+     id — `claim` or `renew` — while reading the ref, it records that
+     event id against its own host clock's current time. An appender
+     records its own append the same way, at the moment it appends. A
+     claim is expired when the reader's current local time minus the
+     recorded first-observation time of the ticket's most recent
+     `claim`/`renew` event — **most recent by position in the append-only
+     chain, never by `ts`**, per the ordering rule in M2.7's Consequences
+     — exceeds the configured lease (`claims.lease`,
+     `CONCEPT.md:296`). A `release` event ends the lease outright, and the
+     observation records for that claim may then be discarded. The reader
+     trusts exactly one clock — its own host's — and no peer's.
+   - **Where the record lives.** `$XDG_STATE_HOME/cankan/`
+     (`CONCEPT.md:270`, already reserved for "lease heartbeats,
+     last-sync timestamps per board"), keyed by board and by event id. It
+     must persist across invocations: a per-process record would
+     re-observe every event on every command, and no lease would ever
+     expire. The board key must be the repository's common git directory,
+     not the current worktree's path — every worktree of one clone shares
+     one coordination ref, so they must share one observation record or
+     two worktrees will compute different expiries for the same claim.
+     Derive that key as `git rev-parse --path-format=absolute
+     --git-common-dir`, then `fs.realpath` the result. **The
+     `--path-format=absolute` is load-bearing, not decoration**: plain
+     `git rev-parse --git-common-dir` returns a path relative to the
+     current directory, so it prints `.git` from a main worktree and an
+     absolute path from a linked one — confirmed on git 2.55 — and an
+     implementer keying on the raw output would produce two different
+     keys for two worktrees of one clone, which is the exact divergence
+     this obligation exists to prevent. The record is per clone by
+     construction. It is never pushed, fetched, or otherwise shared, and
+     no peer can write to it; that is the entire point of siting it
+     there.
+   - **A missing record** — the ordinary case the first time an event is
+     seen — means: record the current local time now, and treat the claim
+     as unexpired. That over-honors the lease, which is the fail-closed
+     direction for a mutual-exclusion primitive.
+   - **An unwritable or unreadable store** is a typed hard error.
+     Proceeding without recording silently re-observes the event on the
+     next invocation, so no lease ever expires; that failure is invisible
+     from the outside and must not be one the reader shrugs off.
+
+   Consequences of this design, **reasoned, not measured**: a clone that
+   first sees an already-old claim starts its clock late, so it honors
+   that claim for up to one full lease period counted from its own first
+   sight of the event rather than from when the claim was made; a clone
+   whose state directory is ephemeral (CI, a throwaway container) does
+   this for every lease it sees. Both cost liveness — a ticket stays
+   unclaimable somewhat longer than it strictly should — and neither
+   costs mutual exclusion, which is the trade a coordination primitive
+   should make in that direction. One residual is not closed by this and
+   is not meant to be: a peer with push access can hold a ticket for as
+   long as it keeps appending `renew` events. That is what `renew` is
+   for, and it is bounded by who has push access, not by any timestamp.
 8. **Malformed or non-blob event-log content — partly observed, partly
    reasoned.** Two distinct issues reach the same unguarded `JSON.parse`
    (`coordination.ts:56`): (a) a corrupted or partially-written *line*
@@ -809,12 +1074,16 @@ inferred from the mechanism):
     log anyone with push access to the ref can write to. User sees:
     nothing wrong-looking. A backdated `ts` silently wins a
     reconciliation tie-break meant to resolve an honest race (claim
-    theft); a far-future `ts` can defeat a lease-expiry check that
-    trusts it (a ticket that never becomes reclaimable); a duplicate
+    theft); a far-future `ts` would defeat any lease-expiry check that
+    consulted it (a ticket that never becomes reclaimable), which is why
+    failure mode 7 places the expiry clock outside the log entirely
+    rather than trying to sanitize the one inside it; a duplicate
     event id with different content silently substitutes for the real
     event if "dedupe by id" doesn't specify which copy survives. Code
     must: validate every event against `events/schema.ts` at the
     boundary (see Consequences), treat position in the append-only
-    chain — not `ts` — as ordering authority, reject rather than
+    chain — not `ts` — as ordering authority, measure lease expiry
+    against the reader-local first-observation clock of failure mode 7
+    rather than any logged timestamp, reject rather than
     silently pick between duplicate ids with differing content, and
     never treat `actor` as an authenticated identity.

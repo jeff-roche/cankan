@@ -87,7 +87,12 @@ A second, independent scratch install (`/tmp/backlog-scratch2`, same
 resolved `backlog.md@1.51.0`) and fixture repo (`/tmp/backlog-probe2`)
 were used for two follow-up checks surfaced while analyzing probe 1 and
 probe 3 (the mixed-prefix gap and the numeric-looking-hash collision,
-both below) - neither committed, both deleted after use.
+both below). A third, likewise independent scratch install
+(`/tmp/backlog-scratch3` / `/tmp/backlog-probe3`, same
+`backlog.md@1.51.0`) was used during the fix-round re-check of probe 3's
+`id:`-casing claim, to `cat` the created file directly rather than rely
+on `--plain` render output. None of the three were committed; all were
+deleted after use.
 
 ## Evidence
 
@@ -180,7 +185,16 @@ and lookup are case-insensitive; the frontmatter's literal casing
 (`ck-a1b2c3`, lowercase, matching CanKan's convention) is read correctly
 and displayed uppercased.
 
-**Mixed-prefix gap.** `task_prefix` is a single global config value, so a
+**Conclusion: read tolerance holds, conditionally.** Backlog.md's parser
+does not require numeric IDs and does not choke on the `cankan:` block.
+But discovery is gated on `backlog/config.yml`'s `task_prefix` matching
+the file's actual filename prefix, case-sensitively. This is **not
+documented in CONCEPT.md** and is a new requirement, addressed in
+Decision below.
+
+### Probe 1 follow-up: mixed-prefix gap
+
+`task_prefix` is a single global config value, so a
 repo cannot have both `task-*` and `ck-*` tickets visible to Backlog.md
 at once - exactly the scenario `cankan adopt backlog` exists for (a repo
 that already has Backlog.md-native tickets). Confirmed with a second,
@@ -205,16 +219,12 @@ is not a hypothetical edge case; it is the default outcome of following
 CONCEPT.md's detection table ("`backlog/` present -> reuse the existing
 task directory as-is") and then also creating native `ck-` tickets.
 
-**Conclusion: read tolerance holds, conditionally, and only for a single
-ID family at a time.** Backlog.md's parser does not require numeric IDs
-and does not choke on the `cankan:` block. But discovery is gated on
-`backlog/config.yml`'s `task_prefix` matching the file's actual filename
-prefix, case-sensitively, and only one prefix is configured at a time.
-This is **not documented in CONCEPT.md** and is a new requirement,
-addressed in Decision below: `cankan init`/`cankan adopt backlog` must
-either set `task_prefix: ck` (silently orphaning any pre-existing
-Backlog.md tickets from Backlog.md's own view) or migrate pre-existing
-tickets into the `ck-` namespace first.
+**Conclusion: only one ID family is visible at a time.** Whichever
+prefix `task_prefix` names is the only one Backlog.md's tooling can see;
+there is no multi-prefix or wildcard mode. Addressed in Decision below:
+`cankan init`/`cankan adopt backlog` must either set `task_prefix: ck`
+(silently orphaning any pre-existing Backlog.md tickets from Backlog.md's
+own view) or migrate pre-existing tickets into the `ck-` namespace first.
 
 ### Probe 2 - write preservation (decisive)
 
@@ -308,8 +318,35 @@ File: /tmp/backlog-probe/backlog/tasks/ck-2 - Second-new-task.md
 ...
 ```
 
-No crash, no error, no collision with `ck-a1b2c3`. Resulting frontmatter
-`id:` fields are `CK-1`, `CK-2` (Backlog.md's own writes use uppercase).
+No crash, no error, no collision with `ck-a1b2c3`. Filename and
+frontmatter `id:` casing diverge, confirmed by re-running the same
+create against a fresh third scratch install/fixture (`backlog.md@1.51.0`
+again) and `cat`-ing the result directly rather than trusting the
+`--plain` render:
+
+```
+$ cat "backlog/tasks/ck-1 - New-task-after-hash-id-present.md"
+---
+id: CK-1
+title: New task after hash id present
+status: To Do
+assignee: []
+created_date: '2026-09-04 22:20'
+labels: []
+dependencies: []
+ordinal: 2000
+---
+
+$ ls backlog/tasks/
+ck-1 - New-task-after-hash-id-present.md
+ck-a1b2c3 - Some title.md
+```
+
+The file is named `ck-1 - ...md` (lowercase, matching the configured
+`task_prefix: ck`) while its own `id:` frontmatter field reads `CK-1`
+(uppercase) - Backlog.md's writer uppercases the ID it stores internally
+regardless of the filename's casing.
+
 Inspecting `backlog/` turned up no separate ID-counter file - the
 allocator scans existing filenames for the configured prefix, extracts
 the numeric suffix of each, and takes `max + 1`. Non-numeric suffixes
@@ -353,7 +390,10 @@ absorbed into that computation and can collide.
 ## Decision
 
 **`cankan adopt backlog` does not need to renumber CanKan's native
-`ck-a1b2c3` IDs.** Evidence: Backlog.md's parser tolerates a non-numeric
+`ck-a1b2c3` IDs** (a one-time relabel of *pre-existing* Backlog.md
+`task-N` tickets into the `ck-` namespace is still required - see point 2
+below - but that is not a renumbering of `ck-` IDs, which never changes).
+Evidence: Backlog.md's parser tolerates a non-numeric
 ID field and a non-numeric filename suffix without crashing (probes 1
 and 3); its own ID allocator copes with their presence by ignoring them,
 not by erroring or colliding. Renumbering to `TASK-N` would buy nothing
@@ -363,12 +403,29 @@ point).
 
 What *is* required, and is new relative to CONCEPT.md's current text:
 
-1. **`cankan init` (detecting an existing `backlog/`) and `cankan adopt
-   backlog` must set `task_prefix: ck` in `backlog/config.yml`.**
-   Without this, native CanKan tickets are invisible to every `backlog`
+1. **Every `cankan init` must set `task_prefix: ck` in
+   `backlog/config.yml` - not only when detecting/adopting an existing
+   `backlog/`.** This was under-scoped in the first draft of this ADR.
+   `CONCEPT.md` line 46 promises a fresh native-mode user who later runs
+   `npm i -g backlog.md` gets a working `backlog browser` "immediately,"
+   with no mention of running `cankan adopt backlog` first. Probe 1's own
+   evidence shows a fresh `backlog init` defaults to `task_prefix: "task"`
+   (line ~78), so if `cankan init` in an empty repo doesn't *also* write
+   `task_prefix: ck` into `backlog/config.yml` at that point, that later
+   `backlog browser` shows nothing - the exact scenario line 46 promises
+   away. So this config write belongs on every `cankan init` path
+   (fresh and adopting), not gated on detecting a pre-existing `backlog/`.
+   Without it, native CanKan tickets are invisible to every `backlog`
    command and to `backlog browser` - not a parse failure, a silent
    zero-result discovery gate. This is a one-line config write, not a
    renumbering pass.
+
+   **Open question, untested:** what does a later user-run `backlog init`
+   do to a `backlog/config.yml` that CanKan already authored (e.g. if a
+   human runs it manually for `--agent-instructions` setup after CanKan
+   already set `task_prefix: ck`)? Does it overwrite `task_prefix` back
+   to the default, merge, or refuse to run over an existing config? Not
+   probed here - flagging it as open rather than guessing.
 2. **If the repo already has Backlog.md-native `task-N` tickets when
    `cankan adopt backlog` runs, they must be migrated into the `ck-`
    namespace, not renumbered.** Because `task_prefix` is a single global
@@ -404,6 +461,15 @@ What *is* required, and is new relative to CONCEPT.md's current text:
    minting. Probe 3 confirmed (not merely inferred) that Backlog.md's
    allocator absorbs a numeric-looking `ck-` suffix into its own
    watermark and will mint a colliding next ID.
+5. **CanKan's ID handling must be case-insensitive on lookup, casing-
+   preserving on write.** Probe 3 confirmed Backlog.md writes an
+   uppercase `id: CK-1` inside a file whose own filename keeps the
+   lowercase, configured-prefix casing (`ck-1 - ...md`). `ticketStore.get()`
+   and any other ID-matching code in `ticket/id.ts`/`ticket/frontmatter.ts`
+   must treat `ck-1` and `CK-1` as the same ticket, while preserving
+   whatever casing was actually on disk when serializing back out -
+   otherwise M2.2's byte-identical round-trip requirement fails on any
+   file Backlog.md has touched.
 
 No probe was inconclusive; all three produced reproducible, unambiguous
 output.
@@ -442,8 +508,21 @@ output.
   CanKan-authored and Backlog.md-authored files; it is explicitly *not*
   "the `cankan:` block always survives a foreign write" - that block's
   persistence is CanKan's own responsibility to re-derive, not something
-  the file format guarantees. `frontmatter.ts` should treat a missing
-  `cankan:` block as "native, unsynced" rather than a parse error.
+  the file format guarantees. Concretely: CanKan must detect that an
+  external Backlog.md write happened (e.g. an `external-write` event, or
+  a mismatch between the ticket's `cankan.sync.base_hash` and the file's
+  current content hash) and, on detecting one, **re-derive and re-attach**
+  the `cankan:` block from the event log rather than merely treating its
+  absence as "native, unsynced" and leaving it that way.
+  `ticket/frontmatter.ts` must also expect two other reserialization
+  quirks Probe 2 surfaced on the very same edit: **key reordering**
+  (`created_date`/`updated_date` moved relative to the other fields) and
+  **single-quoted date scalars** (`created_date: '2026-09-04 22:00'`) -
+  neither is unique to the `cankan:` block, so a round-trip test built
+  only around the `cankan:` block's disappearance will miss them.
+  Separately (Decision point 5): frontmatter `id:` values must be
+  compared case-insensitively (`ck-1` == `CK-1`) but serialized with
+  whatever casing was actually read from disk.
 - **M4.10** (`packages/core/test/backlog-compat.test.ts`): pin
   **`backlog.md@1.51.0`** for the CI install referenced there and in
   PLAN.md's "CI installs a pinned version" note. The test must also set
@@ -456,18 +535,26 @@ output.
   Backlog.md release that starts preserving unknown frontmatter keys is
   noticed rather than silently changing CanKan's required
   reconciliation behavior.
-- **`cankan init`/`cankan adopt backlog`** (CONCEPT.md's detection table,
-  ~line 38, and the adoption flow, ~line 48-50) must additionally write
-  `task_prefix: ck` (or whatever CanKan's configured native prefix is)
-  into `backlog/config.yml` when reusing an existing Backlog.md
-  directory, **and** must migrate any pre-existing `task-N` tickets into
-  the `ck-` namespace (rename, rewrite `id:`, set `display_id`/alias,
-  write an `alias` event) before doing so - otherwise setting
-  `task_prefix: ck` silently orphans those tickets from Backlog.md's own
-  view. Neither step is currently mentioned in CONCEPT.md or PLAN.md;
-  CONCEPT.md's detection-table line ("reuse the existing task directory
-  as-is; no import needed") is incomplete once native `ck-` tickets are
-  also in play and should be revised to describe this migration.
+- **`cankan init`** (CONCEPT.md's setup command reference, and the
+  user story at ~line 46 promising `backlog browser` "immediately" after
+  a later `npm i -g backlog.md`, with no `cankan adopt backlog` step
+  implied) must write `task_prefix: ck` (or whatever CanKan's configured
+  native prefix is) into `backlog/config.yml` on **every** init, fresh or
+  adopting - not only when detecting a pre-existing `backlog/`. This is
+  not currently mentioned in CONCEPT.md or PLAN.md. Also open and
+  untested: what a later manually-run `backlog init` does to a
+  CanKan-authored `backlog/config.yml` (overwrite, merge, or refuse) -
+  worth a quick probe before M2.x implements the init writer, not
+  required for this ADR's decision.
+- **`cankan adopt backlog`** (CONCEPT.md's adoption flow, ~line 48-50)
+  must additionally migrate any pre-existing `task-N` tickets into the
+  `ck-` namespace (rename, rewrite `id:`, set `display_id`/alias, write
+  an `alias` event) - otherwise setting `task_prefix: ck` silently
+  orphans those tickets from Backlog.md's own view. Not currently
+  mentioned in CONCEPT.md or PLAN.md; CONCEPT.md's detection-table line
+  ("reuse the existing task directory as-is; no import needed") is
+  incomplete once native `ck-` tickets are also in play and should be
+  revised to describe this migration.
 - CONCEPT.md line 46 ("with CanKan-specific fields ... namespaced under a
   `cankan:` key that Backlog.md ignores") should be corrected: Backlog.md
   ignores the block on read but deletes it on write. The compatibility

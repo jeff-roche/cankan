@@ -251,12 +251,15 @@ The verified alternative is a fetch into a **distinct local ref name**:
 git fetch origin refs/cankan/coordination:refs/cankan/coordination-remote
 ```
 
-This was confirmed, by the same direct git commands, to succeed
-unconditionally regardless of divergence — it is a plain creation or
-fast-forward of a ref nothing else writes to, never a CAS or a merge
-against the working `refs/cankan/coordination`. Re-running it after the
-remote advances again also succeeds without a rejection, for the same
-reason: nothing else ever moves the staging ref out from under it.
+This was confirmed, by the same direct git commands, to succeed on first
+creating the staging ref, and again on a second fetch after the remote
+had advanced further — both plain creations or fast-forwards of a ref
+nothing else writes to, never a CAS or a merge against the working
+`refs/cankan/coordination`. What this does not cover: a remote ref that
+itself moves non-fast-forward relative to the staging ref (rewound or
+force-updated). That isn't expected here, since the coordination ref is
+only ever advanced by CAS and never force-pushed (see Consequences), but
+it was not directly tested.
 
 From the staging ref, the adapter reads both the local working ref and the
 staging ref's event logs, unions them, rebuilds a single new commit on top
@@ -472,7 +475,11 @@ for no additional correctness benefit.
   flags that the event log's reconciliation step must not be the place
   that silently resolves the conflict by dropping data.
 
-### CONCEPT.md should be revised (not corrected here, per constraint)
+### CONCEPT.md should be revised
+
+This ADR does not itself edit `CONCEPT.md`; it records what a future
+revision of it should say, since the design decisions above make parts of
+its current text stale.
 
 - §4 ("Concurrency... Locally: file lock + commit on the coordination
   ref.") should be revised to say `git update-ref` compare-and-swap, not
@@ -500,7 +507,10 @@ for no additional correctness benefit.
   independently. Append-only prevents content conflicts; it does not
   prevent the ref pointer from needing reconciliation.
 
-### PLAN.md notation should be revised (not edited here, per constraint)
+### PLAN.md notation should be revised
+
+This ADR does not itself edit `PLAN.md` either, for the same reason: it
+records what should change, not the change itself.
 
 `PLAN.md`'s M2.6 line (`PLAN.md:243`) writes the git adapter's CAS
 signature as `updateRefCAS(ref, expectedOld, new)` — old value second,
@@ -537,8 +547,13 @@ inferred from the mechanism):
    stderr: `! [rejected] refs/cankan/coordination ->
    refs/cankan/coordination (fetch first)`. User sees: nothing if handled
    internally by the retry-fetch-reconcile path; a push-conflict message
-   only if that path itself ultimately fails. Code must: fetch with the
-   explicit refspec, reconcile (see Consequences), retry — never force.
+   only if that path itself ultimately fails. Code must: fetch into a
+   **staging ref**, not the working ref — this rejection means the
+   remote has diverged from local, and a plain fetch of the working
+   ref's own refspec is itself rejected as non-fast-forward in exactly
+   this situation (see Evidence, "Refspec for reconciliation fetches").
+   Reconcile from the staging ref (see Consequences), then retry the
+   push — never force.
 4. **Divergent fetch reconciliation — partly observed, partly reasoned.**
    A plain fetch of the working ref's own refspec is rejected as
    non-fast-forward once local and remote have both advanced —
@@ -572,8 +587,10 @@ inferred from the mechanism):
    board that looks like it has no claims/events at all, or one that
    looks stale, purely because an ordinary git operation was trusted.
    Code must: never rely on ordinary clone/fetch/pull for coordination
-   state; always use the explicit refspec, and lazily initialize the ref
-   if `readRef` returns `null` where a board is expected to have one.
+   state; always fetch with the steady-state refspec
+   (`refs/cankan/coordination:refs/cankan/coordination`) into the working
+   ref, and lazily initialize the ref if `readRef` returns `null` where a
+   board is expected to have one.
 7. **Lease expiry not enforced — reasoned, not implemented anywhere
    yet.** CONCEPT.md §4 specifies expired claims return to Ready; neither
    the spike's `findClaim` nor anything else in this codebase implements

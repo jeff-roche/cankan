@@ -30,18 +30,22 @@ each, plus a dedicated stale-lock experiment; (3) `git rebase`; (4) `git
 merge`; (5) push/fetch through a bare remote, including a genuine
 cross-machine non-fast-forward conflict; (6) claim from a secondary
 worktree, read from the primary with no fetch. `spikes/coordination-ref/
-RESULTS.md` is Task 1's committed evidence artifact for one specific run.
+RESULTS.md` is the spike's committed evidence artifact for one specific
+run.
 
-**My own verification.** Per the controller ruling ("re-run the spike
-yourself before writing anything"), I re-ran `bun spikes/coordination-ref/
-run.ts` four times in this environment before writing this ADR. All six
-scenarios passed in all four runs (24/24). Numbers below that come from my
-own re-runs are cited as such, separately from the single run committed in
-`RESULTS.md`, because the spike is explicitly non-deterministic in its
-timings (its own README says so) and one committed run should not be
-over-read as representative — see Evidence, "File lock timing."
+**Independent re-runs.** `bun spikes/coordination-ref/run.ts` was re-run
+four times in this environment before this ADR was drafted. All six
+scenarios passed in all four runs (24/24), reproducing the committed
+`RESULTS.md`. Figures drawn from these four re-runs are cited separately
+from the single run committed in `RESULTS.md`, because the spike's timings
+are non-deterministic by its own README's admission and one committed run
+should not be over-read as representative — see Evidence, "File lock
+timing." These four-re-run figures are author-reported and recorded here
+for transparency; they exist in no committed artifact, and `RESULTS.md`
+remains the single reproducible baseline.
 
-**Environment** (identical across the committed run and my four re-runs):
+**Environment** (identical across the committed run and the four re-runs
+performed for this ADR):
 
 - `git version 2.55.0`
 - `bun 1.4.0`
@@ -79,77 +83,79 @@ working tree), and attempts `git update-ref refs/cankan/coordination
 retrying the write, so a loser can only ever report `already_claimed`,
 never append a second claim for the same ticket.
 
-Across my four re-runs (10 iterations each, 40 total), the race-outcome
-assertion — exactly one `claimed`, exactly two `already_claimed`, and
-exactly one claim event in the log matching the winner's id — held in
-**all 40 iterations**. Example captured CAS rejection stderr (one of
-several, text is representative across all runs):
+Across the four re-runs performed for this ADR (10 iterations each, 40
+total), the race-outcome assertion — exactly one `claimed`, exactly two
+`already_claimed`, and exactly one claim event in the log matching the
+winner's id — held in **all 40 iterations**. Example captured CAS
+rejection stderr (one of several, text is representative across all
+runs):
 
 ```
 fatal: update_ref failed for ref 'refs/cankan/coordination': cannot lock
 ref 'refs/cankan/coordination': is at <sha> but expected <sha>
 ```
 
-**Contention breadth — stated honestly.** The spike's
+**Contention breadth is narrower than it first appears.** The spike's
 `casContentionCount`/`casMaxAttempts` (`run.ts:255`) records whether *at
 least one* losing worker observed a CAS rejection (`attempts > 1`) per
 iteration; it does not record whether all three workers were mid-flight
-simultaneously, only that at least two were. Across my four re-runs: 39/40
-iterations had a losing worker observe a real rejection (run 3 had one
-iteration with none — both losers apparently read after the winner's write
-had already landed). Max attempts by any single worker was **2** in every
-iteration, every run — the spike never forced a scenario requiring a third
-attempt. The semantic guarantee (one winner, two losers, one log entry)
-does not depend on three-way overlap being observed — it follows from
-`update-ref`'s own atomicity, checked once per pair that does overlap — but
-this spike demonstrates **at-least-2-way contention, reliably, not
-confirmed 3-way contention**. State it this way rather than implying all
-three workers were shown to race simultaneously.
+simultaneously, only that at least two were. Across the four re-runs: 39/40
+iterations had a losing worker observe a real rejection (one iteration in
+the third run had none — both losers apparently read after the winner's
+write had already landed). Max attempts by any single worker was **2** in
+every iteration, every run — the spike never forced a scenario requiring a
+third attempt. The semantic guarantee (one winner, two losers, one log
+entry) does not depend on three-way overlap being observed — it follows
+from `update-ref`'s own atomicity, checked once per pair that does
+overlap — but the evidence supports **at-least-2-way contention,
+reliably, not confirmed 3-way contention**: three workers racing
+simultaneously was never directly confirmed.
 
-### File lock timing — use the re-run spread, not one number
+### File lock timing: the committed figure is an outlier
 
-The committed `RESULTS.md` (Task 1's run) reports a single "longest
-single lock-wait observed" of 377.9ms. Task 1's code review flagged this
-as a high outlier the spike itself doesn't contextualize (`run.ts:316`
-records only the max, never min/avg). My four re-runs of the same
-scenario produced: **31.0ms, 291.8ms, 440.1ms, 442.6ms** — a roughly
-14x spread on the same code, same machine, same iteration count. This is
-scheduler noise on process wake-up during the lock's 10ms poll loop, not a
-stable property of the mechanism; no single number from either the
-committed run or my re-runs should be read as "the" file-lock cost.
+The committed `RESULTS.md` reports a single "longest single lock-wait
+observed" of 377.9ms — a figure the spike itself doesn't contextualize,
+since `run.ts:316` records only the max, never min/avg. Four re-runs of
+the same scenario, performed for this ADR, produced: **31.0ms, 291.8ms,
+440.1ms, 442.6ms** — a roughly 14x spread on the same code, same machine,
+same iteration count. This is scheduler noise on process wake-up during
+the lock's 10ms poll loop, not a stable property of the mechanism; no
+single number, from the committed run or from these re-runs, should be
+read as "the" file-lock cost.
 
-More importantly: **the decision does not rest on performance.** The
-race-wall-clock figures in both the committed run and my re-runs (CAS
+More importantly, **the decision does not rest on performance.** The
+race-wall-clock figures in both the committed run and these re-runs (CAS
 ~260-290ms avg, file lock ~280-370ms avg) are dominated by the spike's own
 250ms start barrier (`barrier.ts`, `raceOnceCAS`/`raceOnceLock` in
 `run.ts:89`/`run.ts:108`) plus three `bun` process startups, not by
-mechanism cost — they should not be read as "CAS is faster than file
-lock" or vice versa. The actual per-operation cost of either mechanism is
-better read from scenario 1 (5 sequential CAS appends: 23.3-196.6ms across
-my four re-runs, i.e. roughly single-digit-to-tens of ms per append once
+mechanism cost — they do not show CAS being faster than file lock, or
+vice versa. The actual per-operation cost of either mechanism is better
+read from scenario 1 (5 sequential CAS appends: 23.3-196.6ms across the
+four re-runs, i.e. roughly single-digit-to-tens of ms per append once
 warm) and scenario 6 (one CAS claim from a secondary worktree: 5.4-9.9ms
-across my four re-runs). Both mechanisms are fast enough for interactive
+across the four re-runs). Both mechanisms are fast enough for interactive
 CLI/MCP use; neither timing result is the reason CAS was chosen.
 
-### Stale-lock failure mode — cite the note, not scenario 2's PASS header
+### Stale-lock failure mode: not covered by scenario 2's pass/fail verdict
 
 Scenario 2's `**Result: PASS**` header covers only the race-outcome
 assertions for the CAS and file-lock races; the stale-lock experiment that
 follows it in the same scenario function (`run.ts:322-380`) is appended as
 notes and does not affect that pass/fail verdict (`run.ts:370-377` only
 *adds a note* if the claimant fails to time out as expected — it never
-fails the scenario). Do not cite "scenario 2: PASS" as evidence about
-stale locks. The actual evidence:
+fails the scenario). Scenario 2's PASS is therefore not, on its own,
+evidence about stale locks; the actual evidence is the note text and the
+re-runs below:
 
-- Task 1's committed run: lockfile left behind after SIGKILLing the
-  holder; the subsequent claimant reported `lock_timeout` after its
-  configured 1.2s timeout.
-- My four re-runs: **the same outcome in all four** — lockfile left
-  behind every time (`existsSync` true), and the claimant against the
-  stale lock reported `lock_timeout` every time (waits observed:
-  1312.8ms, 1259.3ms, 1221.4ms, 1219.4ms — all correctly bounded near the
-  configured 1.2s timeout, never hanging indefinitely because the spike's
-  `acquireLock` polls to a deadline).
+- The committed run: lockfile left behind after SIGKILLing the holder;
+  the subsequent claimant reported `lock_timeout` after its configured
+  1.2s timeout.
+- The four re-runs performed for this ADR: **the same outcome in all
+  four** — lockfile left behind every time (`existsSync` true), and the
+  claimant against the stale lock reported `lock_timeout` every time
+  (waits observed: 1312.8ms, 1259.3ms, 1221.4ms, 1219.4ms — all correctly
+  bounded near the configured 1.2s timeout, never hanging indefinitely
+  because the spike's `acquireLock` polls to a deadline).
 
 This is a real, reproducible failure mode of the file-lock mechanism: the
 spike's lockfile (`lockfile.ts`) has no PID-liveness or lease-based
@@ -164,9 +170,10 @@ is no separate lock object to leak.
 The spike places its lockfile at `join(repoDir, ".git",
 "cankan-coordination.lock")` (`run.ts:283`), with a comment claiming this
 is "shared across worktrees since `.git` is shared." That is true only for
-the **main** worktree, where `.git` is a directory. I verified
-independently (outside the spike) that in a **linked** worktree, `.git` is
-a plain text file containing a pointer, not a directory:
+the **main** worktree, where `.git` is a directory. Independent
+verification for this ADR (outside the spike) confirms that in a
+**linked** worktree, `.git` is a plain text file containing a pointer, not
+a directory:
 
 ```
 $ git -C <linked-worktree> rev-parse --git-dir
@@ -188,7 +195,7 @@ that the CAS approach does not have: git's own ref store is already
 common-dir-aware, so `git update-ref` from any worktree contends
 correctly with no extra path computation.
 
-### Refspec requirement (push/fetch)
+### Refspec requirement: steady-state push and fetch
 
 Scenario 5, all four re-runs plus the committed run, consistently
 confirmed:
@@ -201,30 +208,64 @@ confirmed:
   `refs/cankan/coordination` — the explicit refspec is required on
   *every* fetch, not just the first one that creates the ref locally.
 - The explicit refspec `refs/cankan/coordination:refs/cankan/coordination`
-  correctly moves the ref on both push and fetch.
+  correctly moves the ref on both push and fetch, when the local side is
+  strictly behind (fetch) or strictly ahead (push).
 - A non-fast-forward push of the coordination ref (constructed by having a
   clone append its own claim off a stale local ref, independent of a
   second claim already pushed from the original repo) is rejected by git
   by default, no force needed: `! [rejected] refs/cankan/coordination ->
   refs/cankan/coordination (fetch first)`.
 
-**Scoped honestly:** the "default push doesn't move it" check
+**What was actually tested:** the "default push doesn't move it" check
 (`run.ts:543`) tests `git push origin main`, not a bare `git push` with no
 arguments. This doesn't change the conclusion — a repo's default push
 refspec only ever covers `refs/heads/*`, whether or not a branch is named
-explicitly — but the ADR should say what was actually run rather than
-imply a bare `git push` was tested.
+explicitly.
 
-**Not tested by the spike, reasoned here:** the fetch side of a genuine
-two-machine divergence — both sides having appended different events
-since the last common ancestor — was never exercised. The spike only
-tested a clean fast-forward fetch (remote strictly ahead) and the push
-rejection (local strictly behind, caught by git's own protection). What
-happens when both a machine's local coordination ref *and* the remote have
-advanced independently (e.g., two offline claims on different tickets) is
-addressed as a reasoned design in Consequences, not measured — this is a
-concrete test obligation for M2.6/M2.7, not something this ADR can claim
-was verified.
+This refspec — `refs/cankan/coordination:refs/cankan/coordination`,
+applied to the *working* local ref — is correct only when one side is
+strictly ahead of the other. It is not the refspec to use once both sides
+have diverged; see the next section.
+
+### Refspec for reconciliation fetches
+
+The scenario 5 push rejection above shows that pushing the working ref
+when the remote holds commits the local side lacks is rejected as
+non-fast-forward. The mirror case — fetching the working ref when the
+*local* side holds commits the remote lacks — was not exercised by the
+spike itself (scenario 5 only tested a clean fast-forward fetch and the
+push-side rejection). Direct git commands run for this ADR, outside the
+spike script, confirm the mirror case behaves the same way: fetching the
+plain, non-`+`-prefixed explicit refspec into the *same* local ref name
+when both sides hold commits the other lacks is itself rejected as
+non-fast-forward:
+
+```
+! [rejected]        refs/cankan/coordination -> refs/cankan/coordination  (non-fast-forward)
+```
+
+This is why reconciliation cannot use a plain fetch into the working ref.
+The verified alternative is a fetch into a **distinct local ref name**:
+
+```
+git fetch origin refs/cankan/coordination:refs/cankan/coordination-remote
+```
+
+This was confirmed, by the same direct git commands, to succeed
+unconditionally regardless of divergence — it is a plain creation or
+fast-forward of a ref nothing else writes to, never a CAS or a merge
+against the working `refs/cankan/coordination`. Re-running it after the
+remote advances again also succeeds without a rejection, for the same
+reason: nothing else ever moves the staging ref out from under it.
+
+From the staging ref, the adapter reads both the local working ref and the
+staging ref's event logs, unions them, rebuilds a single new commit on top
+of the staging ref's tip, and CASes the local working ref onto that new
+commit (see Consequences). The fetch-into-a-distinct-name step is
+observed to work, by the commands above; the union/rebuild/CAS logic that
+follows it is a reasoned design, not exercised by any test — a concrete
+test obligation for M2.6/M2.7, not something this ADR can claim was
+verified.
 
 ### Lease expiry — not exercised
 
@@ -256,7 +297,8 @@ three-process contention (see Evidence), so this was not decided on
 correctness. It was decided on:
 
 1. **Stale-lock failure mode**, reproduced by `SIGKILL`ing a lock holder
-   in all four of my re-runs plus the committed run: the lockfile is left
+   in all four re-runs performed for this ADR and in the committed run:
+   the lockfile is left
    behind (no PID-liveness/lease check exists or is trivial to add
    correctly), and every subsequent claimant blocks to its own timeout
    with no automatic recovery. `git update-ref` has no equivalent
@@ -288,24 +330,48 @@ for no additional correctness benefit.
 
 - **`readRef(ref)`**: `git rev-parse --verify <ref>`, returning `null` if
   the ref doesn't exist (spike's `git-plumbing.ts:102`).
-- **`updateRefCAS(ref, newSha, oldSha)`**: `git update-ref <ref> <newSha>
-  <oldSha ?? ZERO_SHA>` (the 40-zero sha for "ref must not exist yet") —
-  the trailing old-value argument to `update-ref` *is* the entire CAS
-  mechanism; no separate locking is needed around it. Return both
+- **`updateRefCAS(ref, newSha, oldSha)`** — new value second, old value
+  third; see "PLAN.md notation should be revised" below for why this
+  order is stated explicitly. Implementation: `git update-ref <ref>
+  <newSha> <oldSha ?? ZERO_SHA>` (the 40-zero sha for "ref must not exist
+  yet") — the trailing old-value argument to `update-ref` *is* the entire
+  CAS mechanism; no separate locking is needed around it. Return both
   success/failure and the exact stderr on failure (spike's
   `git-plumbing.ts:113`), since the retry policy below depends on being
-  able to tell a CAS rejection apart from any other git failure.
+  able to tell a CAS rejection apart from any other git failure. The
+  spike's own `claimViaCAS` (`coordination.ts:171-183`) does not yet make
+  this distinction — it retries on any non-zero `update-ref` exit, so a
+  corrupted ref or a permissions failure would silently loop up to 50
+  times today. M2.6 must match the returned stderr against the
+  CAS-rejection signature (`cannot lock ref '...': is at X but expected
+  Y`) before deciding to retry, and treat anything else as a hard failure
+  — this discrimination is new work, not something the spike already
+  does.
 - **`commitTreeToRef`**: build a commit entirely off-tree — blob via
   `git hash-object -w --stdin`, tree via a private temp index
   (`GIT_INDEX_FILE` pointed at a fresh `mkdtemp()` directory per call, so
   concurrent callers never collide on one index file), commit via `git
   commit-tree <tree> -p <old> -m <msg>` — never touching the real index or
   working tree (spike's `git-plumbing.ts:64`, `coordination.ts:102`).
+- **`readBlobFromRef(ref, path)`** (named in `PLAN.md`'s M2.6 line, not
+  given its own spec by the spike directly): resolve `ref` to a commit,
+  then read `<path>` at that commit — `git cat-file -p <commit>:<path>`,
+  exactly the spike's `readFileAtCommit` (`git-plumbing.ts:129`). Return
+  the blob's content as a string when it exists; return `null`, not
+  throw, when the path doesn't exist at that commit — the spike's version
+  keys this off `cat-file`'s exit code, treating any non-zero exit as
+  "not found" (`git-plumbing.ts:134-135`) rather than distinguishing
+  "file missing" from other errors, which is adequate for what this is
+  used for here: reading a specific month's JSONL file (which may not
+  exist yet — no claims that month is not an error) and reading it at a
+  specific historical commit (rebuilding state at a point in time).
+  Callers must treat `null` as "empty," not "failure."
 - **Retry/backoff policy on CAS contention**: on rejection, **re-read the
   ref and re-check the claim state before retrying the write** — never
   blindly retry the same write. This is what the spike's `claimViaCAS`
   already does and it is empirically sufficient at 3-worker contention:
-  39/40 iterations across my four re-runs resolved within 2 attempts, and
+  39/40 iterations across the four re-runs performed for this ADR resolved
+  within 2 attempts, and
   the spike's `maxAttempts = 50` was never approached. For contention
   levels the spike didn't test (more concurrent claimants, or the general
   case of concurrent *different-ticket* appends — see M2.7 below), add
@@ -314,36 +380,43 @@ for no additional correctness benefit.
   "claim contention exceeded" error rather than retrying forever. This
   part of the policy is **reasoned, not measured** — the spike never
   forced contention beyond 3 same-ticket racers.
-- **Required refspec, every push and every fetch, with no exception once
-  the ref exists**: `refs/cankan/coordination:refs/cankan/coordination`.
-  Confirmed (see Evidence): default push/fetch/clone never touch this ref,
-  not even to advance an already-existing local copy. Use this exact
-  refspec string as an explicit argument on every push/fetch call — do
-  **not** rely on a persistent `remote.origin.fetch` config entry as an
+- **Required refspec for steady-state push and fetch, with no exception
+  once the ref exists**: `refs/cankan/coordination:refs/cankan/
+  coordination`, applied directly to the local working ref. Confirmed
+  (see Evidence): default push/fetch/clone never touch this ref, not even
+  to advance an already-existing local copy. Use this exact refspec
+  string as an explicit argument on every push/fetch call — do **not**
+  rely on a persistent `remote.origin.fetch` config entry as an
   alternative; that was not tested here, and a `+` (force) prefix on such
   a config entry would be actively dangerous given the reconciliation
   requirement below (it would let a fetch silently clobber unpushed local
-  claims instead of failing safe).
+  claims instead of failing safe). This refspec is only ever correct when
+  one side is strictly ahead of the other — see the reconciliation
+  refspec below for the diverged case.
 - **Cross-machine push rejection handling**: on a non-fast-forward push
   rejection (confirmed exact stderr: `! [rejected]
   refs/cankan/coordination -> refs/cankan/coordination (fetch first)`),
-  the push path must **fetch (with the explicit refspec above) and
-  reconcile, then retry the push — never force-push**. This matches
-  CONCEPT.md §4's "optimistic push, retry on rejection," which turns out
-  to be exactly git's own non-fast-forward protection, free.
-- **Fetch-side reconciliation when local and remote have both advanced**
-  (reasoned design, **not exercised by the spike** — the spike only
-  tested a clean fast-forward fetch and the push-rejection case, never a
-  fetch where both sides hold events the other doesn't have): fetch the
-  remote ref into a staging ref or `FETCH_HEAD` rather than attempting a
-  plain fast-forward move of the local ref; read both the local and fetched
-  event logs; union the events (dedupe by event id — the log is
-  append-only, so this is a set union, not a merge of mutable state);
-  rebuild a single new commit chain on top of the remote tip containing
-  any locally-appended events the remote doesn't have; CAS the local ref
-  to that new commit; then push. **This is an explicit test obligation
-  for M2.6/M2.7**, not something this ADR can claim was verified — build
-  the test before relying on the design.
+  the push path must **fetch (into a staging ref, per the reconciliation
+  refspec below) and reconcile, then retry the push — never force-push**.
+  This matches CONCEPT.md §4's "optimistic push, retry on rejection,"
+  which turns out to be exactly git's own non-fast-forward protection,
+  free.
+- **Fetch-side reconciliation when local and remote have both advanced**:
+  fetch the remote ref into a **distinct local ref name** — `git fetch
+  origin refs/cankan/coordination:refs/cankan/coordination-remote` —
+  never the working ref directly, since a plain fetch of the working
+  ref's own refspec is itself rejected as non-fast-forward once both
+  sides have diverged (confirmed by direct testing; see Evidence,
+  "Refspec for reconciliation fetches"). From the staging ref: read both
+  the local and staged event logs; union the events (dedupe by event id —
+  the log is append-only, so this is a set union, not a merge of mutable
+  state); rebuild a single new commit chain on top of the staging ref's
+  tip containing any locally-appended events it doesn't have; CAS the
+  local working ref to that new commit; then push. The fetch-into-a-
+  staging-ref step is observed to work; the union/rebuild/CAS logic after
+  it is a reasoned design, **not exercised by any test**. **This is an
+  explicit test obligation for M2.6/M2.7** — build the test before
+  relying on the design.
 - **Ref must never be assumed to exist**: a fresh clone brings no
   `refs/cankan/*` (confirmed). The adapter must check `readRef` and, if
   `null`, either initialize the ref (fresh repo/board) or fetch it
@@ -368,6 +441,13 @@ for no additional correctness benefit.
   union.
 - **Monthly JSONL layout** under the ref, unchanged from the spike:
   `events/<yyyy-mm>.jsonl`, one JSON object per line, appended in order.
+  **The claim-lookup logic built on top of this layout must not be
+  carried forward unchanged** — see "Cross-month claim blindness" in
+  Known failure modes below: the spike's own claim check only ever reads
+  the current month's file, which is a correctness gap, not a layout
+  concern. `read({since, ticket, actor})` must aggregate across as many
+  trailing months as the longest configurable lease can span, not just
+  the current one.
 - **ULID ids**, not the spike's `randomEventId()` (a UUID stand-in
   explicitly marked "not a real ULID... for a throwaway spike" in
   `git-plumbing.ts:138`) — do not carry that stand-in forward.
@@ -402,11 +482,43 @@ for no additional correctness benefit.
   coordination` refspec is required on every push and fetch, not implied
   by a plain `git push`/`git pull`/`git clone` — confirmed none of those
   touch it, even once the ref exists locally.
+- The config example's `push_ref: true # push/pull the coordination ref
+  with normal git remote ops` (`CONCEPT.md:293`) should be revised: normal
+  remote operations never move the ref regardless of any config flag —
+  there is no "normal git remote ops" mode that pushes/pulls it, only the
+  explicit refspec above. The line should describe that requirement, not
+  imply a config toggle changes git's default refspec behavior.
+- "Append-only merges trivially" (`CONCEPT.md:160`) and "append-only
+  events prevent conflicts" (`CONCEPT.md:229`) should be revised to
+  distinguish two different senses of "conflict." The event log itself
+  has no *semantic* merge conflicts, because it's append-only — two
+  events never need reconciling against each other's content. But
+  git-level non-fast-forward conflicts on the ref pointer itself do
+  occur — confirmed directly, both on push (Evidence, "Refspec
+  requirement") and on fetch (Evidence, "Refspec for reconciliation
+  fetches") — whenever two sides have both advanced the ref
+  independently. Append-only prevents content conflicts; it does not
+  prevent the ref pointer from needing reconciliation.
+
+### PLAN.md notation should be revised (not edited here, per constraint)
+
+`PLAN.md`'s M2.6 line (`PLAN.md:243`) writes the git adapter's CAS
+signature as `updateRefCAS(ref, expectedOld, new)` — old value second,
+new value third. This ADR and the spike it is built on
+(`git-plumbing.ts:113`) use the opposite order,
+`updateRefCAS(ref, newSha, oldSha)` — new value second, old value third.
+**The signature this ADR specifies for M2.6 to implement is
+`updateRefCAS(ref, newSha, oldSha)`**, matching the spike (see
+Consequences above). `PLAN.md:243`'s notation is the one that should be
+revised to match — an implementer reading both documents together should
+not have to guess which argument order is authoritative on a
+compare-and-swap, where getting it backwards silently inverts the check.
 
 ## Known failure modes
 
-Distinguishing observed (reproduced by the spike or my re-runs) from
-reasoned (not exercised, inferred from the mechanism):
+Distinguishing observed (reproduced by the spike, or by direct
+verification performed for this ADR) from reasoned (not exercised,
+inferred from the mechanism):
 
 1. **CAS rejection under real contention — observed.** A losing worker's
    `git update-ref` call fails with `cannot lock ref '...': is at <X> but
@@ -427,16 +539,23 @@ reasoned (not exercised, inferred from the mechanism):
    internally by the retry-fetch-reconcile path; a push-conflict message
    only if that path itself ultimately fails. Code must: fetch with the
    explicit refspec, reconcile (see Consequences), retry — never force.
-4. **Divergent fetch reconciliation — reasoned, not tested by the
-   spike.** Two machines each append events (possibly to different
-   tickets, possibly the same one) while offline, then both try to
-   sync. User sees: their sync/push either succeeds after a brief delay
-   (typical case) or, if both machines claimed the *same* ticket, one of
-   them finds out their claim didn't hold once reconciliation runs. Code
-   must: union event logs by event id (append-only, never drop), rebuild
-   and CAS the local ref, and (for the same-ticket case) let `state/
-   fold.ts` (M2.8) apply a deterministic tie-break and notify the loser —
-   not designed in this ADR, flagged for M2.8.
+4. **Divergent fetch reconciliation — partly observed, partly reasoned.**
+   A plain fetch of the working ref's own refspec is rejected as
+   non-fast-forward once local and remote have both advanced —
+   **observed** directly (see Evidence, "Refspec for reconciliation
+   fetches"). Two machines each appending events (possibly to different
+   tickets, possibly the same one) while offline, then both syncing, hit
+   exactly this on the next fetch. User sees: their sync/push either
+   succeeds after a brief delay once the adapter fetches into a staging
+   ref and reconciles (typical case), or, if both machines claimed the
+   *same* ticket, one of them finds out their claim didn't hold once
+   reconciliation runs. Code must: fetch into a staging ref (observed to
+   work), union event logs by event id (append-only, never drop), rebuild
+   and CAS the local ref, and — for the same-ticket case — let `state/
+   fold.ts` (M2.8) apply a deterministic tie-break and notify the loser.
+   The fetch-into-staging-ref step is observed; the union/rebuild/CAS
+   logic and the tie-break itself are **reasoned, not tested** — not
+   designed in this ADR, flagged for M2.7/M2.8.
 5. **Stale file lock — observed, applies only if the file-lock
    alternative were ever used instead of the chosen CAS mechanism.**
    Included here because it is a concrete failure mode this ADR's
@@ -469,3 +588,22 @@ reasoned (not exercised, inferred from the mechanism):
    should: skip-and-warn with file/line context, or fail with a
    diagnosable error identifying the offending ref/commit/file, rather
    than an unguarded parse exception.
+9. **Cross-month claim blindness — reasoned, not implemented; this is a
+   substantive gap, not an edge case.** `eventFilePath()` defaults to the
+   current UTC month (`coordination.ts:26`), and both `claimViaCAS` and
+   `findClaim` only ever read that single month's file
+   (`coordination.ts:147`, `70`). A claim lookup is therefore blind to
+   claims recorded in a previous month's file. Given CONCEPT.md §4's
+   default 2h lease, a claim made shortly before a UTC month boundary is
+   still well within its lease when a check made just after the boundary
+   looks only at the new month's file — which has no entry for that
+   ticket — so the ticket reads as unclaimed and can be claimed a second
+   time. This is exactly the double-claim the coordination-ref design
+   exists to prevent, reintroduced at a specific time boundary rather
+   than by any concurrency failure. User sees: no error at all — a second
+   `claim` on an already-claimed ticket silently appears to succeed, near
+   a month rollover. Code must: aggregate claim lookups across month
+   boundaries — at minimum the current and previous month's files, and
+   more generally at least as many trailing months as the longest
+   configurable lease can span — never assume the current month's file is
+   a complete picture of active claims.

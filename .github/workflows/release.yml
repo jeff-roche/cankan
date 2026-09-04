@@ -1,0 +1,15 @@
+name: Release
+
+# Stub triggered by version tags. The real pipeline (build binaries,
+# publish to npm, cut a GitHub release with assets) is built in M5.2 -
+# this only proves the trigger wiring works before then.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Release pipeline for ${{ github.ref_name }} lands in M5.2"

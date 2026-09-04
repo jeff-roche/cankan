@@ -227,12 +227,16 @@ function renderMilestoneBody(
   milestone: Milestone,
   tasks: Task[],
   idToIssue: Map<string, number>,
+  closedIssues: Set<number>,
 ): string {
   const items = tasks
     .filter((t) => t.milestone === milestone.id)
     .map((t) => {
       const num = idToIssue.get(t.id);
-      return `- [ ] ${num ? `#${num}` : "(pending)"} \`${t.id}\` ${t.title}`;
+      // Closed issue = task done (see docs/issue-conventions.md), so the box
+      // reflects issue state rather than being reset to unchecked on every sync.
+      const box = num !== undefined && closedIssues.has(num) ? "[x]" : "[ ]";
+      return `- ${box} ${num ? `#${num}` : "(pending)"} \`${t.id}\` ${t.title}`;
     })
     .join("\n");
   return `## Tasks\n${items}\n`;
@@ -341,24 +345,27 @@ function main() {
     existingMilestonesRaw.map((m) => [m.title, m.number]),
   );
 
-  const existingIssuesRaw: { number: number; title: string }[] = JSON.parse(
-    gh([
-      "issue",
-      "list",
-      "--repo",
-      repo,
-      "--state",
-      "all",
-      "--json",
-      "number,title",
-      "--limit",
-      "500",
-    ]),
-  );
+  const existingIssuesRaw: { number: number; title: string; state: string }[] =
+    JSON.parse(
+      gh([
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "all",
+        "--json",
+        "number,title,state",
+        "--limit",
+        "500",
+      ]),
+    );
   const idToIssue = new Map<string, number>();
+  const closedIssues = new Set<number>();
   for (const issue of existingIssuesRaw) {
     const m = issue.title.match(/^\[((?:M\d+|MB)(?:\.\d+)?)\]/);
     if (m) idToIssue.set(m[1], issue.number);
+    if (issue.state.toUpperCase() === "CLOSED") closedIssues.add(issue.number);
   }
 
   ensureLabels(repo, dryRun, existingLabels);
@@ -478,7 +485,7 @@ function main() {
     ]);
   }
   for (const m of milestones) {
-    const body = renderMilestoneBody(m, tasks, idToIssue);
+    const body = renderMilestoneBody(m, tasks, idToIssue, closedIssues);
     const bodyPath = join(bodyDir, `${m.id}.md`);
     writeFileSync(bodyPath, body);
     gh([

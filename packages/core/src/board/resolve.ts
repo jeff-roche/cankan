@@ -95,8 +95,8 @@ import { basename, dirname, join } from "node:path";
 import { CanKanError, isCanKanError } from "../errors";
 import type { BoardRef } from "../types";
 import { BoardErrorCodes } from "./errors";
-import { ensurePersonalBoard, resolvePersonalBoardPath } from "./personal";
-import { buildBoardRef, isContained, realpathExistingPrefix } from "./ref";
+import { canonicalPersonalPath, ensurePersonalBoard } from "./personal";
+import { buildBoardRef, isContained } from "./ref";
 import { findRegisteredBoard, listRegisteredBoards } from "./registry";
 
 /**
@@ -269,57 +269,12 @@ async function isDirectory(path: string): Promise<boolean> {
   }
 }
 
-/**
- * The personal board's own path for comparison against a candidate
- * `BoardRef`'s (already-canonical) `root`/`ticketsDir`. `undefined` only
- * when no data home can be resolved at all (matching `registry.ts`'s
- * private `resolveCanonicalPersonalPath`, not exported from that file, so
- * this is a local copy rather than a cross-import).
- *
- * Every caller in this module treats `personalPath === undefined` as
- * "nothing to compare against, skip the check" -- so this function must
- * never return `undefined` merely because the personal board does not
- * exist yet. A never-yet-created personal board is the *ordinary* state
- * of a fresh `cankan` install, not evidence that no alias check is needed;
- * treating it as "no comparison possible" would silently disable every
- * privacy guard in this file for exactly the sessions where they matter
- * most (a first run).
- *
- * Resolved in three tiers, each a fallback for the last:
- *
- * 1. `realpath(raw)` -- the board exists; fully canonical.
- * 2. `realpathExistingPrefix(raw)` (reused from `ref.ts`, the same
- *    technique it uses for `tickets_dir`) -- the board (or some ancestor
- *    of it) does not exist yet, but everything that *does* exist along the
- *    path is still resolved canonically and the missing suffix is
- *    re-appended verbatim. This is what keeps the comparison correct when
- *    `$XDG_DATA_HOME` itself sits behind a symlink (FreeBSD ships
- *    `/home -> /usr/home` by default) and the personal board has never
- *    been created: a raw, un-resolved path here would disagree with the
- *    already-`realpath`'d `ref.root`/`ref.ticketsDir` it gets compared
- *    against on exactly the symlinked prefix, defeating the comparison in
- *    the same way an unresolved `BoardRef.root` would.
- * 3. The raw path itself -- only if even that fails (an ancestor is
- *    unreadable, say). A guard comparing a possibly non-canonical path is
- *    still better than one skipped entirely; the residual risk here is
- *    narrow (it needs `$HOME`/`$XDG_DATA_HOME` itself behind a symlink
- *    *and* an ancestor unreadable *and* the board never created) and is
- *    the same class of accepted, documented residual this module's
- *    canonicalization ruling already lives with elsewhere.
- */
-async function canonicalPersonalPath(env: Env): Promise<string | undefined> {
-  const raw = resolvePersonalBoardPath(env);
-  if (!raw) return undefined;
-  try {
-    return await realpath(raw);
-  } catch {
-    try {
-      return await realpathExistingPrefix(raw);
-    } catch {
-      return raw;
-    }
-  }
-}
+// `canonicalPersonalPath` is imported from `./personal` -- shared with
+// `registry.ts`'s `listRegisteredBoards` (fix round 5, H1: this file and
+// `registry.ts` each held a byte-for-byte-identical copy of the same
+// three-tier fallback chain, which no test could ever catch diverging
+// since each file's tests only exercised its own copy). See that
+// function's own doc comment for the full three-tier explanation.
 
 type WalkResult = { readonly kind: "repo"; readonly root: string } | { readonly kind: "personal-tree" };
 

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import util from "node:util";
 import { isCanKanError } from "../src/errors";
 import {
   createGitAdapter,
@@ -122,6 +123,10 @@ describe("validateCoordinationRef", () => {
     );
     await expectCode(adapter.fetch("origin", "refs/heads/main"), GitErrorCodes.GIT_REF_INVALID);
     await expectCode(adapter.push("origin", "refs/heads/main"), GitErrorCodes.GIT_REF_INVALID);
+    await expectCode(
+      adapter.fetchReconciliation("origin", "refs/heads/main", COORD_REF),
+      GitErrorCodes.GIT_REF_INVALID,
+    );
   });
 });
 
@@ -246,6 +251,79 @@ describe("updateRefCAS — PLAN.md's floor and the inversion hazard", () => {
   });
 });
 
+describe("F2 — newSha/oldSha/parent must be a 40-hex object id", () => {
+  test("updateRefCAS rejects a newSha that is not a sha", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await expectCode(
+      adapter.updateRefCAS(COORD_REF, "HEAD" as ObjectSha, null),
+      GitErrorCodes.GIT_SHA_INVALID,
+    );
+  });
+
+  test("updateRefCAS rejects an oldSha that is not a sha", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const validSha = "a".repeat(40) as unknown as ObjectSha;
+    await expectCode(
+      adapter.updateRefCAS(COORD_REF, validSha, "refs/heads/main" as unknown as RefSha),
+      GitErrorCodes.GIT_SHA_INVALID,
+    );
+  });
+
+  test("commitTreeToRef rejects a params.parent that is not a sha, before building anything off-tree", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const statusBefore = git(repo.dir, ["status", "--porcelain"]);
+
+    await expectCode(
+      adapter.commitTreeToRef(COORD_REF, {
+        parent: "HEAD" as unknown as RefSha,
+        message: "x",
+        files: [{ path: "events/2026-09.jsonl", content: "{}\n" }],
+      }),
+      GitErrorCodes.GIT_SHA_INVALID,
+    );
+
+    // Rejected before `buildTree` ever ran — no stray temp index, no change
+    // to the worktree.
+    expect(git(repo.dir, ["status", "--porcelain"])).toBe(statusBefore);
+    expect(await adapter.readRef(COORD_REF)).toBeNull();
+  });
+
+  test("the reproduced lost-update sequence is now prevented at the type/runtime boundary", async () => {
+    // Verified reproduction (fix-round-1 F2, before this fix): a caller
+    // passes a non-sha revision expression as `newSha` (e.g. "HEAD"),
+    // `updateRefCAS` applies it and hands back `{ sha: "HEAD" }`; a second
+    // writer advances the ref normally; the first caller then passes "HEAD"
+    // back as a *stale* `oldSha` — since "HEAD" is late-bound, the compare
+    // silently matches the ref's *current* value instead of the value it had
+    // when the caller last observed it, and the write is wrongly accepted,
+    // discarding the second writer's commit. `assertShaShape` closes this by
+    // rejecting the non-sha value at the very first call, before it is ever
+    // returned to a caller as if it were a legitimate compare value.
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // The caller's first (malformed) call: never reaches git, never applies,
+    // never hands back a bogus "sha".
+    await expectCode(
+      adapter.updateRefCAS(COORD_REF, "HEAD" as unknown as ObjectSha, null),
+      GitErrorCodes.GIT_SHA_INVALID,
+    );
+
+    // A second, legitimate writer proceeds normally and is never at risk of
+    // being silently overwritten by the first caller's (rejected) attempt.
+    const secondWriter = await adapter.commitTreeToRef(COORD_REF, {
+      parent: null,
+      message: "second writer's commit",
+      files: [{ path: "events/2026-09.jsonl", content: '{"claim":true}\n' }],
+    });
+    expect(secondWriter.outcome).toBe("applied");
+    expect(await adapter.readBlobFromRef(COORD_REF, "events/2026-09.jsonl")).toBe('{"claim":true}\n');
+  });
+});
+
 describe("commitTreeToRef — the no-parent case", () => {
   test("omits -p and compares against the 40-zero sha when parent is null", async () => {
     const repo = await tempRepo();
@@ -319,6 +397,125 @@ describe("failure mode 10 — coordination ref configured outside its namespace"
     // And the local working ref is unchanged too — nothing to push at all.
     const localMain = git(repo.dir, ["rev-parse", "main"]).trim();
     expect(localMain).toBe(mainTipBefore);
+  });
+});
+
+describe("F1 — a coordination ref that is itself a symbolic ref", () => {
+  test("validation rejects a pre-planted symref, and main is never moved", async () => {
+    // ADR 0001 notes "HEAD works identically, since update-ref dereferences
+    // it" but defends only lexically — a coordination ref whose *name*
+    // passes both mandated checks can still be a symref pointing at
+    // refs/heads/main. Verified reproduction (before this fix): with the
+    // ref planted this way, readRef returned main's tip and commitTreeToRef
+    // applied a commit that moved main, with the name-level guard fully in
+    // force throughout.
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const mainTipBefore = git(repo.dir, ["rev-parse", "main"]).trim();
+
+    git(repo.dir, ["symbolic-ref", COORD_REF, "refs/heads/main"]);
+
+    await expectCode(adapter.readRef(COORD_REF), GitErrorCodes.GIT_REF_INVALID);
+    await expectCode(
+      adapter.commitTreeToRef(COORD_REF, {
+        parent: null,
+        message: "attempted hijack via symref",
+        files: [{ path: "events/2026-09.jsonl", content: "{}\n" }],
+      }),
+      GitErrorCodes.GIT_REF_INVALID,
+    );
+
+    expect(git(repo.dir, ["rev-parse", "main"]).trim()).toBe(mainTipBefore);
+  });
+
+  test("--no-deref backstop: even if a write reaches update-ref against a symref, main is never moved", async () => {
+    // The validation test above proves the *easy* half; it never exercises
+    // `--no-deref` at all, since validation throws before `update-ref` is
+    // ever invoked. This test exercises `--no-deref` in isolation, as a
+    // deterministic proof that the mechanism itself holds if it were ever
+    // the only thing standing between a symref and `main` — a genuine
+    // concurrent TOCTOU race (the ref becoming a symref in the gap between
+    // this module's own validation call and its own update-ref call) would
+    // require inter-process timing this suite does not rely on to prove the
+    // point; the backstop's soundness does not depend on winning that race,
+    // only on `--no-deref` behaving as observed below regardless of when it
+    // is invoked.
+    const repo = await tempRepo();
+    const mainTipAtSymrefTime = git(repo.dir, ["rev-parse", "main"]).trim();
+
+    // Plant the ref as a symref to main, then advance main further — so a
+    // sha captured *before* the symref swap (as `readRef`'s dereferencing
+    // `rev-parse --verify` would have captured it) is now stale relative to
+    // what the symref currently resolves to.
+    git(repo.dir, ["symbolic-ref", COORD_REF, "refs/heads/main"]);
+    git(repo.dir, ["commit", "--allow-empty", "-m", "main advances after the symref swap"]);
+    const mainTipAfterAdvance = git(repo.dir, ["rev-parse", "main"]).trim();
+    expect(mainTipAfterAdvance).not.toBe(mainTipAtSymrefTime);
+
+    const newSha = git(
+      repo.dir,
+      ["commit-tree", "-p", mainTipAtSymrefTime, "-m", "hijack attempt", git(repo.dir, ["write-tree"]).trim()],
+    ).trim();
+
+    // The exact argv `updateRefCASCore` issues, invoked directly to isolate
+    // `--no-deref`'s own behavior from `ensureValidRef`'s (separately
+    // tested) symref check.
+    const result = Bun.spawnSync(
+      ["git", "update-ref", "--no-deref", "--end-of-options", COORD_REF, newSha, mainTipAtSymrefTime],
+      { cwd: repo.dir, stdout: "pipe", stderr: "pipe" },
+    );
+
+    // Observed for this task: with a *stale* compare value (main has since
+    // advanced), the write is rejected — `--no-deref` still compares against
+    // the symref's current dereferenced target, so the CAS mechanism itself
+    // keeps working across the swap. main is untouched either way; the test
+    // below this one exercises the other half — a *matching* compare value
+    // succeeds by converting the coordination ref back into a direct ref,
+    // never by advancing whatever the symref pointed to.
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr.toString()).toContain("cannot lock ref");
+
+    expect(git(repo.dir, ["rev-parse", "main"]).trim()).toBe(mainTipAfterAdvance);
+  });
+
+  test("--no-deref backstop: a matching compare converts the symref to a direct ref, without advancing main", async () => {
+    // The prose aside in the test above ("a matching compare value would
+    // instead succeed by converting the coordination ref back into a direct
+    // ref") is the other half of the same mechanism and is just as
+    // deterministic to set up — no race needed, since a matching compare
+    // means the write happens on the first attempt.
+    const repo = await tempRepo();
+    const mainTipAtSymrefTime = git(repo.dir, ["rev-parse", "main"]).trim();
+
+    git(repo.dir, ["symbolic-ref", COORD_REF, "refs/heads/main"]);
+    // main is deliberately NOT advanced here — the compare below is against
+    // the symref's current (unchanged) dereferenced target, so it matches.
+
+    const newSha = git(
+      repo.dir,
+      ["commit-tree", "-p", mainTipAtSymrefTime, "-m", "converts the symref", git(repo.dir, ["write-tree"]).trim()],
+    ).trim();
+
+    const result = Bun.spawnSync(
+      ["git", "update-ref", "--no-deref", "--end-of-options", COORD_REF, newSha, mainTipAtSymrefTime],
+      { cwd: repo.dir, stdout: "pipe", stderr: "pipe" },
+    );
+
+    expect(result.exitCode).toBe(0);
+
+    // COORD_REF is no longer a symref — `--no-deref` wrote directly to its
+    // own path, converting it to a normal ref pointing at newSha.
+    const symrefCheck = Bun.spawnSync(["git", "symbolic-ref", "-q", "--end-of-options", COORD_REF], {
+      cwd: repo.dir,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(symrefCheck.exitCode).not.toBe(0);
+    expect(git(repo.dir, ["rev-parse", "--verify", "--end-of-options", COORD_REF]).trim()).toBe(newSha);
+
+    // main itself was never advanced — the write landed on COORD_REF's own
+    // path, never dereferenced through to main.
+    expect(git(repo.dir, ["rev-parse", "main"]).trim()).toBe(mainTipAtSymrefTime);
   });
 });
 
@@ -461,6 +658,128 @@ describe("gitCommonDir", () => {
     const commonDir = await adapter.gitCommonDir();
     expect(commonDir.startsWith("/")).toBe(true);
     expect(commonDir).toBe(join(repo.dir, ".git"));
+  });
+});
+
+describe("F5 — readRef distinguishes absent from present-but-unreadable", () => {
+  test("hard error on a genuinely broken ref, never a silent null", async () => {
+    // `git show-ref --exists`: exit 0 present, exit 2 absent, exit 1 lookup
+    // failed. Before this fix, `rev-parse --verify --quiet` was
+    // byte-identical (exit 1, empty stdout, empty stderr) for "absent" and
+    // "present but unreadable" — this plants the second case directly (a
+    // ref file whose content is not a valid sha) and asserts it is a typed
+    // hard error, not the `null` a caller would otherwise read as "no
+    // claims here."
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    const gitDir = git(repo.dir, ["rev-parse", "--git-dir"]).trim();
+    await mkdir(join(repo.dir, gitDir, "refs", "cankan"), { recursive: true });
+    await Bun.write(join(repo.dir, gitDir, "refs", "cankan", "coordination"), "garbage-not-a-sha\n");
+
+    await expectCode(adapter.readRef(COORD_REF), GitErrorCodes.GIT_COMMAND_FAILED);
+  });
+
+  test("a directory/file conflict on the ref's path reads as absent, and a write attempt still fails closed", async () => {
+    // `show-ref --exists` reports this specific sub-case (a directory
+    // sitting where the ref file would be) as exit 2, the same code as a
+    // genuinely absent ref — recorded as an accepted, deliberate
+    // simplification (see adapter.ts's `readRefCore` doc comment): a read
+    // cannot distinguish "absent" from "blocked by a directory" any better
+    // than git itself does, and the important property is that a *write*
+    // attempt against that same path still cannot silently succeed.
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    const gitDir = git(repo.dir, ["rev-parse", "--git-dir"]).trim();
+    const conflictDir = join(repo.dir, gitDir, "refs", "cankan", "coordination");
+    await mkdir(join(conflictDir, "sub"), { recursive: true });
+    await Bun.write(join(conflictDir, "sub", "leaf"), `${git(repo.dir, ["rev-parse", "HEAD"]).trim()}\n`);
+
+    expect(await adapter.readRef(COORD_REF)).toBeNull();
+
+    // Fails closed rather than silently double-claiming: the mandated
+    // caller response to a null readRef (commitTreeToRef with parent: null)
+    // still hard-errors, since git itself cannot create a loose ref file
+    // where a directory already occupies that path.
+    await expect(
+      adapter.commitTreeToRef(COORD_REF, {
+        parent: null,
+        message: "would-be first claim",
+        files: [{ path: "events/2026-09.jsonl", content: "{}\n" }],
+      }),
+    ).rejects.toThrow();
+  });
+});
+
+describe("F4 — the transport no longer fails closed on ambient env vars simple-git used to inspect", () => {
+  test("GIT_SSH_COMMAND and PREFIX in the ambient environment no longer break every git operation", async () => {
+    // Fix-round-1 F4: `simple-git`'s unsafe-operations plugin inspected an
+    // 18-key private table; the prior transport's strip list covered 7,
+    // deliberately leaving load-bearing ones (this list) unstripped, which
+    // meant a host that set any of them made *every* git operation in this
+    // module fail before the command ran, regardless of relevance. Ruling
+    // 11 removes the plugin (and therefore the strip list) entirely by
+    // moving off `simple-git` — this test proves the previously-poisonous
+    // variables are now inert.
+    const previous = {
+      GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND,
+      PREFIX: process.env.PREFIX,
+    };
+    process.env.GIT_SSH_COMMAND = "ssh -i /nonexistent/key";
+    process.env.PREFIX = "/usr/local";
+    try {
+      const repo = await tempRepo();
+      const adapter = await createGitAdapter(repo.dir);
+      const result = await adapter.commitTreeToRef(COORD_REF, {
+        parent: null,
+        message: "seed with hostile-looking env vars present",
+        files: [{ path: "events/2026-09.jsonl", content: "{}\n" }],
+      });
+      expect(result.outcome).toBe("applied");
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  test("GIT_CONFIG_COUNT/KEY_0/VALUE_0 are merged into the child's env, not stripped, and are genuinely honored by git", async () => {
+    // A stronger form of the test above: GIT_CONFIG_COUNT=0 (the old test's
+    // value) is trivially inert to git regardless of whether it reaches the
+    // child process, so it could not by itself prove the var was actually
+    // merged rather than coincidentally harmless. This sets a config
+    // override that a real host might use (CI identity injection) and
+    // asserts it is *honored* — proof the merge in `runGitRaw`'s `env: {
+    // ...process.env, LC_ALL: "C", ...options.env }` (R7) actually reaches
+    // the child, since this module does no per-key allowlisting any more.
+    const previous = {
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+    };
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "user.name";
+    process.env.GIT_CONFIG_VALUE_0 = "CI Bot";
+    try {
+      const repo = await tempRepo();
+      const adapter = await createGitAdapter(repo.dir);
+      const result = await adapter.commitTreeToRef(COORD_REF, {
+        parent: null,
+        message: "seed with a config override injected via the environment",
+        files: [{ path: "events/2026-09.jsonl", content: "{}\n" }],
+      });
+      expect(result.outcome).toBe("applied");
+      if (result.outcome !== "applied") throw new Error("unreachable");
+      const authorName = git(repo.dir, ["log", "-1", "--format=%an", result.sha]).trim();
+      expect(authorName).toBe("CI Bot");
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 });
 
@@ -615,7 +934,7 @@ describe("withCasRetry — contention exceeded", () => {
 });
 
 describe("credential leak (M2.1 security finding)", () => {
-  test("a failing push against a token-bearing URL never leaks the token into message, details, or JSON.stringify", async () => {
+  test("a failing push against a token-bearing URL never leaks the token into message, details, JSON.stringify, or util.inspect", async () => {
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);
     const seeded = await adapter.commitTreeToRef(COORD_REF, {
@@ -644,6 +963,21 @@ describe("credential leak (M2.1 security finding)", () => {
     // The cause is attached (not dropped), it's simply never serialized —
     // `CanKanError.toJSON()` excludes `cause` by construction.
     expect(thrown.cause).toBeDefined();
+
+    // Fix-round-1 F3: the M2.1 mitigation held for `toJSON`/`JSON.stringify`
+    // but not for anything that *prints* the error — `console.error(err)`
+    // and Bun/Node's uncaught-rejection printer both render via
+    // `util.inspect`, which rendered `simple-git`'s `GitError.task.commands`
+    // (raw argv, including the credential-bearing remote URL) in full even
+    // though `message` and `details` were clean. Closed by construction now
+    // that this module's transport never produces an error object with an
+    // own-enumerable argv property in the first place (see `transport.ts`'s
+    // `runGit` doc comment) — asserted directly here, at every depth,
+    // including through the `cause` chain.
+    expect(util.inspect(thrown, { depth: null })).not.toContain(token);
+    if (thrown.cause !== undefined) {
+      expect(util.inspect(thrown.cause, { depth: null })).not.toContain(token);
+    }
   });
 });
 

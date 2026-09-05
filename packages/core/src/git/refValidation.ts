@@ -26,6 +26,7 @@ const COORDINATION_REF_PATTERN = /^refs\/cankan\/[A-Za-z0-9._/-]+$/;
 import { tmpdir } from "node:os";
 import { CanKanError } from "../errors";
 import { GitErrorCodes } from "./errors";
+import { runGitRaw } from "./transport";
 
 function rejectRef(ref: string, reason: string): never {
   throw new CanKanError(GitErrorCodes.GIT_REF_INVALID, `invalid ref: ${reason}`, {
@@ -46,27 +47,28 @@ function rejectRef(ref: string, reason: string): never {
  * `git check-ref-format` needs no repository and no pinned root — confirmed:
  * it runs identically from any directory, including one with no `.git` at
  * all — so a config loader (M2.3) can reuse this exact check at load time
- * without needing a `GitAdapter` instance.
+ * without needing a `GitAdapter` instance. `os.tmpdir()` stands in for a
+ * pinned root here for exactly that reason.
  *
- * **A second, necessary exception to R1's "one chokepoint" framing — not a
- * style preference, a correctness requirement, confirmed directly for this
- * task.** `check-ref-format` prints *nothing* to stderr when it rejects a
- * ref; it only sets a non-zero exit code (confirmed: redirecting stdout and
- * stderr separately on a rejected ref, both are empty, exit code 1).
- * `simple-git`'s own `raw()` decides whether a task failed with `exitCode &&
- * stdErr.length` (confirmed by reading its installed
- * `error-detection.plugin` source for this task) — both must be truthy, so a
- * non-zero exit with empty stderr is **silently treated as success**,
- * `raw()` resolves instead of rejecting, and the specific abuse case the ADR
- * spends the most space on (`refs/cankan/../heads/main`, which passes the
- * regex above) would pass validation. This was caught by this task's own
- * test suite, not by inspection: routing this call through the same
- * `simple-git`-based chokepoint every other command in this module uses
- * made the `refs/cankan/../heads/main` rejection test fail. `hash-object`'s
- * exception exists because `simple-git` cannot reach a stdin channel;
- * this one exists because `simple-git`'s error detection cannot see this
- * command's failure at all. Exit code is checked directly, exactly as
- * `hashObjectStdin` does in `adapter.ts`.
+ * **This only covers the ref's *name*.** A ref whose name passes both
+ * checks can still be a **symbolic ref** pointing somewhere outside
+ * `refs/cankan/` — ADR 0001 notes exactly this for `HEAD` ("works
+ * identically, since `update-ref` dereferences it") but only defends
+ * lexically, at the name level. `adapter.ts`'s `ensureValidRef` layers the
+ * additional, repository-aware symref check on top of this one for every
+ * operation this module actually performs against a real repository;
+ * `validateCoordinationRef` alone is deliberately name-only (fix-round-1
+ * F1) so it stays usable without a repository — e.g. by M2.3's config
+ * loader, which has no `GitAdapter` and no pinned root to check a symref
+ * against.
+ *
+ * Routed through this module's one `Bun.spawn` chokepoint (`transport.ts`'s
+ * `runGitRaw`) like every other git invocation in this module (fix-round-1
+ * Ruling 11). `check-ref-format` previously needed a separate direct spawn
+ * because `simple-git`'s error detection silently swallowed this exact
+ * command's failure (a non-zero exit with empty stderr); now that the
+ * chokepoint itself exposes the exit code directly, `check-ref-format` is an
+ * ordinary call like any other.
  */
 export async function validateCoordinationRef(ref: string): Promise<string> {
   if (ref.length === 0) {
@@ -83,23 +85,13 @@ export async function validateCoordinationRef(ref: string): Promise<string> {
   // plumbing does: even `-- <refname>` is rejected as a usage error (exit
   // 129), so `--end-of-options` is not merely unnecessary here, it is not
   // accepted.
-  const proc = Bun.spawn(["git", "check-ref-format", ref], {
-    // `check-ref-format` doesn't consult the working directory at all, but
-    // `cwd` is pinned to a directory this module doesn't otherwise touch
-    // rather than left to inherit `process.cwd()` — this module's own stated
-    // principle (never rely on the host process's current directory) holds
-    // without a "except here, harmlessly" footnote.
-    cwd: tmpdir(),
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, LC_ALL: "C" },
-  });
-  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-  if (exitCode !== 0) {
-    // `stderr` is expected to be empty here (see this function's doc
-    // comment) — included anyway in case a future git version starts
-    // reporting a reason, rather than assuming it stays silent forever.
-    rejectRef(ref, `git check-ref-format rejected it (exit ${exitCode}): ${stderr.trim()}`);
+  const result = await runGitRaw(tmpdir(), ["check-ref-format", ref]);
+  if (result.exitCode !== 0) {
+    // `stderr` is expected to be empty here — `check-ref-format` reports a
+    // rejection purely through its exit code (confirmed directly) —
+    // included anyway in case a future git version starts reporting a
+    // reason, rather than assuming it stays silent forever.
+    rejectRef(ref, `git check-ref-format rejected it (exit ${result.exitCode}): ${result.stderr.trim()}`);
   }
 
   return ref;

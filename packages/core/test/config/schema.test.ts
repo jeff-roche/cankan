@@ -412,6 +412,99 @@ describe("built-in defaults materialize on an empty effective config", () => {
     expect(eff.hooks).toBeUndefined();
     expect(eff.definition_of_done).toBeUndefined();
   });
+
+  test("a defaulted group's nested array is a fresh instance on every parse, not a shared mutable one", () => {
+    // Found in review: `effectiveReadySchema.default({ order: [...] })`
+    // (zod 4.5.4) substitutes its literal via a getter that only
+    // *shallow*-clones it, so the nested `order` array was the exact same
+    // instance across every `effectiveConfigSchema.parse({})` call — a
+    // caller (e.g. M2.12's sort-in-place) could `.push()` onto it and
+    // corrupt every later parse for the life of the process. Switching the
+    // group to `.prefault({})` (which re-runs the inner schema, so
+    // `order`'s own `.default([...])` — and its own shallow-clone getter —
+    // fires fresh each time) fixes this. This test would fail against the
+    // pre-fix `.default({ order: [...] })` form.
+    const a = effectiveConfigSchema.parse({});
+    const b = effectiveConfigSchema.parse({});
+    expect(a.ready).not.toBe(b.ready);
+    expect(a.ready.order).not.toBe(b.ready.order);
+
+    a.ready.order.push("HIJACKED");
+    expect(a.ready.order).toContain("HIJACKED");
+
+    const c = effectiveConfigSchema.parse({});
+    expect(c.ready.order).not.toContain("HIJACKED");
+    expect(c.ready.order).toEqual(["rank", "priority:desc", "created:asc"]);
+  });
+
+  test("every defaulted group produces a fresh top-level object per parse", () => {
+    const a = effectiveConfigSchema.parse({});
+    const b = effectiveConfigSchema.parse({});
+    expect(a.coordination).not.toBe(b.coordination);
+    expect(a.claims).not.toBe(b.claims);
+    expect(a.sync).not.toBe(b.sync);
+    expect(a.agents).not.toBe(b.agents);
+    expect(a.output).not.toBe(b.output);
+    expect(a.repos).not.toBe(b.repos);
+  });
+});
+
+describe("agents.instructions_file is a constrained relative path (found in review)", () => {
+  test.each([
+    "../../../../home/victim/.ssh/authorized_keys",
+    "/etc/anything",
+    "/AGENTS.md",
+    "../.git/hooks/post-checkout",
+    "docs/../../escape.md",
+    "",
+    "AGENTS.md .sh",
+    "AGENTS.md",
+  ])("rejects %j", (value) => {
+    expect(repoConfigSchema.safeParse({ agents: { instructions_file: value } }).success).toBe(
+      false,
+    );
+    expect(effectiveConfigSchema.safeParse({ agents: { instructions_file: value } }).success).toBe(
+      false,
+    );
+  });
+
+  test.each(["AGENTS.md", "docs/AGENTS.md"])("accepts %j", (value) => {
+    expect(repoConfigSchema.safeParse({ agents: { instructions_file: value } }).success).toBe(
+      true,
+    );
+    expect(
+      effectiveConfigSchema.parse({ agents: { instructions_file: value } }).agents
+        .instructions_file,
+    ).toBe(value);
+  });
+
+  test("the built-in default (\"AGENTS.md\") is itself valid", () => {
+    expect(effectiveConfigSchema.parse({}).agents.instructions_file).toBe("AGENTS.md");
+  });
+});
+
+describe("actor and parent are local+effective only, not repo/global (found in review)", () => {
+  test("repo config rejects actor and parent as unrecognized keys", () => {
+    expect(repoConfigSchema.safeParse({ actor: "alice" }).success).toBe(false);
+    expect(repoConfigSchema.safeParse({ parent: "alice" }).success).toBe(false);
+  });
+
+  test("global config rejects actor and parent as unrecognized keys", () => {
+    expect(globalConfigSchema.safeParse({ actor: "alice" }).success).toBe(false);
+    expect(globalConfigSchema.safeParse({ parent: "alice" }).success).toBe(false);
+  });
+
+  test("local config accepts actor and parent", () => {
+    const parsed = localConfigSchema.parse({ actor: "claude-code:alice/wt-auth", parent: "alice" });
+    expect(parsed.actor).toBe("claude-code:alice/wt-auth");
+    expect(parsed.parent).toBe("alice");
+  });
+
+  test("the merged effective config still carries actor and parent (they can flow in from the local layer)", () => {
+    const eff = effectiveConfigSchema.parse({ actor: "claude-code:alice/wt-auth", parent: "alice" });
+    expect(eff.actor).toBe("claude-code:alice/wt-auth");
+    expect(eff.parent).toBe("alice");
+  });
 });
 
 describe("every file is a rung on both precedence chains (contract R1, R7(a))", () => {

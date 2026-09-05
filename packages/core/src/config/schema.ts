@@ -31,7 +31,27 @@
  * example, so there is no documented multi-file resolution chain for them
  * to plug into the way there is for `claims`, `sync`, `columns`, etc. This
  * is a scoping call, flagged in the implementer report, not a contract
- * ruling — it could reasonably go the other way.
+ * ruling — it could reasonably go the other way. The security review of
+ * this scoping call additionally noted that a checked-in `.cankan/config.yml`
+ * carrying `personal.remote` or `credentials.store` would let a hostile
+ * repo redirect a user's auto-synced personal board or downgrade their
+ * credential storage — a concrete reason beyond the textual one above.
+ *
+ * `actor` and `parent` are a second, narrower exception: kept in
+ * `localConfigSchema` and `effectiveConfigSchema` only, deliberately
+ * *not* in `commonConfigFields` (so **not** in `repoConfigSchema` or
+ * `globalConfigSchema`), even though both are ordinary preference keys and
+ * contract R1's chain would otherwise make them fair game everywhere. This
+ * is a security-motivated narrowing found in review: PLAN.md 309-310
+ * documents M2.18's actor-resolution chain as `--actor > CANKAN_ACTOR >
+ * local config > global identity > git user.name` — there is no repo rung
+ * — and CONCEPT.md itself only ever shows `actor`/`parent` in `local.yml`
+ * (362-363); the global file uses `identity.*` (374-376) instead, and the
+ * repo file has neither. Letting a checked-in repo file set `actor` would
+ * let a hostile repo spoof the default claim identity for every user who
+ * has not set a local or env override, forging attribution in the
+ * coordination ref. Relying on M2.18 to defensively filter layers instead
+ * would be fragile — that later lane cannot negotiate with this one.
  *
  * `effectiveConfigSchema` is the superset — the union of every key any
  * layer can contribute — and is the only one of the four schemas that
@@ -232,8 +252,46 @@ const readySchema = z.strictObject({
   exclude_labels: z.array(z.string()).optional(),
 });
 
+/**
+ * `agents.instructions_file` (CONCEPT.md 352: "where init appends the
+ * workflow section") is a write target, and it sits in `commonConfigFields`
+ * — so a checked-in `.cankan/config.yml` controls it. Found in review:
+ * unconstrained, it accepts `../../../../home/victim/.ssh/authorized_keys`,
+ * an absolute path, or a NUL-bearing string, letting a hostile repo make
+ * `init` corrupt an attacker-chosen file outside the board. No later lane
+ * owns this check — unlike `tickets_dir`, which ADR 0002 (542-630) assigns
+ * a staged realpath containment check to, `agents.instructions_file` has no
+ * validation obligation anywhere in PLAN.md, CONCEPT.md, or
+ * `docs/decisions/*`, and (unlike `tickets_dir`) the check needs no
+ * board-root knowledge to do here. Rejects: absolute paths, any `..`
+ * segment, empty, and NUL/control characters. `AGENTS.md` and
+ * `docs/AGENTS.md` stay legal.
+ */
+const AGENTS_INSTRUCTIONS_FILE_ISSUE =
+  'agents.instructions_file must be a relative path with no ".." segment, no leading "/", and no control characters';
+
+function isSafeRelativeFilePath(value: string): boolean {
+  if (value.length === 0) {
+    return false;
+  }
+  if (value.startsWith("/")) {
+    return false;
+  }
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) {
+      return false;
+    }
+  }
+  return !value.split("/").includes("..");
+}
+
+const instructionsFilePathSchema = z
+  .string()
+  .refine(isSafeRelativeFilePath, { error: AGENTS_INSTRUCTIONS_FILE_ISSUE });
+
 const agentsSchema = z.strictObject({
-  instructions_file: z.string().optional(),
+  instructions_file: instructionsFilePathSchema.optional(),
   mcp: z.boolean().optional(),
   default_tool: z.string().optional(),
 });
@@ -243,7 +301,12 @@ const outputSchema = z.strictObject({
   json_pretty: z.boolean().optional(),
 });
 
-/** Every field valid in repo, repo-local, *and* global — everything except `backers` (R4) and the global-only sections. */
+/**
+ * Every field valid in repo, repo-local, *and* global — everything except
+ * `backers` (R4's repo/global keying asymmetry), the global-only sections,
+ * and `actor`/`parent` (kept local+effective only — see the file-level
+ * comment).
+ */
 const commonConfigFields = {
   version: z.number().int().optional(),
   project: z.string().optional(),
@@ -259,8 +322,6 @@ const commonConfigFields = {
   hooks: hooksSchema.optional(),
   agents: agentsSchema.optional(),
   definition_of_done: z.array(z.string()).optional(),
-  actor: z.string().optional(),
-  parent: z.string().optional(),
   editor: z.string().optional(),
   output: outputSchema.optional(),
 };
@@ -277,16 +338,21 @@ export const repoConfigSchema = z.strictObject({
 export type RepoConfig = z.infer<typeof repoConfigSchema>;
 
 // ---------------------------------------------------------------------------
-// `.cankan/local.yml` — repo-local, gitignored (CONCEPT.md 360-369). Same
-// shape as `repoConfigSchema` — see the file-level comment on why a
-// per-file schema is not restricted to one file's own example block, and
-// why `backers` still follows the repo (type-keyed) shape here: a local
-// override targets an already-declared repo backer by type, it does not
-// introduce a global-style named one.
+// `.cankan/local.yml` — repo-local, gitignored (CONCEPT.md 360-369). Shares
+// `commonConfigFields` with `repoConfigSchema` (see the file-level comment
+// on why a per-file schema is not restricted to one file's own example
+// block), plus two fields that are local+effective *only*: `actor` and
+// `parent` — see the file-level comment on why those are excluded from
+// `repoConfigSchema` and `globalConfigSchema`. `backers` still follows the
+// repo (type-keyed) shape here: a local override targets an
+// already-declared repo backer by type, it does not introduce a
+// global-style named one.
 // ---------------------------------------------------------------------------
 
 export const localConfigSchema = z.strictObject({
   ...commonConfigFields,
+  actor: z.string().optional(),
+  parent: z.string().optional(),
   backers: z.record(z.string(), repoBackerEntrySchema).optional(),
 });
 
@@ -335,12 +401,26 @@ export type GlobalConfig = z.infer<typeof globalConfigSchema>;
 
 // ---------------------------------------------------------------------------
 // `effectiveConfigSchema` — the merged superset. Every field optional except
-// where a built-in (fifth-layer) default exists. Each defaulted *object* is
-// itself given a literal default matching what parsing `{}` through its
-// inner shape would produce — `.default(x)` substitutes `x` directly without
-// re-validating it (zod's own behavior), so if the whole group (e.g.
-// `coordination`) is absent, its literal default must already carry every
-// leaf default the group's own fields declare.
+// where a built-in (fifth-layer) default exists.
+//
+// Each defaulted *group* uses `.prefault({})`, not `.default({...literal})`.
+// `.prefault(x)` substitutes `x` for an absent value and then *runs it
+// through the inner schema*, so each field's own `.default(...)` applies —
+// whereas `.default(x)` (zod 4.5.4) substitutes `x` directly via a getter
+// that only *shallow*-clones it. A shallow clone of `{ order: [...] }`
+// copies the outer object but not the nested array, so every call to
+// `effectiveConfigSchema.parse({})` returned the exact same `ready.order`
+// array instance — a shared mutable array a caller could `.push()` onto and
+// corrupt for the rest of the process. Found in review; `columns` and
+// `definition_of_done` were never affected because their own defaults sit
+// directly on the array schema, where the same shallow-clone getter runs
+// fresh on every access. `.prefault({})` is used uniformly across every
+// defaulted group below, not only `ready` — it retires the hand-duplicated
+// group-literal defaults this comment previously required (each field's own
+// default was the single source of truth already; `.prefault({})` makes the
+// group-level default read that source rather than repeat it) and removes
+// the whole class of bug for any group that later grows an array or object
+// field.
 // ---------------------------------------------------------------------------
 
 const effectiveCoordinationSchema = z.strictObject({
@@ -367,7 +447,7 @@ const effectiveReadySchema = z.strictObject({
 });
 
 const effectiveAgentsSchema = z.strictObject({
-  instructions_file: z.string().default("AGENTS.md"),
+  instructions_file: instructionsFilePathSchema.default("AGENTS.md"),
   mcp: z.boolean().default(true),
   default_tool: z.string().optional(),
 });
@@ -396,28 +476,24 @@ export const effectiveConfigSchema = z.strictObject({
    * reading that keeps those other examples coherent with no config at all.
    */
   columns: z.array(z.string()).default(["To Do", "In Progress", "In Review", "Done"]),
-  coordination: effectiveCoordinationSchema.default({
-    ref: "refs/cankan/coordination",
-    mode: "shared-ref",
-    push_ref: true,
-  }),
-  claims: effectiveClaimsSchema.default({ lease: "2h", max_per_actor: 3, require_ready: true }),
-  sync: effectiveSyncSchema.default({ auto_push: "off", auto_pull: "off", conflict_policy: "manual" }),
+  coordination: effectiveCoordinationSchema.prefault({}),
+  claims: effectiveClaimsSchema.prefault({}),
+  sync: effectiveSyncSchema.prefault({}),
   backers: z.record(z.string(), effectiveBackerEntrySchema).optional(),
   default_backer: defaultBackerChoiceSchema.default("none"),
-  ready: effectiveReadySchema.default({ order: ["rank", "priority:desc", "created:asc"] }),
+  ready: effectiveReadySchema.prefault({}),
   queues: queuesSchema.optional(),
   hooks: hooksSchema.optional(),
-  agents: effectiveAgentsSchema.default({ instructions_file: "AGENTS.md", mcp: true }),
+  agents: effectiveAgentsSchema.prefault({}),
   definition_of_done: z.array(z.string()).optional(),
   actor: z.string().optional(),
   parent: z.string().optional(),
   editor: z.string().optional(),
   identity: identitySchema.optional(),
   credentials: credentialsSchema.optional(),
-  output: effectiveOutputSchema.default({ color: "auto", json_pretty: false }),
+  output: effectiveOutputSchema.prefault({}),
   personal: personalSchema.optional(),
-  repos: effectiveReposSchema.default({ auto_register: true }),
+  repos: effectiveReposSchema.prefault({}),
 });
 
 export type EffectiveConfig = z.infer<typeof effectiveConfigSchema>;

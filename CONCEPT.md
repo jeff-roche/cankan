@@ -584,7 +584,7 @@ Scope default: repo board when inside an inited repo, personal board otherwise. 
 - **Monorepo:** `packages/core` (event log, git ops, claims, actors, backer interface), `packages/cli`, `packages/mcp`, `packages/backers/{beads,github,jira}` (no native or Backlog.md adapter — those are just the local file layer).
 - **CLI:** `citty`; every command has `--json` and `--plain`.
 - **Schema:** `zod`; `gray-matter` for frontmatter.
-- **Git:** shell out to system `git` (`simple-git`). Not isomorphic-git — refs, worktrees, and hooks must match the user's git exactly.
+- **Git:** shell out to system `git` through one subprocess chokepoint (`packages/core/src/git/transport.ts`). Not isomorphic-git — refs, worktrees, and hooks must match the user's git exactly. `simple-git` was the original choice and was dropped in M2.6: its error detection resolves any command that exits non-zero with empty stderr as a *success*, which silently swallowed `git check-ref-format`'s rejection and would have let ADR 0001's flagship abuse ref pass validation.
 - **Index:** `bun:sqlite`, rebuildable cache over events + definitions; `cankan reindex`.
 - **MCP:** `@modelcontextprotocol/sdk`, stdio, tools 1:1 with core.
 - **Backers:** beads via its JSONL export / `bd --json`; `octokit` for GitHub; Jira REST v3 (Cloud first, Data Center via the same client). Each backer is its own package behind one interface; Backlog.md needs no adapter because its files are our files.

@@ -43,7 +43,7 @@ Every piece of the system and the single task that creates it. If a piece isn't 
 | Config schema + layer loader + policy resolution | M2.3 | M2.4 (board resolver), M3.1 (CLI context) |
 | Board resolver (which directory is the board) + repo registry | M2.4 | M3.1 (CLI context) |
 | Ticket store (read/write/list files on disk) | M2.5 | M2.8 (state fold) |
-| Git adapter (`simple-git` wrapper: refs, worktrees, commit, orphan ref ops) | M2.6 | M2.7 (event log) |
+| Git adapter (direct `git` subprocess transport: refs, worktrees, commit, orphan ref ops) | M2.6 | M2.7 (event log) |
 | Event log (append, read, ULIDs, monthly files) on the coordination ref | M2.7 | M2.8 (state fold), M2.10 (claims) |
 | Lease-observation store (`$XDG_STATE_HOME/cankan/`, reader-local first-observation times) | M2.7 | M2.10 (claims) |
 | Board state fold (tickets ⊕ events → `BoardState`) | M2.8 | **M2.9 [wire]** |
@@ -241,7 +241,7 @@ All M2 tasks live in `packages/core`. **M2.1 owns the package's public surface**
 - **Done when:** CRUD tests on a temp board; concurrent writes to different tickets don't corrupt.
 
 ### M2.6 Git adapter
-- **Creates:** `git/adapter.ts` wrapping `simple-git`: `readRef`, `updateRefCAS(ref, newSha, oldSha)` (argument order per M1.2's ADR — the *third* argument is the compare; inverting it yields a CAS that always succeeds), `readBlobFromRef`, `commitTreeToRef` (build a commit on an orphan ref without touching the worktree), `listWorktrees`, `fetch/push ref`. Implements the locking approach chosen in M1.2 — `git update-ref` CAS, plus the ref-name validation, cwd pinning and `--end-of-options` obligations that ADR records.
+- **Creates:** `git/adapter.ts` over a single `git` subprocess chokepoint: `readRef`, `updateRefCAS(ref, newSha, oldSha)` (argument order per M1.2's ADR — the *third* argument is the compare; inverting it yields a CAS that always succeeds), `readBlobFromRef`, `commitTreeToRef` (build a commit on an orphan ref without touching the worktree), `listWorktrees`, `fetch/push ref`. Implements the locking approach chosen in M1.2 — `git update-ref` CAS, plus the ref-name validation, cwd pinning and `--end-of-options` obligations that ADR records.
 - **Depends on:** M2.1, M1.2, M1.3
 - **Done when:** two processes calling `updateRefCAS` with the same expected old value → exactly one succeeds; works from a secondary worktree.
 

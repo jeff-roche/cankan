@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -37,7 +37,16 @@ function git(cwd: string, args: string[]): void {
 export async function makeTempRepo(
   options: TempRepoOptions = {},
 ): Promise<TempRepo> {
-  const root = await mkdtemp(join(tmpdir(), "cankan-test-"));
+  // `mkdtemp` returns a path under `tmpdir()` verbatim, which on macOS is
+  // `/var/folders/...` — a symlink to `/private/var/folders/...`. git
+  // canonicalizes symlinks in every path it prints (`--show-toplevel`,
+  // `--git-common-dir`, `worktree list`), so a fixture that hands out the
+  // un-resolved form is a path every git-invocation-based assertion in a
+  // consumer will disagree with on macOS, even though the two paths name
+  // the same directory. Resolved once, here, so `root` (and everything
+  // joined from it below — `dir`, `worktreeDirs`, `remoteDir`) is already
+  // in the exact form git will echo back.
+  const root = await realpath(await mkdtemp(join(tmpdir(), "cankan-test-")));
   const dir = join(root, "main");
 
   git(root, ["init", "-b", "main", dir]);

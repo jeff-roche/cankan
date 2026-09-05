@@ -117,7 +117,21 @@ export interface CommitTreeParams {
   readonly files: readonly CommitTreeFile[];
 }
 
-/** One entry from `git worktree list --porcelain`. */
+/**
+ * One entry from `git worktree list --porcelain`.
+ *
+ * **`path` is canonical (symlink-resolved), guaranteed by this module —
+ * ADR 0001:1097-1099's two-step recipe (`rev-parse ...`, then
+ * `fs.realpath`).** Verified directly (CI's macOS failure, and a Linux
+ * symlink probe reproducing the same condition — see `adapter.ts`'s
+ * `parseWorktreeBlock` doc comment and the task report): git resolves a
+ * worktree's path into its `.git/worktrees/<name>/gitdir` file at
+ * `worktree add` time, before this module ever reads it back, so no
+ * explicit `fs.realpath` call is needed here — adding one would be
+ * redundant, not more correct. This module commits to the outcome (a
+ * canonical path) regardless of mechanism, not to the specific call that
+ * happens to produce it today.
+ */
 export interface WorktreeInfo {
   readonly path: string;
   readonly headSha: string | null;
@@ -146,7 +160,15 @@ export interface GitAdapterOptions {
  * process happens to be running from.
  */
 export interface GitAdapter {
-  /** Absolute path to the repository's working-tree root. */
+  /**
+   * Absolute path to the repository's working-tree root, and canonical
+   * (symlink-resolved) — `git rev-parse --show-toplevel` resolves symlinks
+   * in the path it prints, verified directly (a symlinked `cwd` still
+   * yields the resolved root; see the task report's symlink probe). This
+   * module does not call `fs.realpath` on it separately; the guarantee is
+   * git's, not an addition of this module's — but it is a guarantee, not an
+   * incidental fact a caller must re-verify.
+   */
   readonly root: string;
 
   /**
@@ -193,7 +215,10 @@ export interface GitAdapter {
    */
   commitTreeToRef(ref: string, params: CommitTreeParams): Promise<CasOutcome>;
 
-  /** `git worktree list --porcelain`, parsed. */
+  /**
+   * `git worktree list --porcelain`, parsed. Every `WorktreeInfo.path` is
+   * canonical — see that type's doc comment.
+   */
   listWorktrees(): Promise<WorktreeInfo[]>;
 
   /**
@@ -223,7 +248,23 @@ export interface GitAdapter {
    * construction — the bare `--git-common-dir` form is relative to the
    * current directory and varies with where it runs (ADR 0001:1097-1112),
    * which would make two worktrees of one clone compute two different keys
-   * for whatever uses this. `fs.realpath` is left to the caller.
+   * for whatever uses this.
+   *
+   * **Canonical (symlink-resolved), guaranteed — this module's contract,
+   * not merely an observed fact about git.** ADR 0001:1097-1099 specifies
+   * `rev-parse --path-format=absolute --git-common-dir` **then**
+   * `fs.realpath` as one recipe; an earlier version of this doc comment
+   * said the second half was "left to the caller," which would have made a
+   * silently-forgotten `fs.realpath` call in a consumer (M2.7) produce
+   * exactly the per-clone key divergence this section exists to prevent.
+   * Verified directly (macOS CI: `rev-parse`'s own output was already the
+   * `/private/var/...`-resolved form, never the `/var/...` symlink form the
+   * test fixture wrongly expected; a Linux symlink probe reproducing the
+   * same condition confirms it — see the task report) that `rev-parse`
+   * itself resolves the symlink, so no separate `fs.realpath` call is
+   * added here — adding one would be redundant, not more correct. The
+   * commitment this module makes is the *outcome* (a canonical path), not
+   * the specific mechanism that produces it.
    */
   gitCommonDir(): Promise<string>;
 }

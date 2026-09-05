@@ -253,4 +253,33 @@ export const EventErrorCodes = {
    * different function.
    */
   EVENT_RECOVERY_INVALID_OPTION: "EVENT_RECOVERY_INVALID_OPTION",
+  /**
+   * `recovery.ts`'s `recover()` found something already occupying the
+   * `quarantine/` audit path it needs to write into — either a non-blob
+   * entry at the specific `quarantine/<month>.jsonl` path a fixable failure
+   * needs, a blob planted at the literal top-level `quarantine` path (which
+   * conflicts with *every* `quarantine/<month>.jsonl` write, since git
+   * cannot represent a path as both a blob and a directory prefix in one
+   * tree), or a `commitTreeToRef` failure consistent with that same
+   * conflict (fix round 1, Critical 2 — orchestrator security review).
+   * **Deliberately refuses to fall back to rewriting the month file without
+   * its matching audit record** — writing the fix without the quarantine
+   * record would silently delete the offending line with no audit trail,
+   * which is the one thing this module must never do. `details` names the
+   * exact blocked path; the message states the remediation (rebuild the
+   * ref's tree to remove the conflicting entry).
+   */
+  EVENT_RECOVERY_QUARANTINE_BLOCKED: "EVENT_RECOVERY_QUARANTINE_BLOCKED",
+  /**
+   * `recovery.ts`'s `recover()` found that the quarantine audit content it
+   * would need to write for this call exceeds its own resource bound (fix
+   * round 1, Critical 1 — orchestrator security review). Refuses to write a
+   * disproportionately large quarantine blob into the coordination ref
+   * (which every peer then fetches and stores permanently) rather than
+   * silently doing so — an operator hitting this should re-run recovery
+   * with a narrower `trailingMonths`, or expect to need more than one
+   * recovery pass to fully clear an unusually large amount of distinct
+   * invalid content.
+   */
+  EVENT_RECOVERY_QUARANTINE_TOO_LARGE: "EVENT_RECOVERY_QUARANTINE_TOO_LARGE",
 } as const;

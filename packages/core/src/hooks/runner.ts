@@ -44,8 +44,17 @@ export type HookEvent = (typeof HOOK_EVENTS)[number];
  * precedence, matching every other ordering in the config module
  * (Controller Ruling 3, binding). Declared explicitly and iterated by name
  * rather than relied on as `ConfigResult.layers`'s own incidental array
- * order, which `config/resolve.ts` documents as "highest first" but does
- * not contractually guarantee matches this constant forever.
+ * order (`FILE_LAYER_ORDER` in `config/resolve.ts` is `repo-local, repo,
+ * global` -- a different order, for a different purpose, than this one).
+ *
+ * This also happens to be the exact order `config/resolve.ts`'s own
+ * `loadConfig` now reports a multi-layer load failure in (fixed alongside
+ * issue #88: a `Promise.all` there used to rethrow whichever layer's
+ * rejection settled first, non-deterministically; it now settles all three
+ * and rethrows in this same repo -> repo-local -> global precedence). Not a
+ * coincidence to preserve by hand -- both orderings independently express
+ * "most specific layer first" -- but worth naming so it doesn't read as
+ * arbitrary next to that fix.
  */
 export const HOOK_LAYER_ORDER = ["repo", "repo-local", "global"] as const satisfies readonly LoadedLayer["layer"][];
 

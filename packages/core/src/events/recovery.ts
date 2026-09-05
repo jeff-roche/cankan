@@ -17,7 +17,9 @@
  * - {@link recover}: rewrites each affected month file to drop exactly the
  *   lines {@link diagnose} found invalid, preserving every other line and
  *   in order, and records each removed line — with its reason and original
- *   position — into a `quarantine/<month>.jsonl` audit file. **Ruling R8
+ *   position — into a `quarantine/<month>/<sortableId>.jsonl` audit file,
+ *   one new file per `recover()` call (fix round 2, Ruling R45(b) — see
+ *   `buildQuarantineFilePath`'s doc comment for why). **Ruling R8
  *   (orchestrator, binding): this is a new commit on top of the current
  *   tip, never a CAS rewind** — see {@link recover}'s own doc comment for
  *   why a rewind is rejected.
@@ -108,9 +110,67 @@
  *    under a concurrent append (harmless inside `recoverCore`, since the CAS
  *    itself is what actually serializes; a caveat for a human reading
  *    `diagnose()`'s own output directly).
+ *
+ * ## Fix round 2 (orchestrator security + code review) — what changed
+ *
+ * One new Critical (introduced by fix round 1's own remedy for the original
+ * Critical 1), plus several Mediums and Lows — see `task-4-report.md`'s
+ * fix-round-2 addendum for the full defect-by-defect account and RED/GREEN
+ * evidence.
+ *
+ * 1. **Fix round 1's `EVENT_RECOVERY_QUARANTINE_TOO_LARGE` guard was itself
+ *    a permanent-wedge defect (NEW-1, Critical; Ruling R45).** It compared
+ *    the *combined* size of a single, ever-growing, append-only
+ *    `quarantine/<month>.jsonl` blob against a fixed ceiling, after
+ *    building the full string — so (a) a single adversarial line's
+ *    `JSON.stringify`-escaped form alone could exceed the ceiling (measured:
+ *    6.04x expansion for a run of `\x01` bytes), and (b) prior calls'
+ *    already-committed, permanently-retained history counted against every
+ *    *future* call's budget, so the guard would eventually and
+ *    *permanently* refuse recovery once accumulated history alone
+ *    approached the ceiling (reproduced: three successive real 20 MiB
+ *    pushes recovered twice, growing one file to 120 MiB then 240 MiB, then
+ *    permanently failed on the third, wedging a live claim unreachable).
+ *    Closed with two changes, required together (neither alone suffices —
+ *    see `quarantineDirPath`'s and `MAX_QUARANTINE_RAW_BYTES_PER_RECORD`'s
+ *    doc comments for why): each `recover()` call now writes its **own**
+ *    new `quarantine/<month>/<sortableId>.jsonl` file, never reading or
+ *    growing what an earlier call wrote (closes (b)); and a single removed
+ *    line's raw content embedded in one `QuarantineRecord` is now capped at
+ *    `MAX_QUARANTINE_RAW_BYTES_PER_RECORD`, truncated (disclosed via
+ *    `rawTruncated`) rather than embedded in full when larger (closes (a)).
+ *    The run-wide byte budget that used to be checked *after* building the
+ *    full string is now estimated and enforced **during diagnosis**
+ *    (`MAX_QUARANTINE_RUN_BUDGET_BYTES`), converging over more than one
+ *    `recover()` pass via the same `"diagnostic-truncated"` mechanism
+ *    `MAX_DIAGNOSTIC_FAILURES` already established, rather than throwing
+ *    post-hoc.
+ * 2. **A misdiagnosed `GIT_COMMAND_FAILED` (NEW-2, Medium).** Fix round 1's
+ *    fallback — relabeling *any* `commitTreeToRef` `GIT_COMMAND_FAILED` as
+ *    `EVENT_RECOVERY_QUARANTINE_BLOCKED` — could misattribute an unrelated
+ *    git-level failure (disk full, permissions, a read-only object store) as
+ *    a blocked audit path. Removed: the two proactive
+ *    `assertQuarantineDirectoryUsable` probes (top-level and, new in this
+ *    round, per-month) now catch both known conflict shapes *before* the
+ *    commit is attempted, so the commit itself no longer needs a
+ *    speculative relabel — any `GIT_COMMAND_FAILED` that still occurs
+ *    propagates with its real code and cause intact.
+ * 3. **The options object's own type went unchecked (NEW-5/6, Low).**
+ *    `diagnose(adapter, ref, null)`/`recover(adapter, ref, null)` threw a
+ *    raw `TypeError` (a default parameter does not apply to an explicit
+ *    `null`) rather than a `CanKanError` — both now normalize `null` to `{}`
+ *    before use, the same pattern `observations.ts`'s `observe()` already
+ *    documents. `casRetry: []` (an array, `typeof "object"` but not a valid
+ *    options object) is now also rejected, not silently treated as "no
+ *    overrides."
+ * 4. **An inaccurate comment (NEW-9, Low).** The per-month rebuild read's
+ *    comment overclaimed that it was "pinned" to this attempt's own
+ *    `parentSha`; `readBlobFromRef` re-resolves the ref name on every call,
+ *    it does not pin to a specific commit. Corrected to state what actually
+ *    guarantees correctness: the CAS on `parent: parentSha` at commit time.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { CanKanError, isCanKanError } from "../errors";
 import type { CasOutcome, CasRetryOptions, GitAdapter } from "../git/index";
 import { GitErrorCodes, validateCoordinationRef, withCasRetry } from "../git/index";
@@ -195,15 +255,15 @@ function monthPath(month: string): string {
 }
 
 /**
- * The quarantine audit file's path — `quarantine/<yyyy-mm>.jsonl`, the
- * brief's own suggestion. **Deliberately a different top-level directory
- * than `events/`**, which is what makes requirement 9 ("`read()` does not
- * treat the quarantine file as an event log") true *structurally*, not by
- * convention: `read()`'s only file probe is `events/<month>.jsonl` for each
- * month in its aggregation window (`log.ts`'s `monthPath`) — a path under
- * `quarantine/` is never constructed by, and therefore never reachable from,
- * `read()`'s own code, regardless of what `trailingMonths` a caller passes.
- * See `recovery.test.ts` for the test that proves this by planting hostile
+ * The quarantine audit directory for one month — `quarantine/<yyyy-mm>/`.
+ * **Deliberately a different top-level directory than `events/`**, which is
+ * what makes requirement 9 ("`read()` does not treat the quarantine file as
+ * an event log") true *structurally*, not by convention: `read()`'s only
+ * file probe is `events/<month>.jsonl` for each month in its aggregation
+ * window (`log.ts`'s `monthPath`) — a path under `quarantine/` is never
+ * constructed by, and therefore never reachable from, `read()`'s own code,
+ * regardless of what `trailingMonths` a caller passes. See
+ * `recovery.test.ts` for the test that proves this by planting hostile
  * content at this exact path and confirming `read()` neither throws on it
  * nor is influenced by it.
  *
@@ -211,11 +271,71 @@ function monthPath(month: string): string {
  * is also what makes the `quarantine/` prefix a single point of failure.**
  * Git cannot represent one path as both a blob and a directory prefix in
  * the same tree, so a single blob planted at the literal path `quarantine`
- * (no month suffix) conflicts with *every* `quarantine/<month>.jsonl` write
- * this file could ever make, in one shot — see `assertQuarantineRootUsable`.
+ * (no month suffix) conflicts with *every* `quarantine/<month>/...` write
+ * this file could ever make, in one shot — see `assertQuarantineDirectoryUsable`.
+ * The same conflict class recurs one level down (a blob planted at the bare
+ * `quarantine/<month>` path, no trailing file), which is why `recoverCore`
+ * probes that exact path too, per month, before writing into it (fix round
+ * 2, NEW-1 remediation — see `assertQuarantineDirectoryUsable`).
+ *
+ * **Fix round 2 (orchestrator security review, Ruling R45): one file per
+ * recovery call, not one ever-growing file per month.** The original design
+ * (fix round 1) appended every call's `QuarantineRecord`s onto a single
+ * `quarantine/<month>.jsonl` blob, read back and concatenated on every
+ * subsequent call. That is an unbounded accumulation: `EVENT_RECOVERY_
+ * QUARANTINE_TOO_LARGE`'s own bound-check, comparing the *combined* content
+ * against a fixed ceiling, would eventually and *permanently* refuse every
+ * future call once prior calls' history alone approached that ceiling —
+ * reproduced directly (three successive real 20 MiB pushes against a board
+ * holding a live claim: recovery succeeded twice, growing the single file to
+ * 120 MiB then 240 MiB, then permanently refused on the third, wedging the
+ * live claim unreachable). Each call now writes its own new file —
+ * `quarantine/<month>/<sortableId>.jsonl` (see `buildQuarantineFilePath`) —
+ * so no call ever reads, grows, or is bounded by what an *earlier* call
+ * wrote. This alone does not close the defect (a single call's own audit
+ * content can still be made arbitrarily large by a single adversarial line —
+ * see `MAX_QUARANTINE_RAW_BYTES_PER_RECORD`'s doc comment for the other,
+ * required half of R45).
  */
-function quarantinePath(month: string): string {
-  return `quarantine/${month}.jsonl`;
+function quarantineDirPath(month: string): string {
+  return `quarantine/${month}`;
+}
+
+/**
+ * Fix round 2 (Ruling R45(b)): builds this call's own quarantine file path
+ * for one month — `quarantine/<month>/<ISO-timestamp-with-safe-chars>-
+ * <16 hex chars>.jsonl`. The random suffix (not just the timestamp) is
+ * load-bearing, not decorative: two reasons.
+ *
+ * 1. **Uniqueness even when `quarantinedAt` collides.** `quarantinedAt` is
+ *    computed once per `recoverCore` call from `options.now` (a test's own
+ *    injected, fixed clock, or two real calls landing in the same
+ *    millisecond) — without a random component, two calls in the same month
+ *    at the same instant would target the identical path, and the second to
+ *    land via CAS would *overwrite* the first's audit record rather than
+ *    add a second one (`commitTreeToRef`'s overlay replaces whatever was at
+ *    a given path, it does not append) — silently losing audit history,
+ *    exactly the failure mode `quarantine/`'s whole existence is meant to
+ *    prevent.
+ * 2. **An unpredictable filename closes a pre-planting attack this file's
+ *    old, deterministic `quarantine/<month>.jsonl` path was exposed to**: an
+ *    adversary with push access could not previously predict *this* call's
+ *    exact future audit path to pre-plant a conflicting tree at it (the
+ *    remaining, still-real conflict shapes — a blob at the bare top-level
+ *    `quarantine` path, or at the bare per-month `quarantine/<month>` path —
+ *    are both still deterministic and still guarded by
+ *    `assertQuarantineDirectoryUsable`, called at both levels).
+ *
+ * `randomBytes(8).toString("hex")` mirrors `observations.ts`'s own
+ * temp-file-naming convention (same module family, same "collision
+ * resistance far beyond this threat model's actual need" reasoning as
+ * `lineDigest`'s `sha256` choice) — 64 bits of entropy, no new dependency
+ * (`node:crypto`, constraint 5).
+ */
+function buildQuarantineFilePath(month: string, quarantinedAtIso: string): string {
+  const safeTimestamp = quarantinedAtIso.replace(/[:.]/g, "-");
+  const suffix = randomBytes(8).toString("hex");
+  return `${quarantineDirPath(month)}/${safeTimestamp}-${suffix}.jsonl`;
 }
 
 const TOP_LEVEL_QUARANTINE_PATH = "quarantine";
@@ -257,14 +377,21 @@ function safeRenderForMessage(value: unknown): string {
  * so a bogus `casRetry: "oops"` was silently treated as "no overrides
  * supplied" instead of rejected — exactly the "reject a non-object rather
  * than silently defaulting" gap flagged in review.
+ *
+ * **Fix round 2, Low (NEW-6): also rejects an array.** `typeof [] ===
+ * "object"` and `[] !== null`, so `casRetry: []` passed the round-1 check —
+ * every property access on it (`.maxAttempts`, `.backoffMs`, `.sleep`) then
+ * safely evaluated to `undefined`, silently treating an array the same as
+ * "no overrides supplied" instead of rejecting it as the not-a-valid-
+ * options-object it is.
  */
 function validateCasRetryOption(casRetry: CasRetryOptions | undefined): void {
   if (casRetry === undefined) {
     return;
   }
-  if (typeof casRetry !== "object" || casRetry === null) {
-    throw new CanKanError(EventErrorCodes.EVENT_RECOVERY_INVALID_OPTION, `casRetry must be an object, got ${typeof casRetry}`, {
-      details: { type: typeof casRetry },
+  if (typeof casRetry !== "object" || casRetry === null || Array.isArray(casRetry)) {
+    throw new CanKanError(EventErrorCodes.EVENT_RECOVERY_INVALID_OPTION, `casRetry must be an object, got ${Array.isArray(casRetry) ? "array" : typeof casRetry}`, {
+      details: { type: Array.isArray(casRetry) ? "array" : typeof casRetry },
     });
   }
   const maxAttempts = casRetry.maxAttempts;
@@ -348,6 +475,98 @@ const MAX_DIAGNOSTIC_AGGREGATE_SAFETY_BYTES = 1024 * 1024 * 1024;
  * count of small objects, not proportional to a hostile blob's line count.
  */
 const MAX_DIAGNOSTIC_FAILURES = 5_000;
+
+// The four constants below are `export`ed — like `recoverCore`/
+// `RecoveryHooks` above — for `recovery.test.ts` alone (not re-exported from
+// `events/index.ts`'s barrel, so not part of this module's public surface):
+// solely so its algebraic-invariant test can check the real numbers directly
+// rather than duplicating them and risking silent drift.
+
+/**
+ * Fix round 2 (Ruling R45(a), NEW-1/NEW-3): the hard ceiling on how much raw
+ * line content one `QuarantineRecord` embeds. `buildQuarantineRecord`
+ * truncates anything larger (see `truncateRawForQuarantine`), setting
+ * `rawTruncated: true` so the sacrifice is disclosed, never silent.
+ *
+ * **Why this exists in addition to `MAX_QUARANTINE_RUN_BUDGET_BYTES` below,
+ * not instead of it.** Fix round 1's `EVENT_RECOVERY_QUARANTINE_TOO_LARGE`
+ * check ran *after* building the full audit string, and reproduced defect
+ * NEW-1 shows a *single* fixable line — 45 MiB of mostly-C0-control-byte
+ * garbage, itself under `read()`'s 64 MiB month cap but over its 1 MiB line
+ * cap, so `"line-too-large"` and fixable — whose `JSON.stringify`-escaped
+ * form alone (measured: 45 MiB → ~283 MB, a ~6.3x expansion; confirmed by
+ * direct probe against a 4 KiB all-`\x01` line: 6.04x) already exceeds any
+ * reasonable per-run budget. Truncating the diagnosis-time *budget
+ * estimate* (below) to zero contribution beyond this cap would still leave
+ * the *actual write* unbounded for that one record — so the raw content
+ * itself, not just its counted contribution, must be capped before it is
+ * ever embedded. 8 MiB is comfortably larger than any legitimate event
+ * (`schema.ts` has no field anywhere near this size) while keeping one
+ * record's worst-case embedded size small relative to the run budget: at
+ * `QUARANTINE_ESCAPE_EXPANSION_FACTOR`×, one maximally-truncated record is
+ * ≤ ~64 MiB, a small fraction of `MAX_QUARANTINE_RUN_BUDGET_BYTES` (256
+ * MiB) — see that constant's own doc comment for the invariant this
+ * relationship must hold, and `recovery.test.ts`'s dedicated test for both
+ * the truncation itself and the algebraic invariant.
+ */
+export const MAX_QUARANTINE_RAW_BYTES_PER_RECORD = 8 * 1024 * 1024;
+
+/**
+ * Fix round 2: a conservative, deliberately-overestimating multiplier used
+ * only to *budget* (never to precisely predict) how large one quarantine
+ * record's serialized form will be, from its raw line's byte length alone.
+ * Measured worst case (a real `JSON.stringify` of a record whose `raw` is
+ * 4096 bytes of pure `\x01`, the shape NEW-1 exploited): 6.04x — every C0
+ * control byte other than the handful with a 2-character named escape
+ * (`\n`, `\r`, `\t`, `\b`, `\f`) becomes a 6-character `\uXXXX` escape, and
+ * JSON string quoting/structure overhead is negligible at this scale. 8 is
+ * used, not 6.04, for headroom without needing to re-derive this constant
+ * every time V8/JSC's own `JSON.stringify` escaping table is inspected.
+ */
+export const QUARANTINE_ESCAPE_EXPANSION_FACTOR = 8;
+
+/**
+ * Fix round 2: a fixed per-record allowance for everything in a
+ * `QuarantineRecord` *other* than `raw` — `quarantinedAt`, `month`, `line`,
+ * `endLine`, `count`, `reason`, `message`, `possiblyLossy`, `rawTruncated`,
+ * and, for a `"schema-invalid"` line, `issues` (`parseEvent`'s own
+ * `EventValidationIssue[]`). Measured directly: a real `parseEvent` failure
+ * against several maximally-wrong-shaped inputs produced at most one issue
+ * (`schema.ts`'s discriminated union rejects on the first mismatch, it does
+ * not accumulate one issue per union branch) and a full record (with
+ * `issues`) of 570 bytes total against a near-empty `raw` — comfortably
+ * under this constant even before subtracting `raw`'s own contribution.
+ */
+export const QUARANTINE_RECORD_OVERHEAD_BYTES = 4096;
+
+/**
+ * Fix round 2 (Ruling R45(a)): the run-wide budget `computeDiagnosticReport`
+ * enforces on the *estimated* total serialized size of every quarantine
+ * record this run could produce, checked and enforced **during diagnosis**
+ * — not after `recoverCore` has already built the full audit string, which
+ * is exactly the "throws after the string is built" shape the fix-round-2
+ * review named as the defect in fix round 1's own remediation. Exceeding it
+ * stops the walk and reports the existing `"diagnostic-truncated"` reason
+ * (message names the budget, not the count, so an operator can tell the two
+ * truncation causes apart) — the same "converges over more than one
+ * `recover()` pass" contract `MAX_DIAGNOSTIC_FAILURES` already established,
+ * reused rather than inventing a second truncation vocabulary.
+ *
+ * **Invariant this file's own test suite checks directly**:
+ * `MAX_QUARANTINE_RAW_BYTES_PER_RECORD * QUARANTINE_ESCAPE_EXPANSION_FACTOR
+ * + QUARANTINE_RECORD_OVERHEAD_BYTES` (one record's worst-case estimated
+ * contribution, since `buildQuarantineRecord` never embeds more raw content
+ * than that cap) must be comfortably below this budget — otherwise a single
+ * record that alone pushes the running estimate over budget (allowed
+ * through once, per `recordLineFailure`'s "budget checked *after* opening
+ * this span" ordering, so at least one failure is always reported rather
+ * than none) could still make one run's actual write disproportionately
+ * large relative to its own stated budget. At the values above, one
+ * maximally-truncated record contributes ≤ ~64 MiB against a 256 MiB
+ * budget — four such records before the fifth is deferred to a following
+ * pass.
+ */
+export const MAX_QUARANTINE_RUN_BUDGET_BYTES = 256 * 1024 * 1024;
 
 // ============================================================================
 // Safe rendering of attacker-controlled line content — the decision this
@@ -464,6 +683,34 @@ function hasReplacementCharacter(value: string): boolean {
   return value.includes("�");
 }
 
+/**
+ * Fix round 2 (Ruling R45(a)): truncates `raw` to at most `maxBytes` of
+ * UTF-8, used only by `buildQuarantineRecord` when a single removed line's
+ * content alone would make its quarantine record disproportionately large
+ * (see `MAX_QUARANTINE_RAW_BYTES_PER_RECORD`'s doc comment for why this is
+ * required in addition to, not instead of, the run-wide budget).
+ *
+ * Re-encodes to a `Buffer` and cuts at the byte boundary rather than a code
+ * *unit* boundary, since the goal is a precise byte-length cap (this is fed
+ * straight into `QUARANTINE_ESCAPE_EXPANSION_FACTOR`'s own byte-based
+ * budgeting) — a code-unit slice would under-count for multi-byte UTF-8
+ * content and could leave the actual result larger than intended. A cut
+ * landing mid-multibyte-sequence decodes back losslessly for everything
+ * before the cut and produces a trailing U+FFFD (or drops the incomplete
+ * tail) for the sequence straddling it — confirmed by direct probe (Bun
+ * 1.4.0: `Buffer.from(s,"utf8").subarray(0,cut).toString("utf8")` never
+ * throws for any cut point, including mid-4-byte-emoji). This is already a
+ * lossy operation by construction (that is the whole point — bound the
+ * size), so an extra U+FFFD at the truncation boundary is consistent with,
+ * not worse than, `possiblyLossy`'s own disclosed imprecision.
+ */
+function truncateRawForQuarantine(raw: string, maxBytes: number): { readonly value: string; readonly truncated: boolean } {
+  if (Buffer.byteLength(raw, "utf8") <= maxBytes) {
+    return { value: raw, truncated: false };
+  }
+  return { value: Buffer.from(raw, "utf8").subarray(0, maxBytes).toString("utf8"), truncated: true };
+}
+
 // ============================================================================
 // Half 1 — the diagnostic read
 // ============================================================================
@@ -572,12 +819,17 @@ export interface DiagnoseOptions {
  * this reported value); a caveat worth knowing if a human is reading
  * `diagnose()`'s own output directly rather than through `recover()`.
  */
-export async function diagnose(adapter: GitAdapter, ref: string, options: DiagnoseOptions = {}): Promise<DiagnosticReport> {
+export async function diagnose(adapter: GitAdapter, ref: string, options: DiagnoseOptions | null = {}): Promise<DiagnosticReport> {
+  // Fix round 2, Low (NEW-5): a default parameter does not apply to an
+  // explicit `null` (only to `undefined`) — without this, `diagnose(a, ref,
+  // null)` threw a raw `TypeError` on `options.now` rather than surfacing
+  // through this module's own validated error path.
+  const opts = options ?? {};
   const validatedRef = await validateCoordinationRef(ref);
-  const now = options.now ?? Date.now();
+  const now = opts.now ?? Date.now();
   validateNowIsNumber(now);
   validateNowForDateFormatting(now);
-  const trailingMonths = options.trailingMonths ?? DEFAULT_TRAILING_MONTHS;
+  const trailingMonths = opts.trailingMonths ?? DEFAULT_TRAILING_MONTHS;
   validateTrailingMonths(trailingMonths);
 
   const head = await adapter.readRef(validatedRef);
@@ -631,6 +883,14 @@ async function computeDiagnosticReport(
   let aggregateBytes = 0;
   let aggregateTooLargeReported = false;
   let pending: PendingSpan | null = null;
+  // Fix round 2 (Ruling R45(a)): the running estimate of this run's total
+  // quarantine-record serialized size, updated only when a *new* span opens
+  // (never for a coalesced repeat of the same span — see
+  // `recordLineFailure`) — see `MAX_QUARANTINE_RUN_BUDGET_BYTES`'s doc
+  // comment for what this bounds and why it is checked here, during
+  // diagnosis, rather than after `recoverCore` has already built the audit
+  // string.
+  let estimatedQuarantineBytes = 0;
 
   function flushPending(): void {
     if (pending === null) return;
@@ -664,9 +924,17 @@ async function computeDiagnosticReport(
    * `lineBytes`/`lineSha256`/`linePreview` only when a *new* span starts,
    * which is what actually bounds memory/CPU for a run of repeated
    * identical bad lines (the coalescing check itself is a cheap string
-   * comparison, done before any hashing). Returns `false` when the cap on
-   * *distinct* spans (`MAX_DIAGNOSTIC_FAILURES`) has been reached and a new
-   * span could not be opened — the caller must then stop scanning.
+   * comparison, done before any hashing).
+   *
+   * Returns `"cap"` when the cap on *distinct* spans (`MAX_DIAGNOSTIC_
+   * FAILURES`) has been reached and a new span could not be opened at all —
+   * the caller must stop scanning, and nothing from this call was recorded.
+   * Returns `"budget"` (fix round 2, Ruling R45(a)) when a new span *was*
+   * opened (so this call's failure is always recorded — see
+   * `MAX_QUARANTINE_RUN_BUDGET_BYTES`'s own doc comment for why the check
+   * runs *after* opening it), but doing so pushed the running estimated
+   * quarantine-record size over budget — the caller must stop scanning
+   * *after* this one. Returns `"ok"` otherwise.
    */
   function recordLineFailure(
     month: string,
@@ -675,15 +943,16 @@ async function computeDiagnosticReport(
     rawLine: string,
     message: string,
     extra?: { issues?: readonly EventValidationIssue[]; eventId?: EventId; firstMonth?: string; firstLine?: number },
-  ): boolean {
+  ): "ok" | "cap" | "budget" {
     if (pending !== null && pending.month === month && pending.reason === reason && pending.endLine === line - 1 && pending.rawLine === rawLine) {
       pending.endLine = line;
-      return true;
+      return "ok";
     }
     flushPending();
     if (failures.length >= MAX_DIAGNOSTIC_FAILURES) {
-      return false;
+      return "cap";
     }
+    const lineBytes = Buffer.byteLength(rawLine, "utf8");
     pending = {
       month,
       reason,
@@ -695,25 +964,34 @@ async function computeDiagnosticReport(
       eventId: extra?.eventId,
       firstMonth: extra?.firstMonth,
       firstLine: extra?.firstLine,
-      lineBytes: Buffer.byteLength(rawLine, "utf8"),
+      lineBytes,
       lineSha256: lineDigest(rawLine),
       linePreview: safeLinePreview(rawLine),
       possiblyLossy: hasReplacementCharacter(rawLine),
     };
-    return true;
+    // Fix round 2 (Ruling R45(a)): budget on what this span will actually
+    // cost to *embed* — capped at `MAX_QUARANTINE_RAW_BYTES_PER_RECORD`,
+    // since `buildQuarantineRecord` will truncate to that cap regardless of
+    // how much larger `lineBytes` itself is.
+    const cappedForBudget = Math.min(lineBytes, MAX_QUARANTINE_RAW_BYTES_PER_RECORD);
+    estimatedQuarantineBytes += cappedForBudget * QUARANTINE_ESCAPE_EXPANSION_FACTOR + QUARANTINE_RECORD_OVERHEAD_BYTES;
+    return estimatedQuarantineBytes > MAX_QUARANTINE_RUN_BUDGET_BYTES ? "budget" : "ok";
   }
 
-  function pushTruncatedMarker(month: string, line: number | null): void {
+  function pushTruncatedMarker(month: string, line: number | null, kind: "resource" | "count" | "budget"): void {
+    const message =
+      kind === "resource"
+        ? `this diagnostic run's own resource bound was reached at month ${month}; scanning stopped here — re-run recovery (possibly more than once) to make further progress`
+        : kind === "count"
+          ? `this diagnostic run's own failure-count bound (${MAX_DIAGNOSTIC_FAILURES}) was reached at ${month}:${line}; scanning stopped here — re-run recovery (possibly more than once) to make further progress`
+          : `this diagnostic run's own quarantine-audit-size budget (${MAX_QUARANTINE_RUN_BUDGET_BYTES} bytes, estimated) was reached at ${month}:${line}; scanning stopped here — re-run recovery (possibly more than once) to make further progress`;
     failures.push({
       ref: validatedRef,
       commit: head,
       month,
       line: null,
       reason: "diagnostic-truncated",
-      message:
-        line === null
-          ? `this diagnostic run's own resource bound was reached at month ${month}; scanning stopped here — re-run recovery (possibly more than once) to make further progress`
-          : `this diagnostic run's own failure-count bound (${MAX_DIAGNOSTIC_FAILURES}) was reached at ${month}:${line}; scanning stopped here — re-run recovery (possibly more than once) to make further progress`,
+      message,
     });
   }
 
@@ -805,7 +1083,7 @@ async function computeDiagnosticReport(
 
     if (aggregateBytes > MAX_DIAGNOSTIC_AGGREGATE_SAFETY_BYTES) {
       flushPending();
-      pushTruncatedMarker(month, null);
+      pushTruncatedMarker(month, null, "resource");
       break;
     }
 
@@ -820,15 +1098,15 @@ async function computeDiagnosticReport(
       // shape whose first value alone exceeds the cap) is caught here and
       // never reaches `JSON.parse` at all, exactly like `read()`.
       if (Buffer.byteLength(rawLine, "utf8") > MAX_LINE_BYTES) {
-        const ok = recordLineFailure(
+        const status = recordLineFailure(
           month,
           line,
           "line-too-large",
           rawLine,
           `event log line exceeds read()'s own maximum line size (${MAX_LINE_BYTES} bytes)`,
         );
-        if (!ok) {
-          pushTruncatedMarker(month, line);
+        if (status !== "ok") {
+          pushTruncatedMarker(month, line, status === "cap" ? "count" : "budget");
           break monthsLoop;
         }
         continue;
@@ -836,9 +1114,9 @@ async function computeDiagnosticReport(
 
       const parsed = parseEvent(rawLine, { now });
       if (!parsed.ok) {
-        const ok = recordLineFailure(month, line, parsed.error.reason, rawLine, parsed.error.message, { issues: parsed.error.issues });
-        if (!ok) {
-          pushTruncatedMarker(month, line);
+        const status = recordLineFailure(month, line, parsed.error.reason, rawLine, parsed.error.message, { issues: parsed.error.issues });
+        if (status !== "ok") {
+          pushTruncatedMarker(month, line, status === "cap" ? "count" : "budget");
           break monthsLoop;
         }
         continue;
@@ -853,13 +1131,13 @@ async function computeDiagnosticReport(
         if (previous.rawLine === rawLine) {
           continue; // Byte-identical duplicate — folded, exactly as `read()` folds it.
         }
-        const ok = recordLineFailure(month, line, "duplicate-id-conflict", rawLine, `duplicate event id with differing content: ${event.id}`, {
+        const status = recordLineFailure(month, line, "duplicate-id-conflict", rawLine, `duplicate event id with differing content: ${event.id}`, {
           eventId: event.id,
           firstMonth: previous.month,
           firstLine: previous.line,
         });
-        if (!ok) {
-          pushTruncatedMarker(month, line);
+        if (status !== "ok") {
+          pushTruncatedMarker(month, line, status === "cap" ? "count" : "budget");
           break monthsLoop;
         }
         continue; // The first occurrence stays authoritative; only this later, differing one is flagged.
@@ -893,11 +1171,12 @@ const FIXABLE_REASONS: ReadonlySet<DiagnosticFailureReason> = new Set(["invalid-
 
 /**
  * One line removed from a month file by a `recover()` call, as written into
- * `quarantine/<month>.jsonl` — a JSONL file distinct from every
- * `events/<month>.jsonl` (see `quarantinePath`'s doc comment for why `read()`
- * cannot reach it). Records the removed line's content, its reason, and its
- * original position, so an operator can tell a corruption from an attack
- * and, if needed, recover a wrongly-quarantined event by hand.
+ * this call's own `quarantine/<month>/<sortableId>.jsonl` file — a JSONL
+ * file distinct from every `events/<month>.jsonl` (see
+ * `quarantineDirPath`'s doc comment for why `read()` cannot reach it).
+ * Records the removed line's content, its reason, and its original
+ * position, so an operator can tell a corruption from an attack and, if
+ * needed, recover a wrongly-quarantined event by hand.
  *
  * **`line`/`endLine`/`count` (fix round 1, Critical 1) represent a
  * coalesced span** of contiguous, byte-identical lines — see
@@ -924,6 +1203,18 @@ const FIXABLE_REASONS: ReadonlySet<DiagnosticFailureReason> = new Set(["invalid-
  * `hasReplacementCharacter`'s doc comment for the heuristic's own limits,
  * and `task-4-report.md` for the M2.6 follow-up (a raw-bytes read
  * primitive) that would close this properly.
+ *
+ * **`rawTruncated` (fix round 2, Ruling R45(a)): `true` when `raw` is a
+ * prefix of the original line, not the whole thing.** `buildQuarantineRecord`
+ * caps embedded raw content at `MAX_QUARANTINE_RAW_BYTES_PER_RECORD` — see
+ * that constant's doc comment for why a single adversarial line otherwise
+ * makes this record's own serialized size unbounded, independent of
+ * `MAX_QUARANTINE_RUN_BUDGET_BYTES`. The removed line's full original byte
+ * length is still available via the matching `DiagnosticFailure`/
+ * `QuarantinedLineSummary`'s `lineBytes`, and its identity via
+ * `lineSha256` — both computed from the *untruncated* line — so an operator
+ * can always tell a record is a prefix and by how much, even though the
+ * full bytes are not repeated here.
  */
 export interface QuarantineRecord {
   /** ISO-8601 UTC instant of the `recover()` call that removed this line — this module's own clock, per the same "never trust a peer-supplied clock" discipline as `ts`/`lease_until` (`schema.ts`). */
@@ -939,10 +1230,11 @@ export interface QuarantineRecord {
   readonly firstMonth?: string;
   readonly firstLine?: number;
   readonly possiblyLossy: boolean;
+  readonly rawTruncated: boolean;
   readonly raw: string;
 }
 
-/** A sanitized summary of one removed line/span, as returned in `RecoveryResult.quarantined` — the same safe-to-publish shape `DiagnosticFailure` uses, never the raw bytes (those live only in the persisted `QuarantineRecord`, and only there). */
+/** A sanitized summary of one removed line/span, as returned in `RecoveryResult.quarantined` — the same safe-to-publish shape `DiagnosticFailure` uses, never the raw bytes (those live only in the persisted `QuarantineRecord`, and only there). `path` names the exact `quarantine/<month>/<...>.jsonl` file this span's `QuarantineRecord` was written to (fix round 2: each `recover()` call writes its own new file per month — see `buildQuarantineFilePath`'s doc comment — so this is the only reliable way to locate a specific span's record; there is no enumerable index of every quarantine file ever written, by the same `GitAdapter`-exposes-no-tree-enumeration constraint `quarantineDirPath`'s own doc comment names). */
 export interface QuarantinedLineSummary {
   readonly month: string;
   readonly line: number;
@@ -954,6 +1246,8 @@ export interface QuarantinedLineSummary {
   readonly lineSha256: string;
   readonly linePreview: string;
   readonly possiblyLossy: boolean;
+  readonly rawTruncated: boolean;
+  readonly path: string;
 }
 
 export interface RecoveryResult {
@@ -991,12 +1285,19 @@ export interface RecoveryOptions {
 }
 
 /**
- * Builds `quarantine/<month>.jsonl`'s new record for one removed line/span.
- * `raw` is `lines[failure.line]` — captured **before** the line is dropped
- * from the rebuilt month content, so this is the exact original text this
- * module received, not a re-derivation.
+ * Builds this call's quarantine file's new record for one removed
+ * line/span. `raw` is `lines[failure.line]` — captured **before** the line
+ * is dropped from the rebuilt month content, so this is the exact original
+ * text this module received, not a re-derivation. **Fix round 2, Ruling
+ * R45(a): truncates `raw` to `MAX_QUARANTINE_RAW_BYTES_PER_RECORD`** when
+ * the removed line itself is larger than that — see that constant's and
+ * `QuarantineRecord.rawTruncated`'s doc comments for why and what is still
+ * recoverable when it happens (`lineBytes`/`lineSha256`, computed from the
+ * untruncated line, on the matching `DiagnosticFailure`/
+ * `QuarantinedLineSummary`).
  */
 function buildQuarantineRecord(quarantinedAt: string, failure: DiagnosticFailure, raw: string): QuarantineRecord {
+  const { value: storedRaw, truncated } = truncateRawForQuarantine(raw, MAX_QUARANTINE_RAW_BYTES_PER_RECORD);
   const record: {
     quarantinedAt: string;
     month: string;
@@ -1010,6 +1311,7 @@ function buildQuarantineRecord(quarantinedAt: string, failure: DiagnosticFailure
     firstMonth?: string;
     firstLine?: number;
     possiblyLossy: boolean;
+    rawTruncated: boolean;
     raw: string;
   } = {
     quarantinedAt,
@@ -1021,7 +1323,8 @@ function buildQuarantineRecord(quarantinedAt: string, failure: DiagnosticFailure
     reason: failure.reason,
     message: failure.message,
     possiblyLossy: failure.possiblyLossy ?? hasReplacementCharacter(raw),
-    raw,
+    rawTruncated: truncated,
+    raw: storedRaw,
   };
   if (failure.issues !== undefined) record.issues = failure.issues;
   if (failure.eventId !== undefined) record.eventId = failure.eventId;
@@ -1030,8 +1333,8 @@ function buildQuarantineRecord(quarantinedAt: string, failure: DiagnosticFailure
   return record;
 }
 
-/** Projects a fixable `DiagnosticFailure` into `RecoveryResult.quarantined`'s sanitized shape — never `raw`. */
-function toQuarantinedLineSummary(failure: DiagnosticFailure): QuarantinedLineSummary {
+/** Projects a fixable `DiagnosticFailure` into `RecoveryResult.quarantined`'s sanitized shape — never `raw`. `path`/`rawTruncated` are threaded through from the actual write, since neither is knowable from the `DiagnosticFailure` alone. */
+function toQuarantinedLineSummary(failure: DiagnosticFailure, path: string, rawTruncated: boolean): QuarantinedLineSummary {
   return {
     // biome-ignore lint/style/noNonNullAssertion: same guarantee as `buildQuarantineRecord` above.
     line: failure.line!,
@@ -1040,6 +1343,8 @@ function toQuarantinedLineSummary(failure: DiagnosticFailure): QuarantinedLineSu
     month: failure.month,
     reason: failure.reason,
     message: failure.message,
+    path,
+    rawTruncated,
     lineBytes: failure.lineBytes ?? 0,
     lineSha256: failure.lineSha256 ?? "",
     linePreview: failure.linePreview ?? "",
@@ -1060,89 +1365,65 @@ export interface RecoveryHooks {
 }
 
 /**
- * Fix round 1, Critical 2: probes the **literal top-level** `quarantine`
- * path once per recovery attempt, before any per-month work, and throws
- * `EVENT_RECOVERY_QUARANTINE_BLOCKED` if a blob is planted directly there.
+ * Fix round 1, Critical 2 (generalized in fix round 2): probes an exact
+ * directory-shaped `quarantine/...` path — either the literal top-level
+ * `quarantine` path, or one specific month's `quarantine/<month>` path —
+ * before any write that needs it to actually be usable as a directory, and
+ * throws `EVENT_RECOVERY_QUARANTINE_BLOCKED` if a blob is planted directly
+ * at it instead.
  *
- * **Why this needs its own probe, separate from each month's own
- * `quarantine/<month>.jsonl` read.** Git cannot represent one path as both
- * a blob and a directory prefix in the same tree. A blob planted at the bare
- * path `quarantine` (no month suffix) does not make
- * `readBlobFromRef(ref, "quarantine/<month>.jsonl")` throw or return
- * non-null — `ls-tree` simply finds no entry under a prefix that isn't a
- * directory, so the read returns `null`, indistinguishable from "no
- * quarantine history yet." The conflict only surfaces later, when
- * `commitTreeToRef` tries to add an index entry for
- * `quarantine/<month>.jsonl` on top of an index that already has a
- * *blob* entry for `quarantine` itself, and `git write-tree` fails. Probing
- * the exact top-level path directly — confirmed by probe (three real git
- * states: absent, a genuine directory, a blob) — discriminates all three
- * up front, before this function does any other work: `null` (nothing
- * planted, fine), `GIT_BLOB_AMBIGUOUS` (a real directory — `ls-tree`
- * against an exact non-trailing-slash path returns the directory's own
- * tree entry, mode `040000`, which fails the `mode === "100644"` check the
- * same way `ref.ts`'s own usability probe's tree case does — fine, this is
- * the normal, healthy state once any quarantine file has ever been
- * written), or a non-null **string** (a blob really is planted there —
- * the one case that blocks every future recovery, named and thrown here).
+ * **Why this needs its own probe, separate from the actual per-call file
+ * write.** Git cannot represent one path as both a blob and a directory
+ * prefix in the same tree. A blob planted at a bare directory path (no
+ * further suffix) does not make `readBlobFromRef(ref,
+ * "<that path>/<anything>")` throw or return non-null — `ls-tree` simply
+ * finds no entry under a prefix that isn't a directory, so the read returns
+ * `null`, indistinguishable from "nothing written here yet." The conflict
+ * only surfaces later, when `commitTreeToRef` tries to add an index entry
+ * for a path *under* that prefix on top of an index that already has a
+ * *blob* entry for the prefix itself, and `git write-tree` fails. Probing
+ * the exact directory path directly — confirmed by probe (three real git
+ * states: absent, a genuine directory, a blob) — discriminates all three up
+ * front: `null` (nothing planted, fine), `GIT_BLOB_AMBIGUOUS` (a real
+ * directory — `ls-tree` against an exact non-trailing-slash path returns
+ * the directory's own tree entry, mode `040000`, which fails the
+ * `mode === "100644"` check the same way `ref.ts`'s own usability probe's
+ * tree case does — fine, this is the normal, healthy state once any file
+ * has ever been written under it), or a non-null **string** (a blob really
+ * is planted there — the one case that blocks every future write under
+ * that prefix, named and thrown here).
+ *
+ * **Fix round 2: called at two levels, not one.** The bare top-level
+ * `quarantine` path is checked once per attempt (as fix round 1 already
+ * did); the bare `quarantine/<month>` path is now *also* checked, once per
+ * month this attempt is about to write into, since per-call files
+ * (`quarantine/<month>/<sortableId>.jsonl` — see `buildQuarantineFilePath`)
+ * introduce this same D/F conflict one level deeper, at a path that *is*
+ * still deterministic (unlike the per-call file's own randomized name) and
+ * therefore still pre-plantable.
  */
-async function assertQuarantineRootUsable(adapter: GitAdapter, validatedRef: string): Promise<void> {
-  let topLevel: string | null;
+async function assertQuarantineDirectoryUsable(adapter: GitAdapter, validatedRef: string, dirPath: string): Promise<void> {
+  let existing: string | null;
   try {
-    topLevel = await adapter.readBlobFromRef(validatedRef, TOP_LEVEL_QUARANTINE_PATH);
+    existing = await adapter.readBlobFromRef(validatedRef, dirPath);
   } catch (cause) {
     if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
       return; // A real directory — the normal, healthy state.
     }
     throw cause;
   }
-  if (topLevel !== null) {
+  if (existing !== null) {
     throw new CanKanError(
       EventErrorCodes.EVENT_RECOVERY_QUARANTINE_BLOCKED,
-      `the top-level "${TOP_LEVEL_QUARANTINE_PATH}" path resolves to a file, not a directory, so recovery cannot write any quarantine/<month>.jsonl audit record`,
+      `the "${dirPath}" path resolves to a file, not a directory, so recovery cannot write any audit record under it`,
       {
         details: {
           ref: validatedRef,
-          path: TOP_LEVEL_QUARANTINE_PATH,
-          remediation: `remove the blob planted at "${TOP_LEVEL_QUARANTINE_PATH}" (rebuild the ref's tree: git read-tree / git rm --cached ${TOP_LEVEL_QUARANTINE_PATH} / commit-tree / update-ref) before retrying recovery`,
+          path: dirPath,
+          remediation: `remove the blob planted at "${dirPath}" (rebuild the ref's tree: git read-tree / git rm --cached ${dirPath} / commit-tree / update-ref) before retrying recovery`,
         },
       },
     );
-  }
-}
-
-/**
- * Fix round 1, Critical 2: wraps the per-month "does quarantine history
- * already exist" read. A **tree** planted at the exact
- * `quarantine/<month>.jsonl` path (distinct from a blob at the bare
- * top-level `quarantine` path, which `assertQuarantineRootUsable` catches)
- * makes this specific read throw `GIT_BLOB_AMBIGUOUS`, the same "`ls-tree`
- * against an exact path finds the directory's own non-`100644` entry"
- * shape `ref.ts`'s usability probe already establishes. Thrown as
- * `EVENT_RECOVERY_QUARANTINE_BLOCKED` rather than silently proceeding
- * without a quarantine write for this month — recovering the month file
- * without its matching audit record would be a silent deletion, which this
- * module must never do.
- */
-async function readExistingQuarantineOrThrow(adapter: GitAdapter, validatedRef: string, month: string, qPath: string): Promise<string> {
-  try {
-    return (await adapter.readBlobFromRef(validatedRef, qPath)) ?? "";
-  } catch (cause) {
-    if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
-      throw new CanKanError(
-        EventErrorCodes.EVENT_RECOVERY_QUARANTINE_BLOCKED,
-        `the quarantine audit path does not resolve to a usable blob, refusing to recover ${month} without a place to record the audit trail: ${qPath}`,
-        {
-          details: {
-            ref: validatedRef,
-            month,
-            path: qPath,
-            remediation: `inspect the tree (e.g. \`git ls-tree -r ${validatedRef} -- ${qPath}\`) and remove the offending entry before retrying recovery`,
-          },
-        },
-      );
-    }
-    throw cause;
   }
 }
 
@@ -1167,10 +1448,12 @@ async function readExistingQuarantineOrThrow(adapter: GitAdapter, validatedRef: 
  * tree (fm1's rule, restated for recovery). For each month with at least one
  * *fixable* failure ({@link FIXABLE_REASONS}): read its current blob, drop
  * exactly the offending line span(s) (by index, computed against this
- * attempt's own fresh read), and append one `QuarantineRecord` per removed
- * span to that month's `quarantine/<month>.jsonl`, preserving whatever
- * quarantine history already exists there. Every other file in the tree —
- * every other month, every other quarantine file — survives untouched via
+ * attempt's own fresh read), and write one `QuarantineRecord` per removed
+ * span into this call's own new `quarantine/<month>/<sortableId>.jsonl` file
+ * (fix round 2, Ruling R45(b) — never read, appended to, or grown from an
+ * earlier call's quarantine file; see `quarantineDirPath`'s doc comment for
+ * why). Every other file in the tree — every other month, every earlier
+ * call's quarantine file — survives untouched via
  * `commitTreeToRef`'s own overlay behavior (`git read-tree <parent>` into a
  * private index, verified directly at `git/adapter.ts:200-222`), so this
  * call never needs to (and never does) carry forward content it did not
@@ -1231,8 +1514,9 @@ async function readExistingQuarantineOrThrow(adapter: GitAdapter, validatedRef: 
  *   before the rival even claims it is not a duplicate-id scenario at all —
  *   it is two independent, both-valid events under different ids, and
  *   neither is touched.)
- * - Every removed line/span is preserved in `quarantine/<month>.jsonl`
- *   regardless of which of the above reasons applied — see
+ * - Every removed line/span is preserved in this call's own
+ *   `quarantine/<month>/<sortableId>.jsonl` file, regardless of which of the
+ *   above reasons applied — see
  *   `QuarantineRecord`'s doc comment for exactly what fidelity that
  *   preservation can and cannot promise (Ruling R44). Recovery is
  *   reversible by hand (an operator can inspect the quarantine record and
@@ -1246,8 +1530,8 @@ async function readExistingQuarantineOrThrow(adapter: GitAdapter, validatedRef: 
  * had by pushing the poison line in the first place — they get their own
  * poison quarantined, on the record, and nothing else.
  */
-export async function recover(adapter: GitAdapter, ref: string, options: RecoveryOptions = {}): Promise<RecoveryResult> {
-  return recoverCore(adapter, ref, options, {});
+export async function recover(adapter: GitAdapter, ref: string, options: RecoveryOptions | null = {}): Promise<RecoveryResult> {
+  return recoverCore(adapter, ref, options ?? {}, {});
 }
 
 /** See `RecoveryHooks`'s doc comment: the module-internal export a test drives directly. `recover` is the public surface; it calls this with no hooks. */
@@ -1314,11 +1598,11 @@ export async function recoverCore(
       };
     }
 
-    // Fix round 1, Critical 2: confirm the audit path itself is usable
-    // before doing any per-month work — a blocked top-level path would
-    // otherwise be discovered only after every month's content had already
-    // been read and rebuilt, for no purpose.
-    await assertQuarantineRootUsable(adapter, validatedRef);
+    // Fix round 1, Critical 2: confirm the top-level audit path itself is
+    // usable before doing any per-month work — a blocked top-level path
+    // would otherwise be discovered only after every month's content had
+    // already been read and rebuilt, for no purpose.
+    await assertQuarantineDirectoryUsable(adapter, validatedRef, TOP_LEVEL_QUARANTINE_PATH);
 
     const byMonth = new Map<string, DiagnosticFailure[]>();
     for (const failure of fixable) {
@@ -1334,22 +1618,32 @@ export async function recoverCore(
     const quarantined: QuarantinedLineSummary[] = [];
     const monthsRewritten: string[] = [];
     const monthsWithPossibleEncodingLoss: string[] = [];
-    // Fix round 1, Critical 1: bounds the audit blob this call is about to
-    // write, across every month it touches — coalescing already keeps this
-    // proportional to the number of *distinct* spans, not the number of
-    // bytes/lines they represent, but this is a final, explicit belt before
-    // anything is committed into the coordination ref (which every peer
-    // then fetches and stores permanently).
+    // Fix round 2 (Ruling R45(a)): a final, explicit belt on the *actual*
+    // built content, in addition to (never instead of) the diagnosis-time
+    // budget enforced in `computeDiagnosticReport` — see
+    // `MAX_QUARANTINE_RUN_BUDGET_BYTES`'s doc comment for the algebraic
+    // invariant that keeps this from ever firing under normal operation
+    // (`recovery.test.ts` checks the invariant directly). Unlike fix round
+    // 1's version of this check, this can never *permanently* wedge
+    // anything: each month's quarantine content is its own brand-new file
+    // (never read, grown, or combined with an earlier call's history — see
+    // `quarantineDirPath`'s doc comment), so a throw here means only "this
+    // one call built more than expected," not "this ref can never be
+    // recovered again."
     let totalQuarantineBytes = 0;
 
     for (const [month, monthFailures] of byMonth) {
       const path = monthPath(month);
-      // Fresh read, off this attempt's own `parentSha` — never the blob
-      // `computeDiagnosticReport` happened to see (it read the identical
-      // state, since both calls target the same `parentSha`, but reading
-      // again here keeps this loop's "the content this attempt writes back
-      // is exactly the content this attempt just read" invariant explicit
-      // rather than relying on that coincidence).
+      // Fix round 2 (NEW-9): this read is *not* pinned to a specific
+      // commit — `readBlobFromRef` re-resolves `validatedRef` by name on
+      // every call, exactly like `computeDiagnosticReport`'s own read a
+      // moment ago. What actually guarantees "the content this attempt
+      // writes back is exactly the content this attempt just read" is the
+      // CAS below (`commitTreeToRef`'s `parent: parentSha`): if the ref
+      // moved between that first read and this one — or between this one
+      // and the commit — the commit is rejected outright and
+      // `withCasRetry` re-runs this whole attempt function from a fresh
+      // read, rather than this module ever trusting two reads to agree.
       const raw = (await adapter.readBlobFromRef(validatedRef, path)) ?? "";
       const lines = splitJsonlLines(raw);
       const badRanges = monthFailures
@@ -1395,63 +1689,72 @@ export async function recoverCore(
         }
       }
 
-      const qPath = quarantinePath(month);
-      const existingQuarantine = await readExistingQuarantineOrThrow(adapter, validatedRef, month, qPath);
+      // Fix round 2 (NEW-1 remediation, one level down from the top-level
+      // probe above): a blob planted at the bare `quarantine/<month>` path
+      // is a D/F conflict with the per-call file this month is about to
+      // write, and — unlike the file's own randomized name — that bare
+      // path is deterministic and therefore pre-plantable.
+      await assertQuarantineDirectoryUsable(adapter, validatedRef, quarantineDirPath(month));
+      const qPath = buildQuarantineFilePath(month, quarantinedAt);
       const orderedFailures = [...monthFailures].sort((a, b) => (a.line as number) - (b.line as number));
-      let appended = "";
+      let quarantineContent = "";
       for (const failure of orderedFailures) {
         const rawRemovedLine = lines[failure.line as number] ?? "";
         if (hasReplacementCharacter(rawRemovedLine)) {
           monthPossiblyLossy = true;
         }
         const record = buildQuarantineRecord(quarantinedAt, failure, rawRemovedLine);
-        appended += `${JSON.stringify(record)}\n`;
-        quarantined.push(toQuarantinedLineSummary(failure));
+        quarantineContent += `${JSON.stringify(record)}\n`;
+        quarantined.push(toQuarantinedLineSummary(failure, qPath, record.rawTruncated));
       }
-      // Append-only: whatever quarantine history already exists for this
-      // month survives, exactly as `append`'s own read-check-concatenate
-      // pattern preserves a month file's prior content.
-      const newQuarantineContent = existingQuarantine + appended;
-      totalQuarantineBytes += Buffer.byteLength(newQuarantineContent, "utf8");
-      files.push({ path: qPath, content: newQuarantineContent });
+      // Fix round 2 (Ruling R45(b)): this call's own new file — never an
+      // existing-content read, never appended to an earlier call's history.
+      // See `quarantineDirPath`'s doc comment for why the old append-onto-
+      // one-ever-growing-file design was itself the NEW-1 defect.
+      totalQuarantineBytes += Buffer.byteLength(quarantineContent, "utf8");
+      files.push({ path: qPath, content: quarantineContent });
 
       if (monthPossiblyLossy) {
         monthsWithPossibleEncodingLoss.push(month);
       }
     }
 
-    if (totalQuarantineBytes > MAX_DIAGNOSTIC_MONTH_BLOB_BYTES) {
+    // Fix round 2 (Ruling R45(a)): the true worst-case ceiling — the run
+    // budget diagnosis-time truncation already enforces, plus the one
+    // additional record's worth that `recordLineFailure` always allows
+    // through even when it alone crosses that budget (see
+    // `MAX_QUARANTINE_RUN_BUDGET_BYTES`'s doc comment). Estimated bytes,
+    // not measured, so this uses the same conservative multiplier as the
+    // diagnosis-time check, over the *actual* built content — provably
+    // should never fire; kept as defense-in-depth rather than trusting the
+    // estimate never to be wrong, per fix-round-2 review guidance.
+    const absoluteQuarantineCeiling =
+      MAX_QUARANTINE_RUN_BUDGET_BYTES + MAX_QUARANTINE_RAW_BYTES_PER_RECORD * QUARANTINE_ESCAPE_EXPANSION_FACTOR + QUARANTINE_RECORD_OVERHEAD_BYTES;
+    if (totalQuarantineBytes > absoluteQuarantineCeiling) {
       throw new CanKanError(
         EventErrorCodes.EVENT_RECOVERY_QUARANTINE_TOO_LARGE,
-        `this recovery call's quarantine audit content (${totalQuarantineBytes} bytes) exceeds its own resource bound (${MAX_DIAGNOSTIC_MONTH_BLOB_BYTES} bytes); refusing to write it into the coordination ref`,
-        { details: { ref: validatedRef, totalBytes: totalQuarantineBytes, maxBytes: MAX_DIAGNOSTIC_MONTH_BLOB_BYTES } },
+        `this recovery call's quarantine audit content (${totalQuarantineBytes} bytes) exceeds its own resource bound (${absoluteQuarantineCeiling} bytes); refusing to write it into the coordination ref. This should not happen given this module's own diagnosis-time budgeting — if it does, it indicates a mismatch between this module's size-estimation constants and reality, not a permanently unrecoverable ref (each call's quarantine content is its own new file, never combined with an earlier call's — narrowing trailingMonths, which reduces how many months a single run touches, may avoid the condition in the meantime)`,
+        { details: { ref: validatedRef, totalBytes: totalQuarantineBytes, maxBytes: absoluteQuarantineCeiling } },
       );
     }
 
     await hooks.beforeCas?.(attemptNumber);
 
-    let outcome: CasOutcome;
-    try {
-      outcome = await adapter.commitTreeToRef(validatedRef, {
-        parent: parentSha,
-        message: `quarantine ${fixable.length} invalid event log line${fixable.length === 1 ? "" : "s"}`,
-        files,
-      });
-    } catch (cause) {
-      // Fix round 1, Critical 2 fallback: a tree conflict this function's
-      // own probes did not catch in advance (e.g. a race between the probe
-      // above and this call, or a shape this module has not enumerated)
-      // still surfaces as a typed, named error rather than a bare
-      // `GIT_COMMAND_FAILED` with no actionable guidance.
-      if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_COMMAND_FAILED) {
-        throw new CanKanError(
-          EventErrorCodes.EVENT_RECOVERY_QUARANTINE_BLOCKED,
-          "recovery's commit could not be built — this can happen when something is planted at one of the quarantine/<month>.jsonl paths (or the top-level quarantine path) this run needed to write, conflicting with it as a directory; inspect the tree (e.g. `git ls-tree <ref>`) and remove the offending entry, then retry",
-          { cause, details: { ref: validatedRef, months: monthsRewritten } },
-        );
-      }
-      throw cause;
-    }
+    // Fix round 2 (NEW-2): no longer wraps `commitTreeToRef`'s own
+    // `GIT_COMMAND_FAILED` as `EVENT_RECOVERY_QUARANTINE_BLOCKED`. Fix
+    // round 1's version of this catch relabeled *any* commit failure this
+    // way, which could misattribute an unrelated git-level failure (disk
+    // full, permissions, a read-only object store) as a blocked audit path.
+    // The two `assertQuarantineDirectoryUsable` probes above (top-level and
+    // per-month) now catch both known D/F conflict shapes *before* this
+    // commit is attempted, so a real conflict is already reported with a
+    // named path and remediation well before this call — anything that
+    // still fails here propagates with its genuine code and cause intact.
+    const outcome: CasOutcome = await adapter.commitTreeToRef(validatedRef, {
+      parent: parentSha,
+      message: `quarantine ${fixable.length} invalid event log line${fixable.length === 1 ? "" : "s"}`,
+      files,
+    });
 
     if (outcome.outcome === "applied") {
       return {

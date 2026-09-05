@@ -209,9 +209,12 @@ async function resolveCanonicalPersonalPath(
 // tolerant, same as `resolve.ts` uses), rather than
 // `resolveCanonicalPersonalPath`'s plain form. Fix round 6, security
 // review: comparing only the personal-board side canonically, against a
-// raw `entry.path`, missed even an *exact* alias whenever an ancestor of
-// the data home sits behind a symlink -- see `isPersonalBoardPath`'s own
-// doc comment in `personal.ts` for the full explanation.
+// raw `entry.path`, published an exact alias to `.boards` once the
+// personal board actually existed, on a host where an ancestor of the
+// data home sits behind a symlink -- see `isPersonalBoardPath`'s own doc
+// comment in `personal.ts` for the full explanation, including why the
+// board-not-yet-created case was merely a wrong skip *reason*, not this
+// defect.
 
 // ---------------------------------------------------------------------------
 // Reading (R16-style guard reuse -- see the note on `readRegistryRaw` below)
@@ -345,10 +348,16 @@ export async function listRegisteredBoards(
     // user-editable string) the same existence-tolerant way it
     // canonicalizes the personal board's own path before comparing --
     // fix round 6, security review: an *uncanonicalized* comparison here
-    // missed even an *exact* alias on a host where an ancestor of the
-    // data home sits behind a symlink (macOS's `$TMPDIR` under
-    // `/var/folders/...`, itself a symlink to `/private/var/folders/...`),
-    // not merely a deliberate symlink alias as an earlier version of this
+    // published an *exact* alias to `.boards` once the personal board
+    // actually existed on disk, on a host where an ancestor of the data
+    // home sits behind a symlink (macOS's `$TMPDIR` under
+    // `/var/folders/...`, itself a symlink to `/private/var/folders/...`)
+    // -- `entry.path`'s raw, un-resolved form `stat`s successfully there
+    // (the OS follows the symlink transparently), so it passed every
+    // check that didn't also canonicalize it. (With the board not yet
+    // created, the entry was still skipped either way -- only the *skip
+    // reason* came out wrong, which is what a test first caught.) Not
+    // merely a deliberate symlink alias, as an earlier version of this
     // comment claimed.
     if (await isPersonalBoardPath(entry.path, env)) {
       skipped.push({ name: entry.name, path: entry.path, reason: "is the personal board" });

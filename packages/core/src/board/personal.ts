@@ -96,13 +96,20 @@ export function resolvePersonalBoardPath(
  * not just the personal-board side** (security review, fix round 6:
  * `registry.ts`'s `listRegisteredBoards` compared this function's
  * three-tier result against a registry entry's *raw, uncanonicalized*
- * stored path -- on a host where `$TMPDIR`/`$XDG_DATA_HOME` sits behind a
- * symlink, the two sides disagreed even for an *exact* match, silently
- * defeating the "is the personal board" check entirely, not merely missing
- * a symlink alias as documented). `isPersonalBoardPath` below is the
- * shared predicate that canonicalizes both sides with this one function,
- * so that asymmetry is structurally impossible rather than merely absent
- * at any one call site today.
+ * stored path). The reachable defect is specifically the **board-exists**
+ * cell: once the personal board has actually been created, its raw
+ * (un-canonicalized) path genuinely `stat`s successfully -- transparently
+ * following whatever symlink an ancestor of `$TMPDIR`/`$XDG_DATA_HOME`
+ * sits behind -- so an entry naming that raw path passed every check and
+ * landed in `.boards`, published on the public surface, exactly the
+ * outcome the "is the personal board" check exists to prevent. (When the
+ * board has *not* been created yet, the raw path still fails `stat`
+ * outright, so the entry was skipped either way -- pre-fix, only the
+ * *skip reason* came out wrong there, which is how a test first surfaced
+ * this at all, not a second security-relevant cell.) `isPersonalBoardPath`
+ * below is the shared predicate that canonicalizes both sides with this
+ * one function, so that asymmetry is structurally impossible rather than
+ * merely absent at any one call site today.
  */
 async function canonicalizeExistenceTolerant(path: string): Promise<string> {
   try {

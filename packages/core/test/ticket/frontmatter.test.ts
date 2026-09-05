@@ -206,6 +206,65 @@ describe("setCankanBlock — the disposable-cache rebuild path", () => {
   });
 });
 
+describe("round 2 fix-in: mutation against CONCEPT_TICKET_EXAMPLE, the fixture with padded/unpadded flow collections and inline comments (C-1)", () => {
+  // CONCEPT_TICKET_EXAMPLE is in the no-change round-trip suite above, but
+  // that only proves the no-change path returns `raw` untouched — it says
+  // nothing about the mutation path. The security reviewer showed a naive
+  // `doc.set(key, v); doc.toString()` "fix" passes every existing mutation
+  // assertion (all against PROBE2/PROBE3/UNKNOWN_FIELD, none of which mix a
+  // padded and an unpadded flow collection, or carry an inline comment) and
+  // only fails against this exact fixture — repadding `[alice]` to
+  // `[ alice ]` and dropping the `# manual rank...` comment. These two
+  // tests are the ones that actually exercise that failure mode.
+
+  test("setScalarField(status) changes exactly the status: line; the unpadded/padded flow collections and every inline comment are untouched", () => {
+    const parsed = parseTicketFile(CONCEPT_TICKET_EXAMPLE);
+    const mutated = setScalarField(parsed, "status", "Done");
+    const output = serializeTicketFile(mutated);
+
+    const { changedLines, aLines, bLines } = diffLines(CONCEPT_TICKET_EXAMPLE, output);
+    expect(changedLines).toEqual([3]); // 0-indexed: line 3 is "status: In Progress"
+    expect(aLines[3]).toBe("status: In Progress");
+    expect(bLines[3]).toBe("status: Done");
+
+    // Unpadded flow sequences/maps — a naive `doc.toString()` re-pads these.
+    expect(output).toContain("assignee: [alice]");
+    expect(output).toContain("labels: [backend]");
+    expect(output).toContain("dependencies: [ck-2b1e44]");
+    expect(output).toContain("aliases: [TASK-12]             # previous IDs, filled by adopt/renumber");
+    // The padded flow map inside the sequence — a naive re-emit can also
+    // *unpad* this to match whatever single padding option it chose.
+    expect(output).toContain("- { type: blocks, id: ck-2b1e44 }");
+    expect(output).toContain("- { type: discovered-from, id: ck-91ab02 }");
+    // Every inline comment — a naive re-emit from a plain object drops
+    // these entirely, since they were never part of the parsed data.
+    expect(output).toContain("ordinal: 1250                    # manual rank; Backlog.md's own field");
+    expect(output).toContain("origin: jira:PROJ-45           # omitted for native tickets");
+    expect(output).toContain("state: ahead                 # clean | ahead | behind | diverged | conflict");
+  });
+
+  test("setCankanBlock replace changes only the cankan: block's own lines; everything before it (unpadded/padded flow collections, inline comments) and the body are untouched", () => {
+    const parsed = parseTicketFile(CONCEPT_TICKET_EXAMPLE);
+    const mutated = setCankanBlock(parsed, { display_id: "PROJ-99" });
+    const output = serializeTicketFile(mutated);
+
+    // Derived from the fixture itself, not retyped, so this cannot drift
+    // from CONCEPT_TICKET_EXAMPLE's actual bytes.
+    const prefixBeforeCankan = CONCEPT_TICKET_EXAMPLE.slice(
+      0,
+      CONCEPT_TICKET_EXAMPLE.indexOf("cankan:\n"),
+    );
+    const suffixFromClosingDelimiter = CONCEPT_TICKET_EXAMPLE.slice(
+      CONCEPT_TICKET_EXAMPLE.indexOf("\n---\n\n## Description") + 1,
+    );
+
+    expect(output.startsWith(prefixBeforeCankan)).toBe(true);
+    expect(output.endsWith(suffixFromClosingDelimiter)).toBe(true);
+    expect(output).toContain("cankan:\n  display_id: PROJ-99\n");
+    expect(output).not.toContain("origin: jira:PROJ-45");
+  });
+});
+
 describe("the gray-matter javascript engine (the base vulnerability, unmitigated)", () => {
   // Proves the vulnerability this module defends against is real: calling
   // gray-matter directly, with no mitigation, executes ticket content.
@@ -461,5 +520,150 @@ describe("round 1 fix-in: setScalarField guards (M-5, M-6)", () => {
       thrown = e;
     }
     expect(isCanKanError(thrown)).toBe(true);
+  });
+});
+
+describe("round 2 fix-in: an oversized file or frontmatter segment throws a CanKanError instead of hanging (S-2)", () => {
+  test("a frontmatter segment over the 64 KB cap is rejected immediately, without ever reaching parseDocument", () => {
+    // Not the reviewer's 874 KB / 40 s repro itself — that would make this
+    // suite slow on every run. The cap is checked (`frontmatterText.length`)
+    // before `parseDocument` is ever called, so a fast, deterministic size
+    // check is the actual behavior under test, not the parse time. Padding
+    // with a single long value (not thousands of keys) keeps this
+    // construction itself cheap.
+    const oversizedValue = "x".repeat(70 * 1024);
+    const raw = `---\nid: ck-1\ntitle: x\nstatus: To Do\npadding: ${oversizedValue}\n---\nbody\n`;
+
+    const start = performance.now();
+    let thrown: unknown;
+    try {
+      parseTicketFile(raw);
+    } catch (e) {
+      thrown = e;
+    }
+    const elapsedMs = performance.now() - start;
+
+    expect(isCanKanError(thrown)).toBe(true);
+    expect((thrown as { code: string }).code).toBe(TicketErrorCodes.FRONTMATTER_TOO_LARGE);
+    // Generous bound: proves this is a size check, not an attempted parse
+    // of 70 KB (which the reviewer's own table puts at several seconds).
+    expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  test("a frontmatter segment just under the cap still parses normally", () => {
+    const value = "x".repeat(60 * 1024);
+    const raw = `---\nid: ck-1\ntitle: x\nstatus: To Do\npadding: ${value}\n---\nbody\n`;
+    const parsed = parseTicketFile(raw);
+    expect(parsed.frontmatter.status).toBe("To Do");
+  });
+
+  test("a raw file over the generous whole-file cap is rejected immediately", () => {
+    // Several-MB cap on `raw` as a whole (deliberately generous — a
+    // ticket's prose body is legitimate long text this phase must
+    // round-trip byte-identically, so this is not the cap that matters;
+    // MAX_FRONTMATTER_LENGTH above is).
+    const hugeBody = "x".repeat(9 * 1024 * 1024);
+    const raw = `---\nid: ck-1\ntitle: x\nstatus: To Do\n---\n${hugeBody}`;
+
+    const start = performance.now();
+    let thrown: unknown;
+    try {
+      parseTicketFile(raw);
+    } catch (e) {
+      thrown = e;
+    }
+    const elapsedMs = performance.now() - start;
+
+    expect(isCanKanError(thrown)).toBe(true);
+    expect((thrown as { code: string }).code).toBe(TicketErrorCodes.FRONTMATTER_TOO_LARGE);
+    expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  test("a long legitimate prose body, well under the raw cap, is not rejected", () => {
+    const longBody = "Lorem ipsum dolor sit amet. ".repeat(20000); // ~580 KB of prose
+    const raw = `---\nid: ck-1\ntitle: x\nstatus: To Do\n---\n${longBody}`;
+    const parsed = parseTicketFile(raw);
+    expect(serializeTicketFile(parsed)).toBe(raw);
+  });
+});
+
+describe("round 2 fix-in: setScalarField never republishes a rejected key in message or details (S-7)", () => {
+  test("the unsafe-key rejection reports only the rule, never the key itself", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    const secret = "SECRET-ghp_AAAABBBBCCCC";
+    let thrown: unknown;
+    try {
+      setScalarField(parsed, `k\n${secret}: v`, "x");
+    } catch (e) {
+      thrown = e;
+    }
+    expect(isCanKanError(thrown)).toBe(true);
+    const error = thrown as { message: string; details?: Record<string, unknown> };
+    expect(error.message).not.toContain(secret);
+    expect(JSON.stringify(error.details ?? {})).not.toContain(secret);
+  });
+
+  test("the non-scalar-field rejection reports only the rule, never the field name", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\nassignee: [alice]\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    let thrown: unknown;
+    try {
+      setScalarField(parsed, "assignee", "bob");
+    } catch (e) {
+      thrown = e;
+    }
+    const error = thrown as { message: string; details?: Record<string, unknown> };
+    expect(error.message).not.toContain("assignee");
+    expect(JSON.stringify(error.details ?? {})).not.toContain("assignee");
+  });
+});
+
+describe("round 2 fix-in: setScalarField no longer double-spaces an existing key with trailing whitespace (C-2)", () => {
+  test("epic: (no trailing space) gets exactly one inserted space", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\nepic:\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    const output = serializeTicketFile(setScalarField(parsed, "epic", "EPIC-9"));
+    expect(output).toBe("---\nid: ck-1\ntitle: x\nstatus: To Do\nepic: EPIC-9\n---\nbody\n");
+  });
+
+  test("epic: <trailing space> does not get a second space inserted", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\nepic: \n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    const output = serializeTicketFile(setScalarField(parsed, "epic", "EPIC-9"));
+    expect(output).toBe("---\nid: ck-1\ntitle: x\nstatus: To Do\nepic: EPIC-9\n---\nbody\n");
+  });
+
+  test("epic: <trailing tab> does not get a second space inserted", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\nepic:\t\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    const output = serializeTicketFile(setScalarField(parsed, "epic", "EPIC-9"));
+    expect(output).toBe("---\nid: ck-1\ntitle: x\nstatus: To Do\nepic:\tEPIC-9\n---\nbody\n");
+  });
+});
+
+describe("round 2 fix-in: the alias-rejection message says 'alias', not 'anchor or alias' (D-1)", () => {
+  test("a bare anchor with no alias reference parses cleanly", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\nx: &a 1\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    expect(parsed.frontmatter.status).toBe("To Do");
+  });
+
+  test("an actual alias reference is rejected with a message naming an alias, not an anchor", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\nx: &a [1]\ny: *a\n---\nbody\n";
+    let thrown: unknown;
+    try {
+      parseTicketFile(raw);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(isCanKanError(thrown)).toBe(true);
+    const error = thrown as { message: string };
+    expect(error.message).toContain("alias");
+    // Discriminates from the pre-fix wording ("...uses a YAML anchor or
+    // alias, which is not supported"), which overstated what
+    // `containsAlias` actually rejects — it only matches `*name` alias
+    // references, never a bare `&name` anchor definition.
+    expect(error.message).not.toContain("anchor");
   });
 });

@@ -219,10 +219,13 @@ function formatYamlErrorMessage(
 }
 
 /**
- * True if `doc` contains a YAML anchor/alias anywhere (e.g. `&a`/`*a`).
- * Backlog.md never emits one, and this module rejects them outright rather
- * than ever calling `doc.toJS()` on one — see `parseFrontmatterData`'s
- * comment for why.
+ * True if `doc` contains a YAML **alias** reference (`*a`) anywhere.
+ * Deliberately does not match a bare anchor definition (`&a`) with no
+ * corresponding alias — an anchor nobody references expands to nothing, so
+ * it carries none of the hazards below and rejecting it would be a
+ * behaviour change with no matching risk. Backlog.md never emits an alias,
+ * and this module rejects one outright rather than ever calling
+ * `doc.toJS()` on it — see `parseFrontmatterData`'s comment for why.
  */
 function containsAlias(doc: Document): boolean {
   let found = false;
@@ -235,7 +238,28 @@ function containsAlias(doc: Document): boolean {
   return found;
 }
 
+// 64 KB — real Backlog.md frontmatter is ~1-2 KB, so this is ~30x headroom.
+// This is the cap that matters: measured, `yaml@2.9.0`'s `parseDocument` on
+// the frontmatter segment is at-least-quadratic in key count (94 KB / 8 000
+// keys: 249 ms; 202 KB / 16 000: 785 ms; 426 KB / 32 000: 3 004 ms; 874 KB /
+// 64 000: 47 644 ms) while `matter()`, `toJS()` and zod all stayed flat at
+// every size tested — the quadratic cost is `parseDocument` on this segment
+// specifically, so this is where the bound belongs. 64 KB keeps the worst
+// case at roughly 150 ms by that table. Deliberately not a bound on `raw`
+// as a whole (see `MAX_RAW_LENGTH`): a ticket's body is prose a human may
+// legitimately have written at length, and this phase must round-trip it
+// byte-identically, not reject it.
+const MAX_FRONTMATTER_LENGTH = 64 * 1024;
+
 function parseFrontmatterData(frontmatterText: string, path: string | undefined) {
+  if (frontmatterText.length > MAX_FRONTMATTER_LENGTH) {
+    throw new CanKanError(
+      TicketErrorCodes.FRONTMATTER_TOO_LARGE,
+      path
+        ? `Ticket frontmatter at ${path} exceeds ${MAX_FRONTMATTER_LENGTH} characters`
+        : `Ticket frontmatter exceeds ${MAX_FRONTMATTER_LENGTH} characters`,
+    );
+  }
   const doc = parseDocument(frontmatterText);
   if (doc.errors.length > 0) {
     const error = doc.errors[0];
@@ -249,29 +273,31 @@ function parseFrontmatterData(frontmatterText: string, path: string | undefined)
     );
   }
 
-  // Anchors/aliases are rejected outright, before `toJS()` ever runs. Two
+  // Aliases are rejected outright, before `toJS()` ever runs. Two
   // independent reasons, both confirmed by execution against yaml@2.9.0:
   // (1) `yaml` enforces its alias-expansion resource-exhaustion limit at
   // `toJS()` time, not `parseDocument()` time — `doc.errors` is empty for a
-  // 175-byte file with a handful of nested anchors, and `toJS()` throws a
-  // raw `ReferenceError` ("Excessive alias count indicates a resource
-  // exhaustion attack") that is not a `YAMLParseError` and is not caught by
-  // the check above. (2) A cyclic anchor (`x: &a [*a]`) does not throw at
-  // all — `toJS()` returns a self-referential object that `JSON.stringify`
-  // cannot encode, breaking every `--json` consumer that touches it later,
-  // far from where the ticket was parsed. Backlog.md never emits an anchor
-  // or alias, so rejecting them here costs nothing real.
+  // 175-byte file with a handful of nested anchor/alias pairs, and
+  // `toJS()` throws a raw `ReferenceError` ("Excessive alias count
+  // indicates a resource exhaustion attack") that is not a
+  // `YAMLParseError` and is not caught by the check above. (2) A cyclic
+  // alias (`x: &a [*a]`) does not throw at all — `toJS()` returns a
+  // self-referential object that `JSON.stringify` cannot encode, breaking
+  // every `--json` consumer that touches it later, far from where the
+  // ticket was parsed. Backlog.md never emits an alias, so rejecting one
+  // here costs nothing real. (A bare anchor with no alias is left alone —
+  // see `containsAlias`'s comment.)
   if (containsAlias(doc)) {
     throw new CanKanError(
       TicketErrorCodes.FRONTMATTER_MALFORMED,
       path
-        ? `Ticket frontmatter at ${path} uses a YAML anchor or alias, which is not supported`
-        : "Ticket frontmatter uses a YAML anchor or alias, which is not supported",
+        ? `Ticket frontmatter at ${path} uses a YAML alias, which is not supported`
+        : "Ticket frontmatter uses a YAML alias, which is not supported",
     );
   }
 
   // `toJS()` is a third-party throw site independent of the `doc.errors`
-  // check above (see the anchor/alias comment) — wrapped defensively so a
+  // check above (see the alias comment) — wrapped defensively so a
   // future `yaml` release's new failure mode still surfaces as a
   // `CanKanError`, not a raw exception with `isCanKanError() === false`.
   let data: unknown;
@@ -309,6 +335,12 @@ function validateFrontmatter(data: unknown, path: string | undefined): TicketFro
   return result.data;
 }
 
+// Several MB — generous, and deliberately not the cap that matters (see
+// `MAX_FRONTMATTER_LENGTH`). Only stops a truly pathological file; a
+// ticket's body is prose a human may legitimately have written at length,
+// and this phase must round-trip it byte-identically, not refuse it.
+const MAX_RAW_LENGTH = 8 * 1024 * 1024;
+
 /**
  * Parses a ticket file's full raw text (frontmatter + body) into a
  * `ParsedTicket`. `path` is optional and used only to make error messages
@@ -317,9 +349,24 @@ function validateFrontmatter(data: unknown, path: string | undefined): TicketFro
  * Every call goes through the `gray-matter` security gate (`callMatter`)
  * first, structural delimiter splitting second, and `yaml` parsing third —
  * in that order, so a hostile `---js` payload is always evaluated against
- * the mitigation before anything else runs.
+ * the mitigation before anything else runs. Two further, independent
+ * rejections happen inside that pipeline: an oversized file or frontmatter
+ * segment (`TicketErrorCodes.FRONTMATTER_TOO_LARGE` — `yaml`'s parser is
+ * at-least-quadratic in frontmatter key count), and any YAML **alias**
+ * reference in the frontmatter, i.e. `*name` (`FRONTMATTER_MALFORMED` — a
+ * policy constraint, not a parsing error: Backlog.md never emits one, so no
+ * real file is affected, but an alias can otherwise trigger `yaml`'s own
+ * resource-exhaustion guard or yield a cyclic, unserializable value). A
+ * bare anchor definition (`&name`) with nothing referencing it is left
+ * alone — it expands to nothing, so it carries none of those hazards.
  */
 export function parseTicketFile(raw: string, path?: string): ParsedTicket {
+  if (raw.length > MAX_RAW_LENGTH) {
+    throw new CanKanError(
+      TicketErrorCodes.FRONTMATTER_TOO_LARGE,
+      path ? `Ticket file at ${path} exceeds ${MAX_RAW_LENGTH} characters` : `Ticket file exceeds ${MAX_RAW_LENGTH} characters`,
+    );
+  }
   callMatter(raw, path);
   const split = splitTicketFile(raw, path);
   const { data } = parseFrontmatterData(split.frontmatterText, path);
@@ -406,8 +453,12 @@ export function setScalarField(
   value: string | number | boolean,
 ): ParsedTicket {
   if (UNSAFE_KEY_RE.test(key)) {
+    // Never republish `key` itself: a field name is caller-supplied today,
+    // but the brief has MCP supplying field names later, and this is
+    // exactly the "report which rule failed, not the value" pattern
+    // `filename.ts`'s `assertSafeId` already follows for the same reason.
     throw new CanKanError(ErrorCodes.USAGE, "Field name is not a valid single-line YAML key", {
-      details: { key },
+      details: { reason: "not a valid single-line YAML key" },
     });
   }
 
@@ -418,8 +469,8 @@ export function setScalarField(
   if (pair?.value && !isScalar(pair.value)) {
     throw new CanKanError(
       ErrorCodes.USAGE,
-      `Field "${key}" is not a scalar; setScalarField only sets scalar fields`,
-      { details: { key } },
+      "Field is not a scalar; setScalarField only sets scalar fields",
+      { details: { reason: "field is not a scalar" } },
     );
   }
 
@@ -430,13 +481,22 @@ export function setScalarField(
   if (pair?.value && isRangedNode(pair.value)) {
     const [start, end] = pair.value.range;
     // An existing key with no value (`epic:` — a zero-width, `null`
-    // scalar) has `start === end`, positioned immediately after the
-    // colon. Splicing the new value straight into that zero-width range
-    // butts it against the colon with no separating space
-    // (`epic:EPIC-9`), which the reparse below then rejects as malformed
-    // YAML — a real, reachable case for any passthrough/unknown field left
-    // blank, not just a theoretical one.
-    const replacement = start === end ? ` ${newValueText}` : newValueText;
+    // scalar) has `start === end`. Where exactly that zero-width point
+    // sits depends on whether the source already had trailing whitespace
+    // after the colon: `yaml`'s value range starts *past* any existing
+    // whitespace (confirmed by execution: "epic:\n" ranges at the byte
+    // right after the colon; "epic: \n" ranges one byte later, past the
+    // space that is already there). So a leading space is only missing —
+    // and only needs inserting — when the byte immediately before `start`
+    // is the colon itself, not when it is already whitespace; inserting
+    // unconditionally on `start === end` produces "epic:  EPIC-9" (two
+    // spaces) for "epic: " and "epic:EPIC-9" (none) for "epic:" if the
+    // check went the other way — this is the exact byte that has to be
+    // read to get both cases right.
+    const charBeforeValue = split.frontmatterText[start - 1];
+    const needsLeadingSpace =
+      start === end && charBeforeValue !== " " && charBeforeValue !== "\t";
+    const replacement = needsLeadingSpace ? ` ${newValueText}` : newValueText;
     newFrontmatterText =
       split.frontmatterText.slice(0, start) + replacement + split.frontmatterText.slice(end);
   } else {

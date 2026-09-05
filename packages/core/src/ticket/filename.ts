@@ -16,11 +16,15 @@ import { TicketErrorCodes } from "./errors";
  * handed: it builds and parses a bare filename string, it never joins one
  * onto a directory or touches the filesystem. The ADR names M2.2 as the
  * owner of the whole containment list by number, but steps (a)-(c) belong
- * where the board root actually lives — the board resolver (M2.4 `board/`)
- * or the ticket store (M2.5 `store/`), whichever first resolves
- * `tickets_dir` and performs the write. Do not implement (a)-(c) here:
- * importing `config/`/`board/` from this module would also violate PLAN.md
- * rule 2 (a task may only import from its own `Depends on` list).
+ * to **the ticket store (M2.5 `store/`)**: step (b) ("re-check once
+ * `tickets_dir` exists") is inherently write-time, and M2.5 is the module
+ * that performs the write. (An earlier version of this comment named
+ * "M2.4 or M2.5" — two candidate owners joined by "or" is zero owners; the
+ * ADR's own text at ~line 526-529 still names M2.2, and that correction is
+ * the controller's to carry into the ADR/PLAN.md, not this module's — see
+ * Global Constraints 5 and 6.) Do not implement (a)-(c) here: importing
+ * `config/`/`board/` from this module would also violate PLAN.md rule 2 (a
+ * task may only import from its own `Depends on` list).
  */
 
 const ASCII_DEL = 127;
@@ -29,7 +33,7 @@ const ASCII_MAX_CONTROL = 31;
 /** Punctuation that is illegal or awkward in a filename on at least one of Linux/macOS/Windows. Deliberately listed one by one, no character-class range, so this stays trivial to audit. */
 const UNSAFE_PUNCTUATION = new Set(["/", "\\", ":", "*", "?", '"', "<", ">", "|"]);
 
-/** Unicode bidirectional-formatting and zero-width code points: LRE/RLE/PDF/LRO/RLO, directional isolates, zero-width space/joiners/non-joiner, and the BOM. None of these are ASCII control characters, but a filename containing one renders misleadingly (or invisibly) in a terminal or file browser. */
+/** Unicode bidirectional-formatting and zero-width code points: LRE/RLE/PDF/LRO/RLO, directional isolates, zero-width space/joiners/non-joiner, and the BOM. None of these are ASCII control characters, but a filename containing one renders misleadingly (or invisibly) in a terminal or file browser. All are single UTF-16 code units (BMP), so a plain `charCodeAt` comparison is exact — no surrogate-pair handling needed for this set. */
 const BIDI_OR_ZERO_WIDTH_CODE_POINTS = new Set([
   0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067,
   0x2068, 0x2069, 0xfeff,
@@ -39,25 +43,36 @@ function isAsciiControlOrDel(code: number): boolean {
   return code <= ASCII_MAX_CONTROL || code === ASCII_DEL;
 }
 
-/** True if `ch` (a single UTF-16 code unit) must never survive into a filename: an ASCII control character (including NUL), or one of the punctuation characters in `UNSAFE_PUNCTUATION`. */
-function isUnsafeFilenameChar(ch: string): boolean {
+/** ASCII control character (including NUL/DEL) or filesystem-unsafe punctuation. */
+function isControlOrUnsafePunctuation(ch: string): boolean {
   return isAsciiControlOrDel(ch.charCodeAt(0)) || UNSAFE_PUNCTUATION.has(ch);
 }
 
-function containsUnsafeFilenameChar(s: string): boolean {
+/** A Unicode bidirectional-formatting or zero-width code point (see `BIDI_OR_ZERO_WIDTH_CODE_POINTS`). */
+function isBidiOrZeroWidth(ch: string): boolean {
+  return BIDI_OR_ZERO_WIDTH_CODE_POINTS.has(ch.charCodeAt(0));
+}
+
+/** The full set of characters `stripUnsafeFilenameChars` removes from a title, and one of the sets `unsafeIdReason` rejects an id for containing. */
+function isUnsafeFilenameChar(ch: string): boolean {
+  return isControlOrUnsafePunctuation(ch) || isBidiOrZeroWidth(ch);
+}
+
+function containsControlOrUnsafePunctuation(s: string): boolean {
   for (const ch of s) {
-    if (isUnsafeFilenameChar(ch)) return true;
+    if (isControlOrUnsafePunctuation(ch)) return true;
   }
   return false;
 }
 
 function containsBidiOrZeroWidth(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    if (BIDI_OR_ZERO_WIDTH_CODE_POINTS.has(s.charCodeAt(i))) return true;
+  for (const ch of s) {
+    if (isBidiOrZeroWidth(ch)) return true;
   }
   return false;
 }
 
+/** Strips every character `isUnsafeFilenameChar` flags — control characters, unsafe punctuation, *and* bidirectional/zero-width formatting characters, so a title-derived slug and an id are held to the same character set. */
 function stripUnsafeFilenameChars(s: string): string {
   let out = "";
   for (const ch of s) {
@@ -66,20 +81,45 @@ function stripUnsafeFilenameChars(s: string): string {
   return out;
 }
 
-const MAX_SLUG_LENGTH = 100;
-// No ADR gives an exact number for id length; this keeps `<id> - <slug>.md`
-// well under ext4/APFS's 255-byte NAME_MAX even with both this cap and
-// MAX_SLUG_LENGTH maxed out (100 + 3 + 100 + 3 = 206), with room to spare —
-// an id this long is never legitimate (`ticket/id.ts` mints a `ck-` prefix
-// plus 6 hex characters), so it is rejected outright rather than truncated:
-// truncating an id would silently corrupt its identity.
-const MAX_ID_LENGTH = 100;
+/**
+ * Truncates `s` to at most `maxBytes` UTF-8 bytes, without ever splitting a
+ * surrogate pair (astral character) in two. Iterates by Unicode code point
+ * (`for...of`, not `.slice`, which indexes by UTF-16 code unit and can
+ * split a pair) and stops before the code point that would push the byte
+ * count over the limit.
+ */
+function truncateToUtf8Bytes(s: string, maxBytes: number): string {
+  let out = "";
+  let bytes = 0;
+  for (const ch of s) {
+    const chBytes = Buffer.byteLength(ch, "utf8");
+    if (bytes + chBytes > maxBytes) break;
+    out += ch;
+    bytes += chBytes;
+  }
+  return out;
+}
+
+// Both caps are UTF-8 **byte** budgets, not character counts: a title or id
+// containing CJK, emoji, or other multi-byte characters can be short in
+// characters and long in bytes, and it is bytes that `NAME_MAX` (255 on
+// ext4/APFS) actually limits. 100 + 3 (" - ") + 100 + 3 (".md") = 206 bytes
+// at both caps' maximum, comfortably under 255 with room for a
+// multi-byte-heavy id too.
+const MAX_SLUG_BYTES = 100;
+const MAX_ID_BYTES = 100;
 
 /**
  * Turns a ticket title into a stable, filesystem-safe slug: the same title
  * always yields the same slug, and the result never contains a path
  * separator or other character that breaks on macOS or Linux (CI runs
  * both).
+ *
+ * `maxBytes` bounds the result's **UTF-8 byte length**, not its character
+ * count (`Buffer.byteLength`, truncating on a code-point boundary so a
+ * surrogate pair is never split) — a title-derived slug of CJK characters
+ * or emoji is otherwise short in `.length` and long in the bytes that
+ * actually hit a filesystem's `NAME_MAX`.
  *
  * This is CanKan's **own** slug rule, not a reimplementation of
  * Backlog.md's. ADR 0002 probe 3's own slug is case-preserving
@@ -89,13 +129,13 @@ const MAX_ID_LENGTH = 100;
  * inverses of a filename Backlog.md produced; only of one CanKan minted
  * itself.
  */
-export function slugifyTitle(title: string, maxLength = MAX_SLUG_LENGTH): string {
+export function slugifyTitle(title: string, maxBytes = MAX_SLUG_BYTES): string {
   const stripped = stripUnsafeFilenameChars(title);
   const hyphenated = stripped.trim().replace(/\s+/g, "-");
   const collapsed = hyphenated.replace(/-{2,}/g, "-");
   const trimmedHyphens = collapsed.replace(/^-+|-+$/g, "");
   const withoutLeadingDots = trimmedHyphens.replace(/^\.+/, "");
-  const capped = withoutLeadingDots.slice(0, maxLength);
+  const capped = truncateToUtf8Bytes(withoutLeadingDots, maxBytes);
   return capped.length > 0 ? capped : "untitled";
 }
 
@@ -117,25 +157,40 @@ function unsafeStructuralReason(basename: string): string | undefined {
   if (basename === "..") return "is a double dot";
   // A literal git-metadata directory name: not a traversal by itself, but a
   // downstream cache/ref-key or directory join that treats this id as a
-  // path component could collide with an actual git directory.
-  if (basename === ".git") return "is the git-metadata directory name";
+  // path component could collide with an actual git directory. Compared
+  // case-insensitively: macOS (a stated CI target) defaults to a
+  // case-insensitive filesystem, where `.GIT`/`.gIt` collide with `.git`
+  // just as surely as an exact-case match would.
+  if (basename.toLowerCase() === ".git") return "is the git-metadata directory name";
   return undefined;
 }
 
 /**
  * The extra rules that apply to the **id segment** specifically (not to a
- * full filename, whose length is already bounded by `MAX_ID_LENGTH` +
- * `MAX_SLUG_LENGTH` separately): a length cap (an id this long is never
- * legitimate), and a scrub against control characters, other
- * filesystem-unsafe punctuation, and Unicode bidirectional/zero-width
- * formatting characters — `slugifyTitle` already strips the first class
- * from a title; an id never went through that sanitizer.
+ * full filename, whose length is already bounded by `MAX_ID_BYTES` +
+ * `MAX_SLUG_BYTES` separately): no whitespace (an id with whitespace is
+ * exactly the shape `parseTicketFilename`'s `<id> - <slug>.md` split cannot
+ * recover correctly — see the `FILENAME_RE` comment), a byte-length cap (an
+ * id this long is never legitimate), and a scrub against control
+ * characters, other filesystem-unsafe punctuation, and Unicode
+ * bidirectional/zero-width formatting characters — `slugifyTitle` already
+ * strips this same set from a title; an id never went through that
+ * sanitizer.
  */
 function unsafeIdReason(id: string): string | undefined {
   const structural = unsafeStructuralReason(id);
   if (structural) return structural;
-  if (id.length > MAX_ID_LENGTH) return `is longer than ${MAX_ID_LENGTH} characters`;
-  if (containsUnsafeFilenameChar(id)) return "contains a control character or other unsafe character";
+  // Must be checked before anything that assumes a whitespace-free id.
+  // `FILENAME_RE` below splits a filename into id/slug on the first
+  // " - " it finds, on the assumption (documented, but previously
+  // unenforced) that an id never contains whitespace. An id containing a
+  // space either fails to round-trip (`"ck 1"` builds a filename
+  // `parseTicketFilename` cannot match at all) or, worse, round-trips to a
+  // *different* id (`"a - b"` builds `"a - b - hello.md"`, which parses
+  // back as id `"a"` — silently conflating two tickets).
+  if (/\s/.test(id)) return "contains whitespace";
+  if (Buffer.byteLength(id, "utf8") > MAX_ID_BYTES) return `is longer than ${MAX_ID_BYTES} bytes`;
+  if (containsControlOrUnsafePunctuation(id)) return "contains a control character or other unsafe character";
   if (containsBidiOrZeroWidth(id)) return "contains a bidirectional-formatting or zero-width character";
   if (id.trim().length === 0) return "is whitespace-only";
   return undefined;
@@ -177,6 +232,10 @@ function assertSafeFilename(filename: string): void {
  * module does not control). See the file comment for why containment
  * against a board's tickets directory (ADR 0002 steps (a)-(c)) is
  * deliberately not this function's job.
+ *
+ * Every id `buildTicketFilename` accepts is guaranteed to round-trip
+ * through `parseTicketFilename` back to the same id — see `unsafeIdReason`'s
+ * whitespace rule, which exists specifically to keep that property true.
  */
 export function buildTicketFilename(id: TicketId | string, title: string): string {
   assertSafeId(id);
@@ -193,7 +252,8 @@ export interface ParsedTicketFilename {
   slug: string;
 }
 
-// IDs never contain whitespace (`<prefix>-<hash>`), so the first run of
+// IDs never contain whitespace (`<prefix>-<hash>`, and `unsafeIdReason`
+// rejects any id that does on the write path), so the first run of
 // non-whitespace characters is always the id; " - " is the separator; the
 // rest up to the mandatory `.md` extension is the slug.
 const FILENAME_RE = /^(?<id>\S+) - (?<slug>.+)\.md$/;

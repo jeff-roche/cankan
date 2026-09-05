@@ -352,3 +352,64 @@ describe("a symlinked repo-controlled config file is a load error; a symlinked g
     });
   });
 });
+
+describe("a symlinked .cankan DIRECTORY is also a load error, not just a symlinked file inside it (final review round, finding 7)", () => {
+  test("a repo with .cankan itself as a symlink is rejected without ever reading the target's config.yml", async () => {
+    // `git` stores a directory symlink as a mode-120000 blob and `git
+    // clone` materializes it -- `.cankan -> /home/<user>/.config` in a
+    // hostile commit fully restores the original read-oracle finding 12
+    // closed, because the first version of `assertNotSymlink` only
+    // `lstat`ed the final path component (the file), which is a REAL file
+    // once you've followed the symlinked directory to get there.
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      const target = await makeTempRepoRoot(); // stands in for e.g. ~/.config
+      try {
+        await writeFile(
+          join(target.root, "config.yml"),
+          "github.com:\n  oauth_token: leaked-token-value\nsome_other_key:\n  x: 1\n",
+        );
+        const cankanLinkPath = join(root, ".cankan");
+        await symlink(target.root, cankanLinkPath);
+
+        let thrown: unknown;
+        try {
+          await loadConfig({ repoRoot: root, env: hermeticEnv() });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as Error).message).toContain(join(root, ".cankan", "config.yml"));
+        // The point of the fix: the target directory's contents never
+        // reach the error at all.
+        expect((thrown as Error).message).not.toContain("github.com");
+        expect((thrown as Error).message).not.toContain("leaked-token-value");
+      } finally {
+        await cleanup();
+        await target.cleanup();
+      }
+    });
+  });
+
+  test("a symlinked .cankan directory is rejected for local.yml too", async () => {
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      const target = await makeTempRepoRoot();
+      try {
+        await writeFile(join(target.root, "local.yml"), "editor: vim\n");
+        await symlink(target.root, join(root, ".cankan"));
+
+        let thrown: unknown;
+        try {
+          await loadConfig({ repoRoot: root, env: hermeticEnv() });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+      } finally {
+        await cleanup();
+        await target.cleanup();
+      }
+    });
+  });
+});

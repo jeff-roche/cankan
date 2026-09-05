@@ -12,7 +12,7 @@
  */
 
 import { lstat, readFile } from "node:fs/promises";
-import { isAbsolute, join, resolve as resolvePath } from "node:path";
+import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { type Document, type Tags, parseDocument } from "yaml";
 import type { z } from "zod";
 import { CanKanError } from "../errors";
@@ -138,23 +138,40 @@ function isEnoent(err: unknown): boolean {
  * symlinking personal dotfiles into a dotfiles repo is an entirely normal
  * workflow, and rejecting it would break that to close nothing, since the
  * user already fully controls what that path points at.
+ *
+ * **Final review round, finding 7:** the first version of this check
+ * `lstat`ed only `absPath` itself, so it followed a symlinked `.cankan`
+ * *directory* straight through to a real file underneath and read that —
+ * fully restoring the original read-oracle this check exists to close.
+ * `git` stores a directory symlink as a mode-120000 blob, and `git clone`
+ * materializes it, so this is reachable the same way the original finding
+ * was: `.cankan -> /home/<user>/.config` in a hostile commit. Fixed by also
+ * `lstat`ing the immediate parent directory (`dirname(absPath)`, which for
+ * every caller of this function is exactly `<repoRoot>/.cankan` — never
+ * `repoRoot` itself, which stays trusted as the clone location per the
+ * existing ruling). Still no `realpath`: `dirname` is pure string
+ * manipulation, not filesystem resolution, so this carries none of the
+ * macOS `/private/var` risk either.
  */
 async function assertNotSymlink(absPath: string): Promise<void> {
-  let stats: Awaited<ReturnType<typeof lstat>>;
-  try {
-    stats = await lstat(absPath);
-  } catch {
-    // ENOENT (or any other lstat failure) is not this check's concern --
-    // `readFile` below will hit the same condition and report it uniformly
-    // (R12 missing-layer, or its own read-failure message).
-    return;
-  }
-  if (stats.isSymbolicLink()) {
-    throw new CanKanError(
-      ConfigErrorCodes.INVALID_CONFIG,
-      `${absPath}: refusing to read a symlinked repo config file`,
-      { details: { file: absPath } },
-    );
+  for (const candidate of [dirname(absPath), absPath]) {
+    let stats: Awaited<ReturnType<typeof lstat>>;
+    try {
+      stats = await lstat(candidate);
+    } catch {
+      // ENOENT (or any other lstat failure) is not this check's concern --
+      // `readFile` below will hit the same condition on `absPath` and
+      // report it uniformly (R12 missing-layer, or its own read-failure
+      // message).
+      continue;
+    }
+    if (stats.isSymbolicLink()) {
+      throw new CanKanError(
+        ConfigErrorCodes.INVALID_CONFIG,
+        `${absPath}: refusing to read a symlinked repo config file or directory`,
+        { details: { file: absPath } },
+      );
+    }
   }
 }
 
@@ -222,7 +239,23 @@ export async function readYamlFile(
 // meaningfully shortening any realistic credential shape.
 const MAX_ISSUE_KEY_DISPLAY_LEN = 20;
 
-function truncateForDisplay(value: string): string {
+/**
+ * Truncates one path segment to `MAX_ISSUE_KEY_DISPLAY_LEN` characters for
+ * display in an error message or `details` object -- never for anything
+ * that reaches `ConfigResult.value` or a comparison. Originally local to
+ * this file's own `describeIssue` (S2). Exported as of the final review
+ * round, finding 6: `resolve.ts`'s `POLICY_VIOLATION` throw builds its
+ * `message`/`details.key` from a config-supplied record key the exact same
+ * way `describeIssue` does (a repo can force this throw at will by pinning
+ * a section with `!policy`, e.g. `queues: !policy {}`, while the user's own
+ * config or a different layer holds a credential-shaped key underneath),
+ * and round 1's S2 fix only ever reached this one call site -- the second,
+ * symmetric echo site in `resolve.ts` was missed. The general lesson: a
+ * "don't echo config-supplied strings" mitigation has to be re-checked
+ * against every site that builds a message from config data, not just the
+ * one the original reproduction happened to use.
+ */
+export function truncateForDisplay(value: string): string {
   return value.length > MAX_ISSUE_KEY_DISPLAY_LEN
     ? `${value.slice(0, MAX_ISSUE_KEY_DISPLAY_LEN)}…`
     : value;
@@ -297,6 +330,65 @@ export interface ValidatedLayer {
 }
 
 /**
+ * Final review round, finding 5: `yaml`'s `toJS()` can produce a genuinely
+ * *cyclic* plain object for a self-referencing anchor/alias --
+ *
+ * ```yaml
+ * "To Do": &c
+ *   state:
+ *     loop: *c
+ * ```
+ *
+ * -- and the alias-count guard that would normally reject an
+ * alias-expansion bomb computes 0 expansions for a pure self-reference, so
+ * it never trips. `status_map`'s inner value type
+ * (`z.record(z.string(), z.unknown())`) is `effectiveConfigSchema`'s only
+ * fully opaque leaf, so a cyclic value there passes `safeParse` by
+ * identity untouched. Both `deepFreeze` below and `resolve.ts`'s
+ * `flattenLeaves` then recurse forever and crash with an uncaught
+ * `RangeError` -- not a `CanKanError`, so `isCanKanError` and M3.10's
+ * exit-code map both miss it. This is pre-existing (present in
+ * `flattenLeaves` since the original implementation; `deepFreeze` merely
+ * became the first site to overflow), not something introduced by a
+ * review-fix round.
+ *
+ * This walk **rejects** a cycle rather than tolerating one. A `WeakSet`
+ * used to silently skip an already-visited node (so the walk itself
+ * terminates without ever throwing) was considered and rejected: that
+ * would let the cyclic value survive validation and reach
+ * `ConfigResult.value` untouched, where `JSON.stringify` -- e.g. M3.3's
+ * `--json` output -- throws its own uncaught `TypeError` on a cycle
+ * instead. That merely moves today's crash onto a lane with no way to see
+ * it coming; rejecting it here, with a named file and a `CanKanError`
+ * code, is strictly better.
+ *
+ * Standard DFS cycle detection: `onStack` tracks only the *current
+ * recursion path* (added on enter, removed on exit/backtrack) -- this is
+ * not a "visited" set, so a value legitimately reached twice via two
+ * different, non-cyclic branches (a shared default object, say) is never
+ * flagged. Only a genuine back-edge to a live ancestor is.
+ */
+function assertAcyclic(value: unknown, onStack: Set<unknown> = new Set()): void {
+  if (value === null || typeof value !== "object") {
+    return;
+  }
+  if (onStack.has(value)) {
+    throw new Error("cyclic reference in YAML document (an anchor/alias referencing itself)");
+  }
+  onStack.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      assertAcyclic(item, onStack);
+    }
+  } else {
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      assertAcyclic((value as Record<string, unknown>)[key], onStack);
+    }
+  }
+  onStack.delete(value);
+}
+
+/**
  * Recursively freezes `value` (objects and arrays; anything else is
  * already immutable or opaque to us). `Object.freeze` alone is shallow, so
  * `LoadedLayer.data`'s `Readonly<Record<string, unknown>>` type was
@@ -355,6 +447,12 @@ export async function loadValidatedLayer(
   let raw: unknown;
   try {
     raw = parsed.doc.toJS() ?? {};
+    // Finding 5: reject a cyclic value here, before it can reach
+    // `deepFreeze` (below) or `resolve.ts`'s `flattenLeaves` and overflow
+    // the stack. Same try/catch, same wrapped-error shape, as this is the
+    // same class of "this document doesn't convert to a safely usable
+    // plain value" failure the surrounding catch already exists to cover.
+    assertAcyclic(raw);
   } catch (err) {
     throw new CanKanError(ConfigErrorCodes.INVALID_CONFIG, `${absPath}: could not be converted from YAML`, {
       cause: err,

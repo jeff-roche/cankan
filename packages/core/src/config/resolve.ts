@@ -58,6 +58,7 @@ import {
   resolveGlobalConfigPath,
   resolveRepoConfigPath,
   resolveRepoLocalConfigPath,
+  truncateForDisplay,
 } from "./layers";
 import {
   type EffectiveConfig,
@@ -768,7 +769,14 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
         }
         const pinningFile = repoLoaded.layer.file;
         const pinningFileRelative = repoRoot ? relative(repoRoot, pinningFile) : pinningFile;
-        const key = renderPath(leaf.path);
+        // Final review round, finding 6: `leaf.path` is config-supplied --
+        // a repo can force this throw at will by pinning a section
+        // (`queues: !policy {}`) while a credential-shaped record key sits
+        // underneath it in a *different* layer -- so this must get the
+        // same per-segment truncation as `describeIssue`'s S2 fix, not
+        // `renderPath`'s untruncated join. `pinningFile`/`loaded.layer.file`
+        // are file paths, not config-supplied strings, and stay as they are.
+        const key = leaf.path.map(truncateForDisplay).join(".");
         throw new CanKanError(
           ErrorCodes.POLICY_VIOLATION,
           `${key} is set as policy by ${pinningFileRelative}`,

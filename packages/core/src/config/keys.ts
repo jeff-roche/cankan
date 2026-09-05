@@ -149,14 +149,42 @@ function matchesPattern(pattern: string, keySegments: readonly string[]): boolea
 /**
  * Classifies one config key as `"policy"` or `"preference"`.
  *
- * Accepts either form (AMENDMENT A1 — union parameter, not a new method
- * name, so the export name set is unchanged for the lanes freezing against
- * it): a `readonly string[]` of path segments (the unambiguous form —
- * `resolve.ts` always calls this way, since only segments can safely
- * represent a record key that itself contains a "."), or a plain dotted
- * `string`, split on "." here for backward-compatible callers that already
- * know none of their segments contain an embedded dot (e.g. this file's own
- * tests, and the classification-table patterns themselves).
+ * **AMENDMENT A2 (binding, amends A1): segments only — no `string`
+ * overload.** A1 originally gave this a union parameter matching
+ * `resolved()`'s; the final review demonstrated that was wrong for this
+ * function specifically:
+ *
+ * ```
+ * classifyKey(["backers", "a.b", "status_map"])  -> "policy"      (correct)
+ * classifyKey("backers.a.b.status_map")          -> "preference"  (wrong, SILENTLY)
+ * ```
+ *
+ * `resolved(string)` (in `resolve.ts`) is lossless *by lookup* — it matches
+ * exactly against the set of rendered `entry.key` values that actually
+ * exist, so it never needs to parse. `classifyKey` has no such set to
+ * match against: given a string, it has no choice but to `.split(".")` it
+ * back into segments to match against `KEY_CLASSIFICATION`'s patterns —
+ * which is exactly the lossy, ambiguous operation A1 exists to eliminate.
+ * A record key containing a literal "." (`hooks: { "a.b": ... }`) then
+ * silently misclassifies, and this is a *security-relevant* property
+ * (policy vs. preference decides whether repo-controlled config or the
+ * user wins a key) being silently wrong with no way for a caller to
+ * detect it — the worst combination available, and a JSDoc warning would
+ * not fix that, only move the blame. Rejecting "ambiguous" strings at
+ * runtime was considered and is not implementable: `"a.b.c"` is
+ * indistinguishable from a legitimate three-segment key. So the overload
+ * is removed rather than documented as a footgun.
+ *
+ * A caller holding a runtime key already has the right value:
+ * `ResolvedEntry.path`. Never pass `ResolvedEntry.key` (display-only) — A2
+ * makes that a compile error instead of a silent wrong answer. A caller
+ * with a genuinely human-typed dotted key (e.g. M3.3's `cankan config set
+ * claims.lease 4h`) splits it itself, at the call site, where the
+ * ambiguity is visible and can be checked against the schema's known keys.
+ *
+ * `KEY_CLASSIFICATION`'s own patterns stay dotted strings — those are
+ * *authored* patterns, not runtime data, so their segmentation is under
+ * the author's control, not a caller's.
  *
  * When more than one `KEY_CLASSIFICATION` pattern matches the same key, the
  * pattern with the most segments (the most specific one) wins — mirroring
@@ -169,8 +197,7 @@ function matchesPattern(pattern: string, keySegments: readonly string[]): boolea
  * default classification, not an exhaustive one, and contract R2 rules
  * unclassified keys preference by default.
  */
-export function classifyKey(key: string | readonly string[]): "policy" | "preference" {
-  const keySegments = Array.isArray(key) ? key : (key as string).split(".");
+export function classifyKey(keySegments: readonly string[]): "policy" | "preference" {
   let best: KeyClassificationEntry | undefined;
   for (const entry of KEY_CLASSIFICATION) {
     if (!matchesPattern(entry.pattern, keySegments)) {

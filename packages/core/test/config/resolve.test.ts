@@ -281,6 +281,57 @@ describe("resolved() for a key with no effective value anywhere", () => {
   });
 });
 
+describe("AMENDMENT A1 rule 3 — a rendered-key collision between two distinct paths (review round 2 finding 4)", () => {
+  test("string-form resolved() returns whichever collision entry appears first in entries() order; array form disambiguates both", async () => {
+    // Two genuinely distinct paths that render to the identical dotted
+    // string "backers.gh.status_map.type":
+    //   P1 = ["backers", "gh.status_map", "type"]   -- a backer literally
+    //        named "gh.status_map" (a dot inside one segment)
+    //   P2 = ["backers", "gh", "status_map", "type"] -- a backer named "gh"
+    //        whose own status_map has an (empty-object) entry keyed "type"
+    // Documented in AMENDMENT A1's ResolvedEntry.resolved() JSDoc, never
+    // exercised until now.
+    await withEnv(undefined, async () => {
+      const home = process.env.HOME as string;
+      await writeGlobalConfigFile(
+        join(home, ".config"),
+        [
+          "backers:",
+          '  "gh.status_map":',
+          "    type: github",
+          "  gh:",
+          "    type: github",
+          "    status_map:",
+          "      type: {}",
+          "",
+        ].join("\n"),
+      );
+      const result = await loadConfig({ env: hermeticEnv() });
+
+      const collisionKey = "backers.gh.status_map.type";
+      const collisionEntries = result.entries().filter((e) => e.key === collisionKey);
+      expect(collisionEntries).toHaveLength(2);
+
+      // The two really are distinct paths -- a genuine collision, not a
+      // duplicate.
+      const paths = collisionEntries.map((e) => e.path);
+      expect(paths).toContainEqual(["backers", "gh.status_map", "type"]);
+      expect(paths).toContainEqual(["backers", "gh", "status_map", "type"]);
+
+      // String form: whichever collision entry appears first in entries()'s
+      // own overall order wins -- deterministic and documented, not an
+      // arbitrary or unstable pick. Reference-equal to entries()'s own
+      // object, not just value-equal.
+      expect(result.resolved(collisionKey)).toBe(collisionEntries[0]);
+
+      // Array form is the escape hatch A1 exists to provide: each path is
+      // independently addressable regardless of the string-level collision.
+      expect(result.resolved(["backers", "gh.status_map", "type"])?.value).toBe("github");
+      expect(result.resolved(["backers", "gh", "status_map", "type"])?.value).toEqual({});
+    });
+  });
+});
+
 describe("entries()", () => {
   test("enumerates every effective key and is sorted", async () => {
     await withEnv(undefined, async () => {
@@ -809,6 +860,13 @@ describe("env coercion (R9)", () => {
       const message = (thrown as Error).message;
       expect(message).toContain("CANKAN_CLAIMS__LEASE");
       expect(message).toContain("claims.lease");
+      // Final review round, finding 3: correct by construction today (the
+      // message template never interpolates the raw value), but nothing
+      // stops a future edit from adding it "for debuggability" -- which
+      // would leak whatever a CANKAN_* var actually held, including a
+      // credential set through the env channel. Locking this in as an
+      // explicit assertion rather than leaving it merely true by omission.
+      expect(message).not.toContain("not-a-duration");
     });
   });
 });
@@ -915,8 +973,46 @@ describe("the dotted-path rebuild rejects __proto__/constructor/prototype segmen
   });
 
   test("flattenLeaves drops a subtree composed entirely of forbidden segments", () => {
-    const leaves = flattenLeaves({ __proto__: { pwned: true } }, [], new Map());
-    expect(leaves.size).toBe(0);
+    // Final review round, finding 1: `{ __proto__: {...} }` as a JS object
+    // *literal* sets the object's [[Prototype]] -- it does NOT create an
+    // own enumerable key, so `Object.keys()` on it is already `[]`
+    // regardless of whether `FORBIDDEN_SEGMENTS` contains "__proto__" at
+    // all. The original version of this test used exactly that literal
+    // and so passed unconditionally -- it asserted nothing about the
+    // guard. Proven empirically: with `FORBIDDEN_SEGMENTS` neutralized in
+    // a scratch copy, the original assertion still held (see the report's
+    // RED/GREEN evidence for this finding).
+    //
+    // `JSON.parse` (matching how `yaml`'s own `doc.toJS()` actually
+    // materializes a real "__proto__" mapping key -- verified empirically)
+    // and `Object.defineProperty` both create a genuine *own enumerable*
+    // property, which `Object.keys()` -- what `flattenLeaves` iterates --
+    // does include. `constructor` and `prototype` are added too: unlike
+    // `__proto__`, both of those survive `zod`'s own validation as
+    // ordinary own string-valued properties (verified in round 1's
+    // findings), so `flattenLeaves`'s own filter is the layer uniquely
+    // responsible for stopping them -- `setPath`'s independent per-segment
+    // check is not the only barrier for these two.
+    const protoLeaves = flattenLeaves(JSON.parse('{"__proto__":{"pwned":true}}'), [], new Map());
+    expect(protoLeaves.size).toBe(0);
+
+    const ctorTarget: Record<string, unknown> = {};
+    Object.defineProperty(ctorTarget, "constructor", {
+      value: { hijacked: true },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    expect(flattenLeaves(ctorTarget, [], new Map()).size).toBe(0);
+
+    const protoFieldTarget: Record<string, unknown> = {};
+    Object.defineProperty(protoFieldTarget, "prototype", {
+      value: { hijacked: true },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    expect(flattenLeaves(protoFieldTarget, [], new Map()).size).toBe(0);
   });
 
   test("the primitive is real at this layer: a setPath reimplementation with the guard removed genuinely pollutes Object.prototype", () => {
@@ -1015,6 +1111,95 @@ describe("record keys containing a literal '.' round-trip correctly (AMENDMENT A
         thrown = err;
       }
       expect(isCanKanError(thrown)).toBe(true);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Final review round, finding 5 -- a cyclic YAML alias must be a load
+// error, not a hard RangeError crash.
+// ---------------------------------------------------------------------------
+
+describe("a cyclic YAML alias under status_map is a load error naming the file, not a RangeError crash (review round 2 finding 5)", () => {
+  test("a self-referencing anchor/alias inside backers.<name>.status_map is rejected", async () => {
+    // status_map's inner value type (z.record(z.string(), z.unknown())) is
+    // effectiveConfigSchema's only fully opaque leaf, so a cyclic object
+    // here survives schema validation by identity. Before the fix, this
+    // crashed loadConfig with an uncaught RangeError from either
+    // deepFreeze (layers.ts) or flattenLeaves (resolve.ts) recursing
+    // forever -- isCanKanError(e) === false, invisible to M3.10's exit map.
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      try {
+        const path = await writeRepoConfigFile(
+          root,
+          "config.yml",
+          [
+            "backers:",
+            "  github:",
+            "    status_map:",
+            '      "To Do": &c',
+            "        state:",
+            "          loop: *c",
+            "",
+          ].join("\n"),
+        );
+        let thrown: unknown;
+        try {
+          await loadConfig({ repoRoot: root, env: hermeticEnv() });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as Error).message).toContain(path);
+      } finally {
+        await cleanup();
+      }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Final review round, finding 6 -- POLICY_VIOLATION's message/details must
+// truncate a config-supplied record key too, not just describeIssue's.
+// ---------------------------------------------------------------------------
+
+describe("POLICY_VIOLATION truncates a config-supplied record key in both message and details (review round 2 finding 6)", () => {
+  test("a hostile repo forces the throw (hooks: !policy {}) while local.yml holds a credential-shaped hook name", async () => {
+    // Round 1's S2 fix (truncateForDisplay) only ever reached
+    // `describeIssue` in layers.ts -- this is resolve.ts's own, symmetric
+    // echo site, missed by that fix. Rated Important rather than Minor
+    // because the repo *forces* the echo via the pin, rather than merely
+    // waiting for a validation failure to happen to expose it.
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      try {
+        await writeRepoConfigFile(root, "config.yml", "hooks: !policy {}\n");
+        const token = `ghp_${"B".repeat(36)}`;
+        await writeRepoConfigFile(root, "local.yml", `hooks:\n  ${token}: "echo x"\n`);
+
+        let thrown: unknown;
+        try {
+          await loadConfig({ repoRoot: root, env: hermeticEnv() });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        const err = thrown as InstanceType<typeof Error> & { code: string; details?: unknown };
+        expect(err.code).toBe("POLICY_VIOLATION");
+        expect(err.message).not.toContain(token);
+        expect(JSON.stringify(err.details)).not.toContain(token);
+        // `JSON.stringify(err)` is the actual --json-consumer-visible
+        // shape, via CanKanError.toJSON -- the same check R16's own test
+        // makes.
+        expect(JSON.stringify(err)).not.toContain(token);
+        // Still names the truncated key and the pinning file, so R13's
+        // "names the offending key" and R7's own contract both still hold.
+        expect(err.message).toContain("hooks.");
+        expect(err.message).toContain("is set as policy by");
+      } finally {
+        await cleanup();
+      }
     });
   });
 });

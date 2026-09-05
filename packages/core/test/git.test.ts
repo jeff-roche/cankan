@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import util from "node:util";
@@ -683,7 +683,86 @@ describe("gitCommonDir", () => {
     const adapter = await createGitAdapter(repo.dir);
     const commonDir = await adapter.gitCommonDir();
     expect(commonDir.startsWith("/")).toBe(true);
+    // Negative assertion (macOS CI fix, layer 1): this must hold with
+    // `repo.dir` used exactly as `tempRepo()` returned it — no `realpath()`
+    // call on either side here. If this needed one, the fixture would
+    // still be lying about its own path, and this test would go green for
+    // the wrong reason. This is the assertion that failed on macOS CI
+    // before the fixture was fixed; it does not, by itself, discriminate
+    // the fix on this Linux host, since `tmpdir()` here is not a symlink —
+    // `tempRepo.test.ts`'s `TMPDIR`-override test is the one that actually
+    // goes RED without the fixture fix (RED-probed; see the task report).
     expect(commonDir).toBe(join(repo.dir, ".git"));
+  });
+});
+
+describe("path canonicalization — root, gitCommonDir, and listWorktrees paths survive a symlink (macOS CI fix)", () => {
+  // CI fix brief's root cause: on macOS, `$TMPDIR` is under `/var/folders/...`,
+  // and `/var` symlinks to `/private/var`. git canonicalizes symlinks in
+  // every path it prints; the pre-fix `makeTempRepo` handed back the
+  // un-resolved `/var/...` form, so every assertion comparing git's output
+  // against a fixture-built path failed on macOS even though the adapter's
+  // own paths were already correct. This host is Linux, so a real symlink
+  // is used to reproduce the identical link-vs-resolved condition directly,
+  // rather than trusting that fixing the fixture was sufficient by
+  // inference alone.
+  //
+  // This test guards layer 2 (the adapter's own path contract), not layer
+  // 1 (the fixture) — the symlinks here point at `repo.dir`/`repo.root`,
+  // which are already canonical on this host regardless of the fixture
+  // fix, since `tmpdir()` itself is not a symlink on Linux. It would pass
+  // even with the fixture's `realpath()` call reverted. Layer 1's own
+  // regression guard lives in `packages/test-utils/test/tempRepo.test.ts`,
+  // which overrides `TMPDIR` to a symlink and does go RED without the
+  // fixture fix (RED-probed; see the task report).
+  test("adapter.root, gitCommonDir(), and a worktree's listed path all resolve through a filesystem symlink", async () => {
+    const repo = await tempRepo();
+
+    // `createGitAdapter` reached through a symlinked `cwd` — probes
+    // `--show-toplevel`'s own canonicalization, independent of the fixture.
+    const repoLink = join(repo.root, "repo-symlink");
+    await symlink(repo.dir, repoLink);
+
+    // A worktree created through a symlinked *target* path — probes
+    // `worktree list --porcelain`'s canonicalization specifically, since
+    // (per the brief) it reads a stored `.git/worktrees/*/gitdir` file
+    // rather than performing a fresh cwd-based resolution, so unlike
+    // `--show-toplevel` this was not already established. The real
+    // directory must exist before the symlink is created — `git worktree
+    // add` (like plain `mkdir`) cannot create a directory at a dangling
+    // symlink's path, only use an existing (possibly empty) one.
+    const worktreeReal = join(repo.root, "worktree-canon-real");
+    const worktreeLink = join(repo.root, "worktree-canon-link");
+    await mkdir(worktreeReal);
+    await symlink(worktreeReal, worktreeLink);
+    git(repo.dir, ["worktree", "add", "-b", "wt/canon", worktreeLink, "main"]);
+
+    const adapter = await createGitAdapter(repoLink);
+
+    // Surface 1: adapter.root (`rev-parse --show-toplevel`).
+    expect(adapter.root).toBe(repo.dir);
+    expect(await realpath(adapter.root)).toBe(adapter.root);
+
+    // Surface 2: gitCommonDir() (`rev-parse --path-format=absolute --git-common-dir`).
+    const commonDir = await adapter.gitCommonDir();
+    expect(commonDir).toBe(join(repo.dir, ".git"));
+    expect(await realpath(commonDir)).toBe(commonDir);
+
+    // Surface 3: listWorktrees()[].path (`worktree list --porcelain`) — the
+    // one this brief specifically flagged as unverified, since it comes
+    // from a file git wrote at `worktree add` time, not a fresh resolution.
+    const worktrees = await adapter.listWorktrees();
+    const symlinkedEntry = worktrees.find((w) => w.branch === "refs/heads/wt/canon");
+    if (!symlinkedEntry) throw new Error("expected the symlink-created worktree to be listed");
+    expect(symlinkedEntry.path).toBe(worktreeReal);
+    expect(await realpath(symlinkedEntry.path)).toBe(symlinkedEntry.path);
+
+    // The ADR invariant this whole mechanism exists to protect, restated
+    // through the symlinked adapter: the primary and a worktree agree on
+    // one common dir, regardless of which path was used to reach either.
+    const primaryEntry = worktrees.find((w) => w.path === repo.dir);
+    if (!primaryEntry) throw new Error("expected the primary worktree to be listed");
+    expect(primaryEntry.path).not.toBe(symlinkedEntry.path);
   });
 });
 

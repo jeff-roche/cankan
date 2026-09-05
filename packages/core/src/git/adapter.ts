@@ -518,6 +518,19 @@ async function commitTreeToRef(
   return updateRefCASCore(root, validatedRef, commit, params.parent);
 }
 
+/**
+ * `path` is git's own output from `worktree list --porcelain`, unmodified.
+ * Canonical (symlink-resolved) by git itself, not by this module: git
+ * resolves a worktree's path into its `.git/worktrees/<name>/gitdir` file
+ * once, at `worktree add` time — verified directly by adding a worktree
+ * through a symlinked target path and confirming both the `gitdir` file and
+ * every later `worktree list` report the resolved path, never the symlink
+ * (see the task report's symlink probe; this is the one of the three
+ * path-emitting surfaces the ADR's canonicalization recipe doesn't
+ * obviously cover, since these paths come from a stored file rather than a
+ * fresh cwd-based resolution — checked rather than assumed for that
+ * reason). No `fs.realpath` call is added here; it would be redundant.
+ */
 function parseWorktreeBlock(block: string): WorktreeInfo {
   let path = "";
   let headSha: string | null = null;
@@ -636,6 +649,15 @@ async function push(root: string, remote: string, ref: string): Promise<SyncOutc
   });
 }
 
+/**
+ * Canonical (symlink-resolved) by construction — see `GitAdapter.gitCommonDir`'s
+ * doc comment in `types.ts` for the guarantee and how it was verified. No
+ * `fs.realpath` call is added here: `rev-parse` already resolves symlinks
+ * in the path it prints (confirmed both by macOS CI, whose failure was the
+ * *fixture's* expected value being unresolved, never git's own output, and
+ * by a Linux symlink probe reproducing the same condition — see the task
+ * report), so adding one would be redundant, not more correct.
+ */
 async function gitCommonDir(root: string): Promise<string> {
   try {
     const out = await runGit(root, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
@@ -664,6 +686,13 @@ async function gitCommonDir(root: string): Promise<string> {
  * confirmed distinct stderr for each (`fatal: not a git repository...` and
  * `fatal: this operation must be run in a work tree`, respectively) — and
  * never falls back to any other directory.
+ *
+ * `root` (and therefore `GitAdapter.root`) is canonical — see the
+ * `GitAdapter.root` doc comment in `types.ts` — because `--show-toplevel`
+ * itself resolves symlinks in `cwd`, verified directly (a symlinked `cwd`
+ * still yields the resolved root; see the task report's symlink probe). No
+ * `fs.realpath` call is added here for the same reason it isn't added in
+ * `gitCommonDir`: it would be redundant.
  */
 export async function createGitAdapter(cwd: string, options: GitAdapterOptions = {}): Promise<GitAdapter> {
   const tmpRoot = options.tmpRoot ?? tmpdir();

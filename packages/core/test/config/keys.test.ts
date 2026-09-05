@@ -32,33 +32,45 @@ describe("classifyKey — every row of CONCEPT.md 415-426, by example key", () =
     ["default_backer", "preference"],
     ["sync.auto_push", "preference"],
   ] as const)("%s -> %s", (key, expected) => {
-    expect(classifyKey(key)).toBe(expected);
+    // AMENDMENT A2: classifyKey takes segments only. These example keys are
+    // *authored* test literals with no embedded dots in any segment, so
+    // splitting them here (at the call site, where that assumption is
+    // visible) is safe -- this is exactly the kind of caller A2's JSDoc
+    // describes, not the ambiguous case A2 exists to foreclose.
+    expect(classifyKey(key.split("."))).toBe(expected);
   });
 
   // Contract R3 / R5: hooks is one policy row (not "repo policy, local
   // preference" split by file) because classification is per key.
   test("hooks.<event> is policy regardless of which file would set it (contract R5)", () => {
-    expect(classifyKey("hooks.on_close")).toBe("policy");
-    expect(classifyKey("hooks.on_claim")).toBe("policy");
+    expect(classifyKey(["hooks", "on_close"])).toBe("policy");
+    expect(classifyKey(["hooks", "on_claim"])).toBe("policy");
   });
 
   // Contract R3: the same map splits across both columns, resolved leaf by
   // leaf — status_map and credential live on the same `backers.github.*`
   // map but classify oppositely.
   test("the same backers map splits per leaf (contract R3)", () => {
-    expect(classifyKey("backers.github.status_map")).toBe("policy");
-    expect(classifyKey("backers.github.credential")).toBe("preference");
+    expect(classifyKey(["backers", "github", "status_map"])).toBe("policy");
+    expect(classifyKey(["backers", "github", "credential"])).toBe("preference");
   });
 
   test("a nested leaf beneath a wildcard-matched subtree inherits that subtree's class", () => {
     // backers.*.status_map matches as a prefix, so everything the backer's
     // own status representation nests beneath it is still policy.
-    expect(classifyKey("backers.github.status_map.To Do.state")).toBe("policy");
+    expect(classifyKey(["backers", "github", "status_map", "To Do", "state"])).toBe("policy");
   });
 
   test("an unmatched key defaults to preference (contract R2)", () => {
-    expect(classifyKey("version")).toBe("preference");
-    expect(classifyKey("some.made.up.key")).toBe("preference");
+    expect(classifyKey(["version"])).toBe("preference");
+    expect(classifyKey(["some", "made", "up", "key"])).toBe("preference");
+  });
+
+  // AMENDMENT A2's own motivating case: a record key containing a literal
+  // "." must not be silently miscounted into extra segments. Locks in the
+  // exact example the amendment's rationale is built on.
+  test("a record key containing a literal '.' classifies correctly by segment count, not by re-split string length (AMENDMENT A2)", () => {
+    expect(classifyKey(["backers", "a.b", "status_map"])).toBe("policy");
   });
 });
 
@@ -91,7 +103,9 @@ describe("UNCLASSIFIED_KEYS", () => {
 
   test("classifyKey resolves every listed key to preference, per contract R2", () => {
     for (const key of UNCLASSIFIED_KEYS) {
-      expect(classifyKey(key), key).toBe("preference");
+      // AMENDMENT A2: segments only. `UNCLASSIFIED_KEYS` is authored data
+      // (see keys.ts), not runtime-supplied, so splitting it here is safe.
+      expect(classifyKey(key.split(".")), key).toBe("preference");
     }
   });
 });

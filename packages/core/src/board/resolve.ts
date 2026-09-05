@@ -131,9 +131,16 @@ import { findRegisteredBoard, listRegisteredBoards } from "./registry";
  * it calls `listRegisteredBoards` directly (not through this function) and
  * still throws on the same malformed file, so the loud path survives; only
  * a single-repo session's *display name* degrades to `basename(root)`.
- * Every other error from `listRegisteredBoards` (a data-home resolution
- * failure, an unexpected filesystem error) still propagates -- this is
- * narrowly about a malformed *file*, not "swallow anything registry-shaped."
+ * Every other error would still propagate -- this is narrowly about a
+ * malformed *file*, not "swallow anything registry-shaped." (Fix round 2,
+ * F9: as of this writing `REGISTRY_INVALID` is in fact the *only* error
+ * `listRegisteredBoards` can ever throw -- a data-home resolution failure
+ * returns an *empty listing*, not a throw, and no other code path in that
+ * function raises anything either. Not manufacturing an artificial
+ * non-`REGISTRY_INVALID` throw just to exercise this `catch`'s `throw err`
+ * branch -- see the report for why. The `catch` stays narrow regardless,
+ * so a future error `listRegisteredBoards` grows still propagates rather
+ * than silently degrading a display name.)
  */
 async function registeredNameFor(root: string, env: Env): Promise<string | undefined> {
   let boards: Awaited<ReturnType<typeof listRegisteredBoards>>["boards"];
@@ -175,13 +182,32 @@ type Env = Readonly<Record<string, string | undefined>>;
  *   run *after* `buildBoardRef` has resolved `ticketsDir`, can catch it.
  *
  * Refusing a root that instead *contains* the personal board (the reverse
- * relationship) is not an option -- `$HOME` is a legitimate dotfiles-board
- * root that happens to be an ancestor of `$XDG_DATA_HOME/cankan/personal/`
- * on many systems. `ticketsDir` is the precise cut for that shape; `root`
- * alone cannot be.
+ * relationship on `root`) is not an option -- `$HOME` is a legitimate
+ * dotfiles-board root that happens to be an ancestor of
+ * `$XDG_DATA_HOME/cankan/personal/` on many systems.
+ *
+ * **F6 (fix round 2): the `ticketsDir` check must run in *both*
+ * directions, not only "does `ticketsDir` reach into the personal
+ * board."** The mirror shape -- `tickets_dir` steered so that `ticketsDir`
+ * instead *encloses* the personal board (`register($XDG_DATA_HOME, {
+ * tickets_dir: "cankan" })`, or `register($HOME, { tickets_dir: ".local"
+ * })`) -- is exactly the dotfiles-repo-at-an-ancestor workflow the
+ * root-direction exception above protects, reached from the other
+ * direction: a *board's own tickets directory*, not its root, containing
+ * `.../cankan/personal/backlog/tasks/<a real ticket file>` and
+ * `repos.yml` itself. `isContained(ref.ticketsDir, personalPath)` is the
+ * added third check -- not a relaxation of the root exception (it
+ * constrains `ticketsDir`, never `root`), confirmed against the
+ * legitimate `$HOME`-with-default-`tickets_dir` case, which still passes
+ * all three checks and resolves normally (see `resolve.test.ts`'s F6
+ * tests).
  */
 function aliasesPersonalBoard(ref: Pick<BoardRef, "root" | "ticketsDir">, personalPath: string): boolean {
-  return isContained(personalPath, ref.root) || isContained(personalPath, ref.ticketsDir);
+  return (
+    isContained(personalPath, ref.root) ||
+    isContained(personalPath, ref.ticketsDir) ||
+    isContained(ref.ticketsDir, personalPath)
+  );
 }
 
 /**
@@ -255,13 +281,38 @@ async function isDirectory(path: string): Promise<boolean> {
 }
 
 /**
- * The personal board's own canonical path, or `undefined` when it cannot
- * be resolved (no data home) or does not exist yet on disk. A local copy
- * of `registry.ts`'s private `resolveCanonicalPersonalPath` (not exported
- * from that file, and this module has no other reason to import it) --
- * same five lines, same reasoning: `resolvePersonalBoardPath` gives the
- * raw XDG-derived path, `realpath` is what makes it comparable to another
- * canonical path at all.
+ * The personal board's own path for comparison against a candidate
+ * `BoardRef`'s (already-canonical) `root`/`ticketsDir` -- `realpath`'d
+ * when possible, falling back to the raw XDG-derived path when it is not.
+ * `undefined` only when no data home can be resolved at all (matching
+ * `registry.ts`'s private `resolveCanonicalPersonalPath`, not exported
+ * from that file, so this is a local copy rather than a cross-import).
+ *
+ * **F8 (fix round 2): the earlier version returned `undefined` whenever
+ * `realpath` failed** -- which is the *ordinary* case for a personal
+ * board that has never been created yet (a fresh install, before
+ * `ensurePersonalBoard()` has ever run against this data home), and also
+ * fires on a merely-unreadable board (`EACCES`). Every one of this
+ * module's alias guards treats `personalPath === undefined` as "nothing
+ * to compare against, skip the check" -- so on a fresh install, every
+ * privacy guard in this file silently stopped applying, which is exactly
+ * backwards: a personal board that does not exist yet is not evidence
+ * that no alias check is needed, it is the single most common state a
+ * fresh `cankan` install is in.
+ *
+ * Falling back to the *raw* path instead keeps every guard active: a
+ * candidate `ref.root`/`ref.ticketsDir` reaching this function has
+ * already been `realpath`'d by `buildBoardRef`, and `isContained`'s
+ * `path.relative`-based comparison is correct against an absolute,
+ * not-yet-existing path on the other side -- a path component that does
+ * not exist cannot itself be a symlink, so there is nothing for the
+ * comparison to get wrong on *that* side. The residual risk is narrower
+ * than it sounds: it only reopens if `$HOME` or `$XDG_DATA_HOME` *itself*
+ * sits behind a symlink on a system where the personal board has never
+ * been created -- the same class of accepted, documented residual this
+ * module's canonicalization ruling already lives with elsewhere (its
+ * "Never falls through to personal on failure" note above), rather than a
+ * newly introduced one.
  */
 async function canonicalPersonalPath(env: Env): Promise<string | undefined> {
   const raw = resolvePersonalBoardPath(env);
@@ -269,7 +320,7 @@ async function canonicalPersonalPath(env: Env): Promise<string | undefined> {
   try {
     return await realpath(raw);
   } catch {
-    return undefined;
+    return raw;
   }
 }
 

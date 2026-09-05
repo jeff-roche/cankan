@@ -33,6 +33,19 @@ function requirePersonalBoardPath(env: Readonly<Record<string, string | undefine
   return path;
 }
 
+/**
+ * `JSON.stringify` of a thrown `CanKanError`'s `details`, for asserting
+ * what does or doesn't appear there specifically -- `details`, not
+ * `message`, is the channel `toJSON`/`--json` output actually publishes
+ * (fix round 2, F7), so a message-only `.not.toContain(...)` assertion
+ * does not discriminate a fix that scrubs the message but leaves
+ * `details.path` (or similar) intact.
+ */
+function detailsAsString(thrown: unknown): string {
+  const details = (thrown as { details?: unknown }).details;
+  return JSON.stringify(details ?? {});
+}
+
 async function initedRepo(): Promise<{ dir: string; cleanup: () => Promise<void> }> {
   const repo = await makeTempRepo();
   await mkdir(join(repo.dir, ".cankan"), { recursive: true });
@@ -388,8 +401,17 @@ describe("fix round 1 -- F1: personal-board guards are containment, not equality
         }
         expect(isCanKanError(thrown)).toBe(true);
         expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
-        // F5: the personal board's own path must not appear in the message.
+        // This scenario is caught by registry.ts's own root-containment
+        // check (a subdirectory, not an ancestor+steered-ticketsDir), so
+        // it is `findRegisteredBoard`'s throw that actually fires here,
+        // not `resolve.ts`'s post-build one -- confirmed by mutation: this
+        // assertion does not discriminate `resolve.ts`'s own throw (see
+        // the F1(b) test below, and task-B-report.md, for the one that
+        // does). Still worth asserting on this path too, since either
+        // throw site reaching a caller with the path attached would be a
+        // defect.
         expect((thrown as Error).message).not.toContain(personal.board.root);
+        expect(detailsAsString(thrown)).not.toContain(personal.board.root);
       } finally {
         await outsider.cleanup();
       }
@@ -421,6 +443,17 @@ describe("fix round 1 -- F1: personal-board guards are containment, not equality
         }
         expect(isCanKanError(thrown)).toBe(true);
         expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+        // F5/F7 (fix round 2): this scenario -- unlike the F1(a)
+        // reachability test above -- is the one that genuinely reaches
+        // `resolve.ts`'s *own* `REGISTERED_BOARD_IS_PERSONAL` throw
+        // (registry.ts's cheaper root-containment check cannot see a
+        // registered *ancestor*, so `findRegisteredBoard` returns this
+        // entry normally and never throws itself). Confirmed by mutation:
+        // restoring `path: ref.root` to this throw's `details` makes this
+        // exact assertion fail; the F1(a) test above does not, because it
+        // never reaches this call site at all. See task-B-report.md.
+        expect(detailsAsString(thrown)).not.toContain(personal.board.root);
+        expect(detailsAsString(thrown)).not.toContain(umbrella);
       } finally {
         await outsider.cleanup();
       }
@@ -475,14 +508,22 @@ describe("fix round 1 -- F1: personal-board guards are containment, not equality
     });
   });
 
-  // Mutation note (see task-B-report.md, fix round 1): this test verifies
-  // the *observable outcome*, not one specific line. Reverting
-  // walkForBoard's own `isContained` back to `===` alone does NOT fail
-  // this test -- the post-build `aliasesPersonalBoard` check (root half)
-  // independently catches the same shape after `buildBoardRef` runs, so
-  // the two checks are redundant for this particular shape today.
-  // Reverting `aliasesPersonalBoard` itself (both halves, tested above in
-  // F1(b)) is what actually discriminates the outcome this test protects.
+  // Mutation note (see task-B-report.md, fix round 1 and its round-2
+  // correction): this test verifies the *observable outcome*, not one
+  // specific line. Reverting walkForBoard's own `isContained` back to
+  // `===` alone does NOT fail this test -- the post-build
+  // `aliasesPersonalBoard` check independently catches the same shape
+  // after `buildBoardRef` runs, so the two checks are redundant for this
+  // particular shape today. Specifically the *`ticketsDir`* half of that
+  // check is what does the work here, not the `root` half: `buildBoardRef`
+  // itself enforces `isContained(root, ticketsDir)` (ADR 0002,
+  // `ref.ts`'s `checkContainment`) for every ref that ever reaches this
+  // point, so `isContained(personalPath, root)` being true always implies
+  // `isContained(personalPath, ticketsDir)` is true too -- the root half
+  // is kept as defense-in-depth, not because it is the one actually
+  // discriminating here. Reverting `aliasesPersonalBoard` itself (tested
+  // above in F1(b)) is what actually discriminates the outcome this test
+  // protects.
   test("F1(c): a nested .cankan/ inside the personal board's own tree is never treated as an ordinary repo, no-flag or --board repo", async () => {
     await withEnv(undefined, async () => {
       const env = hermeticEnv();
@@ -646,6 +687,174 @@ describe("fix round 1 -- F4: canonicalCwd wraps a non-ENOENT realpath failure to
       } finally {
         await rm(linkParent, { recursive: true, force: true });
       }
+    });
+  });
+});
+
+describe("fix round 2 -- F6: aliasesPersonalBoard's containment must be checked in both directions", () => {
+  test("F6: a registered $XDG_DATA_HOME with tickets_dir steered to enclose the personal board is refused, not returned as an ordinary repo", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      await ensurePersonalBoard({ env });
+      const dataHome = env.XDG_DATA_HOME;
+      if (!dataHome) throw new Error("test setup: XDG_DATA_HOME not set by hermeticEnv()");
+      const outsider = await makeTempRepo();
+      try {
+        // ticketsDir ends up $XDG_DATA_HOME/cankan, which contains
+        // $XDG_DATA_HOME/cankan/personal/backlog/tasks (real tickets) and
+        // $XDG_DATA_HOME/cankan/repos.yml -- the enclosing-direction shape
+        // the root-direction exception (a registered ancestor is fine on
+        // its own) does not by itself protect against.
+        await writeRepoConfigFile(dataHome, "config.yml", "tickets_dir: cankan\n");
+        await register("enc", dataHome, env);
+
+        let thrown: unknown;
+        try {
+          await resolveBoard({ cwd: outsider.dir, flag: { kind: "name", name: "enc" }, env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+
+        const all = await resolveAllBoards({ env });
+        expect(all.boards.map((b) => b.name)).not.toContain("enc");
+        expect(all.skipped.find((s) => s.name === "enc")?.reason).toBe("is the personal board");
+      } finally {
+        await outsider.cleanup();
+      }
+    });
+  });
+
+  test("F6: a registered $HOME with tickets_dir steered to enclose the personal board (via .local) is refused too", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      await ensurePersonalBoard({ env });
+      const home = env.HOME;
+      if (!home) throw new Error("test setup: HOME not set by hermeticEnv()");
+      const outsider = await makeTempRepo();
+      try {
+        await writeRepoConfigFile(home, "config.yml", "tickets_dir: .local\n");
+        await register("dot", home, env);
+
+        let thrown: unknown;
+        try {
+          await resolveBoard({ cwd: outsider.dir, flag: { kind: "name", name: "dot" }, env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+      } finally {
+        await outsider.cleanup();
+      }
+    });
+  });
+
+  // The over-correction guard: F6's fix must not turn a legitimate
+  // dotfiles-repo-at-$HOME workflow into a false positive. Default
+  // tickets_dir (backlog/tasks) neither reaches into nor encloses the
+  // personal board, so this must keep resolving normally at every entry
+  // point that can reach it.
+  test("F6: a legitimate $HOME dotfiles board (default tickets_dir) still resolves at all three entry points and stays in --board all", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      await ensurePersonalBoard({ env });
+      const home = env.HOME;
+      if (!home) throw new Error("test setup: HOME not set by hermeticEnv()");
+      await mkdir(join(home, ".cankan"), { recursive: true }); // no config.yml -- default tickets_dir applies
+      await register("dotfiles", home, env);
+
+      const byName = await resolveBoard({ cwd: home, flag: { kind: "name", name: "dotfiles" }, env });
+      expect(byName.kind).toBe("repo");
+      expect(byName.name).toBe("dotfiles");
+
+      const byRepoFlag = await resolveBoard({ cwd: home, flag: { kind: "repo" }, env });
+      expect(byRepoFlag.name).toBe("dotfiles");
+
+      const noFlag = await resolveBoard({ cwd: home, env });
+      expect(noFlag.name).toBe("dotfiles");
+
+      const all = await resolveAllBoards({ env });
+      expect(all.boards.map((b) => b.name)).toContain("dotfiles");
+    });
+  });
+});
+
+describe("fix round 2 -- F7: the post-build alias check on the cwd-walk paths (--board repo, no-flag) has direct tests, not only via --board <name>", () => {
+  test("F7: --board repo whose own repo root is an ancestor of the personal board, with tickets_dir steered into it, is refused -- not returned as an ordinary repo", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      await ensurePersonalBoard({ env });
+      const dataHome = env.XDG_DATA_HOME;
+      if (!dataHome) throw new Error("test setup: XDG_DATA_HOME not set by hermeticEnv()");
+      await writeRepoConfigFile(dataHome, "config.yml", "tickets_dir: cankan/personal/backlog/tasks\n");
+
+      let thrown: unknown;
+      try {
+        await resolveBoard({ cwd: dataHome, flag: { kind: "repo" }, env });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("NOT_INSIDE_REPO_BOARD");
+    });
+  });
+
+  test("F7: a no-flag resolution from that same ancestor repo falls through to personal, not an ordinary repo board", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      await ensurePersonalBoard({ env });
+      const dataHome = env.XDG_DATA_HOME;
+      if (!dataHome) throw new Error("test setup: XDG_DATA_HOME not set by hermeticEnv()");
+      await writeRepoConfigFile(dataHome, "config.yml", "tickets_dir: cankan/personal/backlog/tasks\n");
+
+      const board = await resolveBoard({ cwd: dataHome, env });
+      expect(board.kind).toBe("personal");
+    });
+  });
+});
+
+describe("fix round 2 -- F8: canonicalPersonalPath's guard must not vanish just because the personal board hasn't been created yet", () => {
+  test("F8: --board <name> against a steered-ancestor entry is refused even when the personal board has never been created", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      // Deliberately no ensurePersonalBoard() call -- that is the point of
+      // this test. writeRepoConfigFile below creates XDG_DATA_HOME/.cankan
+      // (a sibling of where "cankan/personal" would eventually live), so
+      // it does not itself create the personal board.
+      const dataHome = env.XDG_DATA_HOME;
+      if (!dataHome) throw new Error("test setup: XDG_DATA_HOME not set by hermeticEnv()");
+      await writeRepoConfigFile(dataHome, "config.yml", "tickets_dir: cankan/personal/backlog/tasks\n");
+      await register("umbrella", dataHome, env);
+      const outsider = await makeTempRepo();
+      try {
+        let thrown: unknown;
+        try {
+          await resolveBoard({ cwd: outsider.dir, flag: { kind: "name", name: "umbrella" }, env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+      } finally {
+        await outsider.cleanup();
+      }
+    });
+  });
+
+  test("F8: a no-flag resolution from that same ancestor repo also falls through correctly when the personal board has never been created", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const dataHome = env.XDG_DATA_HOME;
+      if (!dataHome) throw new Error("test setup: XDG_DATA_HOME not set by hermeticEnv()");
+      await writeRepoConfigFile(dataHome, "config.yml", "tickets_dir: cankan/personal/backlog/tasks\n");
+
+      // resolveBoard's own fall-through calls ensurePersonalBoard() as
+      // part of resolving -- that is expected and fine; the point is that
+      // the *ancestor repo* is refused rather than returned as-is.
+      const board = await resolveBoard({ cwd: dataHome, env });
+      expect(board.kind).toBe("personal");
     });
   });
 });

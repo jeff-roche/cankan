@@ -82,6 +82,34 @@ function validateTrailingMonths(trailingMonths: number): void {
 }
 
 /**
+ * Validates the clock reading both `append` and `read` accept as `now`
+ * (fix round 2, NEW-2). `options.now ?? Date.now()` was previously
+ * unvalidated in `read` while its sibling parameter, `trailingMonths`, was
+ * — on the very next line — the exact class of oversight fix round 1's own
+ * house rule warns about ("check the siblings at the same call site").
+ * `now: NaN` makes `monthKeyUtc` produce the literal string `"NaN-NaN"`, so
+ * `read`'s month-key window becomes a list of months that cannot exist —
+ * `read()` silently resolves `[]` on a board that has real events, S1's
+ * exact fail-open shape, just reached through the sibling parameter rather
+ * than `trailingMonths` itself. `now: Infinity`/`-Infinity` has the same
+ * effect in `read`, and in `append` additionally mints a ULID whose seed
+ * time can never be beaten by a later real-clock call, permanently
+ * degrading the shared `injectedClockUlidFactory` lane (fix round 1, S6) —
+ * see that constant's doc comment. Not peer-reachable (`now` is a
+ * caller-supplied clock reading, never read from the log), but reachable
+ * with no attacker at all from an upstream `Date.parse` that returned
+ * `NaN`. Raised **before** any git invocation, alongside
+ * `validateTrailingMonths`.
+ */
+function validateNow(now: number): void {
+  if (!Number.isFinite(now)) {
+    throw new CanKanError(EventErrorCodes.EVENT_LOG_INVALID_WINDOW, `now must be a finite number, got ${now}`, {
+      details: { now },
+    });
+  }
+}
+
+/**
  * The `trailingMonths` trailing month keys ending at `monthKeyUtc(nowMs)`,
  * **oldest first** — the order `read()` walks in, so line indices and the
  * `position` counter both advance in append-only chain order (obligation D's
@@ -385,6 +413,13 @@ export interface AppendOptions {
    * write path back to a recoverable state, which is a worse outcome than
    * the DoS this cap defends against. Ordinary callers should never touch
    * this field.
+   *
+   * Validated (fix round 2, Low): must be `>= 0`. `NaN` would otherwise
+   * silently disable the cap entirely (`existingBytes > NaN` is always
+   * `false` in JavaScript), and a negative value would refuse even an
+   * empty month. `Number.POSITIVE_INFINITY` — the bypass documented above
+   * — is explicitly a valid value; only `NaN` and negative numbers are
+   * rejected.
    */
   readonly maxExistingBlobBytes?: number;
 }
@@ -484,7 +519,15 @@ export async function appendCore(
   options: AppendOptions,
   hooks: AppendHooks,
 ): Promise<AppendedEvent> {
+  // Fix round 2 (Low, consistent with read()'s own reordering): the fm10
+  // ref gate runs before any parameter-shape check, so a call carrying both
+  // a bad ref and a bad `now` reports the ref problem, not the clock one.
+  const validatedRef = await validateCoordinationRef(ref);
   const now = options.now ?? Date.now();
+  // Fix round 2, NEW-2: `now` must be finite — see `validateNow`'s doc
+  // comment for why an unvalidated NaN/Infinity here is more than a read()
+  // problem (it also poisons the injected-clock ULID lane below).
+  validateNow(now);
   // Fix round 1, S6: an injected `now` uses the separate, equally
   // persistent `injectedClockUlidFactory` lane rather than the real-clock
   // `defaultUlidFactory` — see both constants' doc comments for why two
@@ -493,7 +536,18 @@ export async function appendCore(
   // from the real-clock path.
   const mint = options.ulidFactory ?? (options.now !== undefined ? injectedClockUlidFactory : defaultUlidFactory);
   const maxExistingBlobBytes = options.maxExistingBlobBytes ?? MAX_MONTH_BLOB_BYTES;
-  const validatedRef = await validateCoordinationRef(ref);
+  // Fix round 2 (Low): `NaN` would otherwise silently disable the size cap
+  // (`existingBytes > NaN` is always `false`), and a negative value would
+  // refuse even an empty month — see `AppendOptions.maxExistingBlobBytes`'s
+  // doc comment. `Number.POSITIVE_INFINITY` (the documented bypass) is
+  // explicitly allowed.
+  if (Number.isNaN(maxExistingBlobBytes) || maxExistingBlobBytes < 0) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+      `maxExistingBlobBytes must be a non-negative number (or Infinity), got ${maxExistingBlobBytes}`,
+      { details: { maxExistingBlobBytes } },
+    );
+  }
 
   // The id is minted once, before the retry loop — not per attempt. A retry
   // re-reads and re-checks git-level state, but it is still the same
@@ -547,8 +601,18 @@ export async function appendCore(
     // hoisted: `existing` is re-fetched fresh each time.
     const existingBytes = Buffer.byteLength(existing, "utf8");
     if (existingBytes > maxExistingBlobBytes) {
+      // Fix round 2, NEW-3: `commit: parentSha` — ADR 0001:1176-1178 makes
+      // naming the offending commit a property of *the error*, not of
+      // which function raises it. Fix round 1's F1 added `commit: head` to
+      // every `read()` throw site but missed both of `append`'s own
+      // fm8-class errors (this one and the malformed-tail one below) —
+      // safe to include: `parentSha` is necessarily non-null here (a
+      // non-empty `existing`, which is required to reach this branch,
+      // is only ever populated when `parentSha !== null`, a few lines
+      // above), and it is module-derived (this function's own `readRef`
+      // result), never peer-authored content.
       throw new CanKanError(EventErrorCodes.EVENT_LOG_BLOB_TOO_LARGE, `month file exceeds the maximum blob size, refusing to extend it: ${path}`, {
-        details: { ref: validatedRef, month, path, bytes: existingBytes, maxBytes: maxExistingBlobBytes },
+        details: { ref: validatedRef, commit: parentSha, month, path, bytes: existingBytes, maxBytes: maxExistingBlobBytes },
       });
     }
 
@@ -560,10 +624,12 @@ export async function appendCore(
     // Appending onto it via plain concatenation would fuse this event onto
     // the truncated tail, corrupting both — fail closed instead.
     if (existing.length > 0 && !existing.endsWith("\n")) {
+      // Fix round 2, NEW-3: `commit: parentSha` — see the identical note
+      // on the size-cap throw immediately above.
       throw new CanKanError(
         EventErrorCodes.EVENT_LOG_MALFORMED_BLOB,
         `month file does not end with a newline, refusing to append onto a truncated tail: ${path}`,
-        { details: { ref: validatedRef, month, path } },
+        { details: { ref: validatedRef, commit: parentSha, month, path } },
       );
     }
 
@@ -734,14 +800,22 @@ export interface ReadOptions {
  * An absent ref genuinely has no events yet, and `[]` says exactly that.
  */
 export async function read(adapter: GitAdapter, ref: string, options: ReadOptions = {}): Promise<readonly EventRecord[]> {
+  // Fix round 2 (Low): the fm10 ref gate runs *first* — before either
+  // parameter-shape check below. Ordering is observable: a call carrying
+  // both a bad ref and a bad window previously reported
+  // `EVENT_LOG_INVALID_WINDOW` rather than `GIT_REF_INVALID`, which is the
+  // wrong diagnosis to hand a caller who configured the ref wrong (fm10 is
+  // the security-relevant gate; the window checks are hygiene).
+  const validatedRef = await validateCoordinationRef(ref);
   const now = options.now ?? Date.now();
   const trailingMonths = options.trailingMonths ?? DEFAULT_TRAILING_MONTHS;
-  // Fix round 1, S1: validated before any git invocation and before the
-  // month-key loop that a degenerate value (0, negative, NaN) or a
-  // pathologically large one (a hostile config-derived Infinity) would
-  // otherwise reach unguarded.
+  // Fix round 1, S1 / fix round 2, NEW-2: validated before any further git
+  // invocation and before the month-key loop — a degenerate `trailingMonths`
+  // (0, negative, NaN) or a pathologically large one (a hostile
+  // config-derived Infinity), and a non-finite `now` (NaN/Infinity, e.g.
+  // from an upstream `Date.parse` failure), would otherwise reach unguarded.
+  validateNow(now);
   validateTrailingMonths(trailingMonths);
-  const validatedRef = await validateCoordinationRef(ref);
 
   const head = await adapter.readRef(validatedRef);
   if (head === null) {

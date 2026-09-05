@@ -35,15 +35,18 @@ export const ErrorCodes = {
  * holder.
  *
  * **`details` is published by default — treat it as user-visible output, not
- * as a debugging scratchpad.** Unlike `message`, `cause` and `stack`, which
- * are non-enumerable, `details` is an own enumerable property: both
- * `JSON.stringify(error)` (the shape `--json` output naturally reaches for)
- * and the terminal's uncaught-error printer emit it without anyone opting
- * in. So put in it only values that are safe to show the user who ran the
- * command — a config file path they already know, the actor name holding a
- * claim, a config key. Never credentials, tokens, environment values, a
- * backer's HTTP response body, or text copied out of `cause.message`, which
- * may carry any of those.
+ * as a debugging scratchpad.** `toJSON` deliberately includes it in JSON
+ * output, so it reaches `--json` consumers; and because it is an own
+ * enumerable property (unlike `message`, `cause` and `stack`), the
+ * terminal's uncaught-error printer emits it regardless. So put in it only
+ * values that are safe to show the user who ran the command — a config file
+ * path they already know, the actor name holding a claim, a config key.
+ * Never credentials, tokens, environment values, a backer's HTTP response
+ * body, or text copied out of `cause.message`, which may carry any of those.
+ *
+ * Keep it flat: JSON primitives, or arrays of them. The constructor's freeze
+ * is shallow, so a nested object stays aliased to the caller's and stays
+ * mutable — no nested objects, no class instances, no getters, no BigInt.
  */
 export interface CanKanErrorOptions {
   cause?: unknown;

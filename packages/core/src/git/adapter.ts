@@ -6,12 +6,16 @@
  * must implement").
  *
  * See `types.ts` for the public shapes and `refValidation.ts` for the
- * mandatory ref check every method below runs before touching git.
+ * name-level ref check (`validateCoordinationRef`) that `ensureValidRef`
+ * below layers a repository-aware symref check on top of.
  *
- * Every invocation here goes through `transport.ts`'s `runGit` chokepoint,
- * with one documented exception below (`hashObjectStdin`) — see that
- * function's doc comment, and `refValidation.ts`'s for a second, unrelated
- * exception in that file.
+ * Every invocation here goes through `transport.ts`'s `runGitRaw`/`runGit`
+ * chokepoint (fix-round-1 Ruling 11 — the transport is `Bun.spawn`, not
+ * `simple-git`; see `transport.ts`'s doc comment for the five measured
+ * reasons). There are no direct-spawn exceptions left in this module:
+ * `hash-object -w --stdin` and `check-ref-format` (`refValidation.ts`) are
+ * both ordinary calls through the same chokepoint now that it exposes exit
+ * codes directly.
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
@@ -20,7 +24,7 @@ import { join } from "node:path";
 import { CanKanError } from "../errors";
 import { GitErrorCodes } from "./errors";
 import { validateCoordinationRef } from "./refValidation";
-import { messageOf, runGit } from "./transport";
+import { runGit, runGitRaw } from "./transport";
 import type {
   CasOutcome,
   CommitTreeParams,
@@ -34,6 +38,65 @@ import type {
 } from "./types";
 
 const ZERO_SHA = "0".repeat(40);
+
+/** `^[0-9a-f]{40}$` — see `Sha`'s doc comment in `types.ts` (fix-round-1 F2). */
+const SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+/**
+ * Runtime backstop for the `RefSha`/`ObjectSha` brands (fix-round-1 F2): a
+ * brand is compile-time only, and `git update-ref` accepts any revision
+ * expression, not only an object id. Verified directly: without this check,
+ * `updateRefCAS(ref, "refs/heads/main", old)` applies and returns `{sha:
+ * "refs/heads/main"}`; feeding a non-sha value like `"HEAD"` back as a later
+ * `oldSha` makes the compare late-bound against whatever `HEAD` currently
+ * resolves to rather than a fixed point-in-time value, and a reproduced
+ * sequence (apply with `newSha: "HEAD"`, let another writer advance the ref,
+ * then pass `"HEAD"` back as `oldSha`) silently accepted the stale write and
+ * lost the other writer's commit — PLAN.md's "Done when" and ADR 0001's "the
+ * trailing old-value argument *is* the entire CAS mechanism" both defeated
+ * at once. Called on `newSha`, `oldSha` (when non-null), and `parent` (when
+ * non-null) before any of them reach argv.
+ */
+function assertShaShape(value: string, paramName: string): void {
+  if (!SHA_PATTERN.test(value)) {
+    throw new CanKanError(GitErrorCodes.GIT_SHA_INVALID, `${paramName} is not a 40-hex object id: "${value}"`, {
+      details: { paramName, value },
+    });
+  }
+}
+
+/**
+ * Both mandated name-level ref checks (`validateCoordinationRef`) plus this
+ * module's own additional guard: reject a ref that is *currently* a
+ * symbolic ref, before any operation that could act on it (fix-round-1 F1).
+ *
+ * ADR 0001 notes "`HEAD` works identically, since `update-ref` dereferences
+ * it" but defends only lexically, at the name level. A coordination ref
+ * that is *itself* a symref to (say) `refs/heads/main` has a name that
+ * passes both mandated checks — `refs/cankan/coordination` matches the
+ * regex and `check-ref-format` — yet `update-ref`/`rev-parse --verify` both
+ * dereference it by default, reintroducing the exact abuse those checks
+ * exist to prevent. Verified directly: with the ref planted as a symref,
+ * `readRef` returned `main`'s tip and `commitTreeToRef` applied a commit
+ * that moved `main`, with the name-level guard fully in force throughout.
+ *
+ * `git symbolic-ref -q --end-of-options <ref>`: exit 0 with a target on
+ * stdout means `ref` is a symref (reject); a non-zero exit with empty
+ * output means it is not (proceed) — confirmed directly, including that the
+ * marker must sit after `-q`, immediately before the single positional it
+ * protects (placing it before `-q` makes `-q` itself the ref pattern
+ * instead of a flag).
+ */
+async function ensureValidRef(root: string, ref: string): Promise<string> {
+  const validated = await validateCoordinationRef(ref);
+  const symref = await runGitRaw(root, ["symbolic-ref", "-q", "--end-of-options", validated]);
+  if (symref.exitCode === 0) {
+    throw new CanKanError(GitErrorCodes.GIT_REF_INVALID, `ref is a symbolic ref: ${validated}`, {
+      details: { ref: validated, target: symref.stdout.trim() },
+    });
+  }
+  return validated;
+}
 
 /**
  * The CAS-rejection signature. ADR 0001:471-473 states one form: `cannot
@@ -90,40 +153,16 @@ const PUSH_REJECTED_PATTERN = /! \[rejected\][^\n]*\((fetch first|non-fast-forwa
 const FETCH_REJECTED_PATTERN = /! \[rejected\][^\n]*\(non-fast-forward\)/;
 
 /**
- * **R1's named direct-spawn exception.** `git hash-object -w --stdin` needs
- * a stdin channel to hand it the blob's content; `simple-git` exposes none —
- * confirmed for this task: `spawn.options` carries no `stdio` or `input`
- * field. ADR 0001:411-413 explicitly exempts `hash-object` from the
- * `--end-of-options` rule for the same reason from the other direction: its
- * content arrives on stdin, and the command takes no ref, path, or commit
- * argument at all, so there is no positional for the marker to protect.
- *
- * (`refValidation.ts`'s `check-ref-format` call is a second, independent
- * direct spawn, for an unrelated reason — see that file's doc comment. R1
- * names `hash-object` as "the one permitted exception"; the second was
- * forced by a `simple-git` defect this task found empirically, not chosen.)
+ * `git hash-object -w --stdin`. Not a direct-spawn exception any more
+ * (fix-round-1 Ruling 11) — `runGit`'s `stdin` option gives this an ordinary
+ * path through the one chokepoint. ADR 0001:411-413 exempts this command
+ * from the `--end-of-options` rule on its own terms: its content arrives on
+ * stdin, and the command takes no ref, path, or commit argument at all, so
+ * there is no positional for the marker to protect.
  */
 async function hashObjectStdin(root: string, content: string): Promise<ObjectSha> {
-  const proc = Bun.spawn(["git", "hash-object", "-w", "--stdin"], {
-    cwd: root,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, LC_ALL: "C" },
-  });
-  proc.stdin.write(content);
-  await proc.stdin.end();
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  if (exitCode !== 0) {
-    throw new CanKanError(GitErrorCodes.GIT_COMMAND_FAILED, "git hash-object failed", {
-      cause: new Error(stderr.trim()),
-    });
-  }
-  return stdout.trim() as ObjectSha;
+  const out = await runGit(root, ["hash-object", "-w", "--stdin"], { stdin: content });
+  return out.trim() as ObjectSha;
 }
 
 /**
@@ -146,18 +185,19 @@ async function buildTree(
 ): Promise<ObjectSha> {
   const indexDir = await mkdtemp(join(tmpRoot, "cankan-git-index-"));
   try {
-    const extraEnv = { GIT_INDEX_FILE: join(indexDir, "index") };
+    const env = { GIT_INDEX_FILE: join(indexDir, "index") };
 
     if (parent === null) {
-      await runGit(root, ["read-tree", "--empty"], extraEnv);
+      await runGit(root, ["read-tree", "--empty"], { env });
     } else {
       // `parent` is a `RefSha` this module itself obtained from `readRef`
-      // (or the caller's own prior read of it) — a 40-hex sha, never a
-      // config- or log-derived string, so it cannot begin with `-`. The
-      // marker is still included ahead of it as the mechanical, costs-
-      // nothing hygiene the ADR calls for (0001:391-417) — confirmed
+      // (or the caller's own prior read of it), shape-checked by
+      // `commitTreeToRef` before this function is ever called — a 40-hex
+      // sha, never a config- or log-derived string, so it cannot begin with
+      // `-`. The marker is still included ahead of it as the mechanical,
+      // costs-nothing hygiene the ADR calls for (0001:391-417) — confirmed
       // accepted by git 2.55.0's `read-tree`.
-      await runGit(root, ["read-tree", "--end-of-options", parent], extraEnv);
+      await runGit(root, ["read-tree", "--end-of-options", parent], { env });
     }
 
     for (const file of files) {
@@ -177,13 +217,13 @@ async function buildTree(
       await runGit(
         root,
         ["update-index", "--add", "--cacheinfo", `100644,${blob},${file.path}`, "--end-of-options"],
-        extraEnv,
+        { env },
       );
     }
 
     // `write-tree` takes no ref/path/commit argument either; `--end-of-options`
     // is kept for the same uniformity reason and confirmed harmless.
-    const tree = await runGit(root, ["write-tree", "--end-of-options"], extraEnv);
+    const tree = await runGit(root, ["write-tree", "--end-of-options"], { env });
     return tree.trim() as ObjectSha;
   } finally {
     await rm(indexDir, { recursive: true, force: true });
@@ -200,7 +240,9 @@ async function buildTree(
  * immediately before the single positional it protects: `-p <old> -m <msg>
  * --end-of-options <tree>`. `<old>` is deliberately left uncovered by the
  * marker — like `parent` in `buildTree`, it is a `RefSha` this module
- * obtained itself, never a config- or log-derived string.
+ * obtained itself (and, since fix-round-1 F2, shape-checked by
+ * `commitTreeToRef` before this function is called), never a config- or
+ * log-derived string.
  */
 async function commitTreeCommand(
   root: string,
@@ -216,31 +258,66 @@ async function commitTreeCommand(
   return out.trim() as ObjectSha;
 }
 
-/** `readRef`, assuming `ref` has already been validated. */
+/**
+ * `readRef`, assuming `ref` has already been validated.
+ *
+ * **Fix-round-1 F5 — "absent" and "present but unreadable/broken" are
+ * discriminated by exit code, not conflated.** The prior implementation
+ * used `rev-parse --verify --quiet`, which is byte-identical (exit 1, empty
+ * stdout, empty stderr) for both a genuinely absent ref and a ref that
+ * exists but cannot be read (a corrupted ref file, a directory/file
+ * conflict on its path) — the same class of defect this task's
+ * `check-ref-format` finding was, on the only other command in this module
+ * that could exit non-zero with empty stderr. Verified this did not reach
+ * the ADR's condemned outcome in practice (the mandated caller response,
+ * `commitTreeToRef` with `parent: null`, still hard-errors on a broken ref
+ * rather than silently double-claiming), but the recorded reasoning for the
+ * old `--quiet` deviation was itself backwards: exit-128-for-both is
+ * fail-**closed** (both throw), and `--quiet` is what turned both into a
+ * silent `""` → `null`, i.e. fail-**open** — the opposite of what the old
+ * comment claimed. Corrected here rather than left for another lane to copy.
+ *
+ * `git show-ref --exists --end-of-options <ref>` distinguishes cleanly,
+ * confirmed directly: exit 0 present, exit 2 absent, exit 1 lookup failed
+ * (both a corrupted-ref-file case and a directory/file conflict on the
+ * ref's path were probed; the corrupted-file case produces exit 1, the D/F
+ * conflict produces exit 2, indistinguishable from genuine absence by exit
+ * code alone). This module does not add an `lstat`-level check to tell a
+ * D/F conflict apart from real absence — the honest reason exit 2 is treated
+ * as "absent" here is that `--exists` collapses the two, not that they are
+ * conceptually the same outcome. What makes this acceptable is what happens
+ * next, not this function: a caller that got `null` back and proceeds to
+ * write (`commitTreeToRef` with `parent: null`) still hard-fails against
+ * that same path rather than silently succeeding, because the write goes
+ * through `update-ref`/`hash-object`, not through this read. `--exists`
+ * requires git ≥ 2.43; confirmed present on both `ubuntu-latest` and
+ * `macos-latest` GitHub-hosted runner images (2.55.0, matching local) at
+ * the time of this fix.
+ */
 async function readRefCore(root: string, validatedRef: string): Promise<RefSha | null> {
-  let out: string;
-  try {
-    // R8 — `--quiet` is a deliberate deviation from the ADR's literal
-    // template (0001:338), which omits it. Confirmed for this task: without
-    // `--quiet`, `rev-parse --verify --end-of-options <missing-ref>` exits
-    // 128 with `fatal: Needed a single revision` — indistinguishable by exit
-    // code (which `simple-git` doesn't even surface) or by this message
-    // alone from a genuine failure, which is exactly the fail-open confusion
-    // the ADR condemns for `cat-file` in the `readBlobFromRef` bullet.
-    // `--quiet` is an option, not a positional, so it does not sit where
-    // `--end-of-options` would need to protect it, and does not weaken the
-    // marker's coverage of `<ref>`. With `--quiet`, a missing ref resolves
-    // to the empty string through `simple-git` instead of throwing —
-    // confirmed directly.
-    out = await runGit(root, ["rev-parse", "--verify", "--quiet", "--end-of-options", validatedRef]);
-  } catch (cause) {
+  const existsResult = await runGitRaw(root, ["show-ref", "--exists", "--end-of-options", validatedRef]);
+  if (existsResult.exitCode === 2) {
+    return null;
+  }
+  if (existsResult.exitCode !== 0) {
+    throw new CanKanError(
+      GitErrorCodes.GIT_COMMAND_FAILED,
+      `git show-ref --exists failed for ref ${validatedRef}`,
+      {
+        cause: new Error(existsResult.stderr.trim() || `exit ${existsResult.exitCode}`),
+        details: { ref: validatedRef },
+      },
+    );
+  }
+
+  const revResult = await runGitRaw(root, ["rev-parse", "--verify", "--end-of-options", validatedRef]);
+  if (revResult.exitCode !== 0) {
     throw new CanKanError(GitErrorCodes.GIT_COMMAND_FAILED, `git rev-parse failed for ref ${validatedRef}`, {
-      cause,
+      cause: new Error(revResult.stderr.trim() || `exit ${revResult.exitCode}`),
       details: { ref: validatedRef },
     });
   }
-  const trimmed = out.trim();
-  return trimmed.length === 0 ? null : (trimmed as RefSha);
+  return revResult.stdout.trim() as RefSha;
 }
 
 /** `updateRefCAS`, assuming `ref` has already been validated. */
@@ -250,11 +327,39 @@ async function updateRefCASCore(
   newSha: ObjectSha,
   oldSha: RefSha | null,
 ): Promise<CasOutcome> {
+  // Fix-round-1 F2: the compile-time brand alone does not stop a caller from
+  // passing a non-sha revision expression (`"HEAD"`, `"refs/heads/main"`) at
+  // runtime — see `assertShaShape`'s doc comment for the reproduced lost
+  // update this closes.
+  assertShaShape(newSha, "newSha");
+  if (oldSha !== null) {
+    assertShaShape(oldSha, "oldSha");
+  }
   const compare: Sha = oldSha ?? (ZERO_SHA as Sha);
-  try {
-    // ADR 0001:458-475: "the trailing old-value argument to `update-ref` *is*
-    // the entire CAS mechanism; no separate locking is needed around it."
-    await runGit(root, ["update-ref", "--end-of-options", validatedRef, newSha, compare]);
+
+  // ADR 0001:458-475: "the trailing old-value argument to `update-ref` *is*
+  // the entire CAS mechanism; no separate locking is needed around it."
+  // `--no-deref` (fix-round-1 F1) is the TOCTOU backstop alongside
+  // `ensureValidRef`'s symref check: confirmed a no-op for a normal ref (the
+  // overwhelming case) in every respect tested — creation, update, and the
+  // contention race all behave identically with or without it — and
+  // confirmed that if the ref *did* become a symref between validation and
+  // this write, `--no-deref` makes the compare check still evaluate against
+  // the symref's current dereferenced target (so a stale compare is still
+  // correctly rejected) while any write that *does* pass compare lands on
+  // the named ref path directly, converting it back to a normal ref, rather
+  // than dereferencing through to advance whatever it pointed to. `main`
+  // was not moved in either outcome, tested directly.
+  const result = await runGitRaw(root, [
+    "update-ref",
+    "--no-deref",
+    "--end-of-options",
+    validatedRef,
+    newSha,
+    compare,
+  ]);
+
+  if (result.exitCode === 0) {
     // The one sanctioned RefSha/ObjectSha transition (see `CasOutcome`'s doc
     // comment in `types.ts`): `update-ref` just confirmed the ref now points
     // to `newSha`, so it is now, in fact, a value "a ref currently points
@@ -263,20 +368,20 @@ async function updateRefCASCore(
     // never at a call site as a way to manufacture a `RefSha` to hand back
     // in as `newSha` on some other call.
     return { outcome: "applied", sha: newSha as unknown as RefSha };
-  } catch (cause) {
-    const message = messageOf(cause);
-    if (CAS_REJECTION_PATTERN.test(message)) {
-      return { outcome: "rejected", stderr: message };
-    }
-    throw new CanKanError(GitErrorCodes.GIT_COMMAND_FAILED, `git update-ref failed for ref ${validatedRef}`, {
-      cause,
-      details: { ref: validatedRef },
-    });
   }
+
+  if (CAS_REJECTION_PATTERN.test(result.stderr)) {
+    return { outcome: "rejected", stderr: result.stderr.trim() };
+  }
+
+  throw new CanKanError(GitErrorCodes.GIT_COMMAND_FAILED, `git update-ref failed for ref ${validatedRef}`, {
+    cause: new Error(result.stderr.trim() || `exit ${result.exitCode}`),
+    details: { ref: validatedRef },
+  });
 }
 
 async function readBlobFromRef(root: string, ref: string, path: string): Promise<string | null> {
-  const validatedRef = await validateCoordinationRef(ref);
+  const validatedRef = await ensureValidRef(root, ref);
   const commit = await readRefCore(root, validatedRef);
   if (commit === null) {
     // ADR failure mode 6: a caller must check `readRef` (and initialize or
@@ -359,18 +464,33 @@ async function commitTreeToRef(
   ref: string,
   params: CommitTreeParams,
 ): Promise<CasOutcome> {
-  const validatedRef = await validateCoordinationRef(ref);
+  const validatedRef = await ensureValidRef(root, ref);
+  // Fix-round-1 F2: `parent` reaches `read-tree`'s and `commit-tree -p`'s
+  // argv directly (see `buildTree`/`commitTreeCommand`) — shape-checked
+  // here, before either is called, not left to `updateRefCASCore`'s own
+  // check alone, which runs only after the tree and commit have already
+  // been built off it.
+  if (params.parent !== null) {
+    assertShaShape(params.parent, "parent");
+  }
+  // Fix-round-1 F1: `ensureValidRef` above is a point-in-time check on
+  // `validatedRef` itself; it says nothing about `validatedRef`'s state by
+  // the time this function's one write (`updateRefCASCore`, at the end)
+  // runs. That gap is harmless here: every step in between — `read-tree
+  // --end-of-options <parent>`, `commit-tree -p <parent>` — takes `parent`,
+  // an already-shape-checked 40-hex object id, never `validatedRef` itself.
+  // `validatedRef` is not resolved again until `updateRefCASCore`'s
+  // `update-ref`, which carries `--no-deref` for exactly this reason. There
+  // is no ref-resolving step in this function's build phase for a
+  // symref-swap to land on.
+
   let commit: ObjectSha;
   try {
     const tree = await buildTree(root, tmpRoot, params.parent, params.files);
     commit = await commitTreeCommand(root, tree, params.parent, params.message);
   } catch (cause) {
-    // `hashObjectStdin` already throws a typed `CanKanError`; anything else
-    // here (a raw `GitError` from `read-tree`/`update-index`/`write-tree`/
-    // `commit-tree`) is wrapped rather than left to propagate unwrapped —
-    // every hard failure this module surfaces is a `CanKanError`, never a
-    // bare `GitError` a caller would have to know to unwrap, and never a
-    // path that copies `cause`'s argv into `message` or `details`.
+    // Every hard failure this module surfaces is a `CanKanError`, never a
+    // bare `Error` a caller would have to know to unwrap.
     if (cause instanceof CanKanError) {
       throw cause;
     }
@@ -424,30 +544,32 @@ async function listWorktrees(root: string): Promise<WorktreeInfo[]> {
 }
 
 async function fetch(root: string, remote: string, ref: string): Promise<SyncOutcome> {
-  const validatedRef = await validateCoordinationRef(ref);
+  const validatedRef = await ensureValidRef(root, ref);
   const refspec = `${validatedRef}:${validatedRef}`;
-  try {
-    // Required refspec, with no exception once the ref exists (ADR
-    // 0001:630-646): applied directly to the local working ref. Never
-    // relying on a persistent `remote.origin.fetch` entry — confirmed
-    // untested by the ADR and, with a `+` prefix, actively dangerous given
-    // the reconciliation requirement below.
-    await runGit(root, ["fetch", "--end-of-options", remote, refspec]);
+  // Required refspec, with no exception once the ref exists (ADR
+  // 0001:630-646): applied directly to the local working ref. Never
+  // relying on a persistent `remote.origin.fetch` entry — confirmed
+  // untested by the ADR and, with a `+` prefix, actively dangerous given
+  // the reconciliation requirement below.
+  const result = await runGitRaw(root, ["fetch", "--end-of-options", remote, refspec]);
+  if (result.exitCode === 0) {
     return { outcome: "ok" };
-  } catch (cause) {
-    const message = messageOf(cause);
-    if (FETCH_REJECTED_PATTERN.test(message)) {
-      // ADR 0001:655-662: a plain fetch of the working ref's own refspec is
-      // itself rejected as non-fast-forward once local and remote have both
-      // advanced — confirmed directly. The caller's move here is
-      // `fetchReconciliation`, into a staging ref, not a retry of this call.
-      return { outcome: "rejected" };
-    }
-    throw new CanKanError(GitErrorCodes.GIT_COMMAND_FAILED, "git fetch failed", {
-      cause,
-      details: { ref: validatedRef },
-    });
   }
+  if (FETCH_REJECTED_PATTERN.test(result.stderr)) {
+    // ADR 0001:655-662: a plain fetch of the working ref's own refspec is
+    // itself rejected as non-fast-forward once local and remote have both
+    // advanced — confirmed directly. The caller's move here is
+    // `fetchReconciliation`, into a staging ref, not a retry of this call.
+    return { outcome: "rejected" };
+  }
+  throw new CanKanError(GitErrorCodes.GIT_COMMAND_FAILED, "git fetch failed", {
+    // Fix-round-1 F3: this `cause` is a plain `Error` built only from git's
+    // own (already credential-redacted) stderr — never an object carrying
+    // argv — so nothing here leaks through `util.inspect`,
+    // `console.error`, or an uncaught-rejection printer.
+    cause: new Error(result.stderr.trim() || `exit ${result.exitCode}`),
+    details: { ref: validatedRef },
+  });
 }
 
 async function fetchReconciliation(
@@ -456,48 +578,46 @@ async function fetchReconciliation(
   ref: string,
   stagingRef: string,
 ): Promise<void> {
-  const validatedRef = await validateCoordinationRef(ref);
-  const validatedStaging = await validateCoordinationRef(stagingRef);
+  const validatedRef = await ensureValidRef(root, ref);
+  const validatedStaging = await ensureValidRef(root, stagingRef);
   const refspec = `${validatedRef}:${validatedStaging}`;
-  try {
-    // ADR 0001:655-662: fetch the remote ref into a distinct local ref name,
-    // never the working ref directly.
-    await runGit(root, ["fetch", "--end-of-options", remote, refspec]);
-  } catch (cause) {
+  // ADR 0001:655-662: fetch the remote ref into a distinct local ref name,
+  // never the working ref directly.
+  const result = await runGitRaw(root, ["fetch", "--end-of-options", remote, refspec]);
+  if (result.exitCode !== 0) {
     throw new CanKanError(GitErrorCodes.GIT_COMMAND_FAILED, "git fetch (reconciliation) failed", {
-      cause,
+      cause: new Error(result.stderr.trim() || `exit ${result.exitCode}`),
       details: { ref: validatedRef, stagingRef: validatedStaging },
     });
   }
 }
 
 async function push(root: string, remote: string, ref: string): Promise<SyncOutcome> {
-  const validatedRef = await validateCoordinationRef(ref);
+  const validatedRef = await ensureValidRef(root, ref);
   const refspec = `${validatedRef}:${validatedRef}`;
-  try {
-    await runGit(root, ["push", "--end-of-options", remote, refspec]);
+  const result = await runGitRaw(root, ["push", "--end-of-options", remote, refspec]);
+  if (result.exitCode === 0) {
     return { outcome: "ok" };
-  } catch (cause) {
-    const message = messageOf(cause);
-    if (PUSH_REJECTED_PATTERN.test(message)) {
-      // ADR 0001:647-654: on a non-fast-forward push rejection, the caller
-      // must fetch (into a staging ref) and reconcile, then retry — never
-      // force-push. This module returns the typed outcome; the
-      // fetch-reconcile-retry orchestration is M2.7's (R3).
-      return { outcome: "rejected" };
-    }
-    // M2.1's credential finding: `cause` (a `simple-git` `GitError`) can
-    // carry a credential-bearing remote URL in its own-enumerable
-    // `task.commands`, even though git's own stderr — this error's
-    // `message`, were it copied — redacts credentials itself. `cause` is
-    // attached here and nowhere else: never copied into `message` or
-    // `details`. `CanKanError.toJSON()` (and therefore `JSON.stringify`)
-    // does not serialize `cause` at all.
-    throw new CanKanError(GitErrorCodes.GIT_COMMAND_FAILED, "git push failed", {
-      cause,
-      details: { ref: validatedRef },
-    });
   }
+  if (PUSH_REJECTED_PATTERN.test(result.stderr)) {
+    // ADR 0001:647-654: on a non-fast-forward push rejection, the caller
+    // must fetch (into a staging ref) and reconcile, then retry — never
+    // force-push. This module returns the typed outcome; the
+    // fetch-reconcile-retry orchestration is M2.7's (R3).
+    return { outcome: "rejected" };
+  }
+  // M2.1's credential finding, closed by construction (fix-round-1 F3):
+  // `cause` here is a plain `Error` carrying only git's own stderr text —
+  // git redacts embedded userinfo from its own error messages itself
+  // (confirmed: `fatal: unable to access 'https://host/x.git/': ...` never
+  // includes credentials even when the argv that produced it did) — never
+  // an object with an own-enumerable argv property for `util.inspect`,
+  // `console.error`, or an uncaught-rejection printer to render. Never
+  // copied into `message` or `details` either way.
+  throw new CanKanError(GitErrorCodes.GIT_COMMAND_FAILED, "git push failed", {
+    cause: new Error(result.stderr.trim() || `exit ${result.exitCode}`),
+    details: { ref: validatedRef },
+  });
 }
 
 async function gitCommonDir(root: string): Promise<string> {
@@ -519,7 +639,7 @@ async function gitCommonDir(root: string): Promise<string> {
  * the pin. `cwd` is a required parameter, never `process.cwd()`: this
  * module never changes or reads the host process's working directory, since
  * doing so would race every other concurrently-running test or command in
- * this process — `simple-git`'s per-instance `baseDir` is what lets a
+ * this process — the chokepoint's explicit `cwd` argument is what lets a
  * bootstrap "from a subdirectory" or "from a secondary worktree" be
  * expressed as a parameter instead.
  *
@@ -545,9 +665,9 @@ export async function createGitAdapter(cwd: string, options: GitAdapterOptions =
 
   return {
     root,
-    readRef: async (ref) => readRefCore(root, await validateCoordinationRef(ref)),
+    readRef: async (ref) => readRefCore(root, await ensureValidRef(root, ref)),
     updateRefCAS: async (ref, newSha, oldSha) =>
-      updateRefCASCore(root, await validateCoordinationRef(ref), newSha, oldSha),
+      updateRefCASCore(root, await ensureValidRef(root, ref), newSha, oldSha),
     readBlobFromRef: (ref, path) => readBlobFromRef(root, ref, path),
     commitTreeToRef: (ref, params) => commitTreeToRef(root, tmpRoot, ref, params),
     listWorktrees: () => listWorktrees(root),

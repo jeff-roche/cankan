@@ -4,11 +4,25 @@
  */
 
 /**
- * A 40-hex (or, on a future SHA-256 repository, 64-hex) git object id.
+ * A 40-hex git object id. Forty-hex only, deliberately: nothing in this
+ * project targets a SHA-256 (64-hex) repository, and an earlier version of
+ * this comment claimed 64-hex support while `ZERO_SHA` (`adapter.ts`) was
+ * hardcoded to 40 zeros — a regex admitting a width the zero sentinel cannot
+ * express would be a latent defect, not a generalization, so the SHA-256
+ * case is left unclaimed here rather than half-supported (fix-round-1 F2).
+ *
  * Branded so a plain `string` is not accidentally accepted as a `Sha` — but
- * like `TicketId`/`ActorId` in `../types.ts`, the brand carries **no runtime
- * validation**. It exists to support the two narrower brands below, which do
- * carry a real, load-bearing distinction.
+ * unlike `TicketId`/`ActorId` in `../types.ts`, this brand is **not**
+ * runtime-validation-free: `assertShaShape` (`adapter.ts`) checks every
+ * `newSha`/`oldSha`/`parent` against `^[0-9a-f]{40}$` before it reaches
+ * argv. `git update-ref` accepts any revision expression, not only an
+ * object id — a caller passing `"HEAD"` or `"refs/heads/main"` as a `Sha`
+ * would otherwise compile cleanly and defeat the CAS at runtime (fix-round-1
+ * F2: verified directly, including a reproduced lost update where a second
+ * writer's commit was silently dropped after such a value was fed back as a
+ * stale compare). The brand exists to support the two narrower brands below,
+ * which carry a further, load-bearing distinction on top of the shared
+ * runtime check.
  */
 export type Sha = string & { readonly __brand: "Sha" };
 
@@ -136,16 +150,25 @@ export interface GitAdapter {
   readonly root: string;
 
   /**
-   * `git rev-parse --verify --quiet --end-of-options <ref>`. Returns `null`
-   * if `ref` does not exist. `ref` is validated before any git invocation.
+   * `git show-ref --exists` to discriminate "absent" from "present but
+   * unreadable/broken" (fix-round-1 F5), then `git rev-parse --verify
+   * --end-of-options <ref>` to resolve the sha. Returns `null` if `ref` does
+   * not exist; throws a typed hard error if it exists but cannot be read.
+   * `ref` is validated (name check, plus the symref check — fix-round-1 F1)
+   * before any git invocation.
    */
   readRef(ref: string): Promise<RefSha | null>;
 
   /**
-   * `git update-ref --end-of-options <ref> <newSha> <oldSha ?? ZERO_SHA>`.
-   * The *third* argument is the compare value — see `ObjectSha`'s doc
-   * comment for why the type checker, not documentation, is what prevents
-   * inverting it. `oldSha: null` means "the ref must not exist yet."
+   * `git update-ref --no-deref --end-of-options <ref> <newSha> <oldSha ??
+   * ZERO_SHA>`. The *third* argument is the compare value — see
+   * `ObjectSha`'s doc comment for why the type checker, not documentation,
+   * is what prevents inverting it, and `Sha`'s doc comment for the runtime
+   * shape check that closes the gap a compile-time brand alone leaves open
+   * (fix-round-1 F2). `--no-deref` (fix-round-1 F1) is a TOCTOU backstop: a
+   * no-op for a normal ref, and the reason a ref that becomes a symbolic ref
+   * between validation and this write still cannot move whatever it points
+   * to. `oldSha: null` means "the ref must not exist yet."
    */
   updateRefCAS(ref: string, newSha: ObjectSha, oldSha: RefSha | null): Promise<CasOutcome>;
 

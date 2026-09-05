@@ -231,6 +231,62 @@ describe("obligation 3 — ticket canonicalized on read", () => {
 });
 
 // ============================================================================
+// Fix round 1, finding M2 — structural id-shape guard on `ticket`
+// (traversal strings, control characters, bidi overrides, whitespace-only,
+// oversized values previously accepted; probes proving each is now rejected)
+// ============================================================================
+
+describe("fix round 1 M2 — ticket structural id-shape guard", () => {
+  test("a path-traversal-shaped ticket is rejected", () => {
+    const result = parse(envelope({ event: "release", ticket: "../../../../home/victim/.gitconfig" }));
+    expect(result.ok).toBe(false);
+  });
+
+  test("an absolute-path-shaped ticket is rejected", () => {
+    expect(parse(envelope({ event: "release", ticket: "/etc/passwd" })).ok).toBe(false);
+  });
+
+  test("a ticket containing a raw ANSI escape is rejected", () => {
+    expect(parse(envelope({ event: "release", ticket: "\x1b[2Jck-1" })).ok).toBe(false);
+  });
+
+  test("a whitespace-only ticket is rejected", () => {
+    expect(parse(envelope({ event: "release", ticket: "   " })).ok).toBe(false);
+  });
+
+  test("a ticket containing a NUL byte is rejected", () => {
+    expect(parse(envelope({ event: "release", ticket: "ck-1\0evil" })).ok).toBe(false);
+  });
+
+  test("a ticket containing a bidi override is rejected", () => {
+    expect(parse(envelope({ event: "release", ticket: "ck-1‮" })).ok).toBe(false);
+  });
+
+  test("a ticket exactly '.' or '..' is rejected", () => {
+    expect(parse(envelope({ event: "release", ticket: "." })).ok).toBe(false);
+    expect(parse(envelope({ event: "release", ticket: ".." })).ok).toBe(false);
+  });
+
+  test("a ticket over 100 UTF-8 bytes is rejected", () => {
+    expect(parse(envelope({ event: "release", ticket: `ck-${"a".repeat(100)}` })).ok).toBe(false);
+  });
+
+  test("legitimate ticket ids still pass — no false-positive regression", () => {
+    for (const ticket of ["ck-a1b2c3", "ck-7f3a9c", "TASK-12", "PROJ-45", "#123"]) {
+      expect(parse(envelope({ event: "release", ticket })).ok).toBe(true);
+    }
+  });
+
+  test("documented, deliberate gap: embedded (non-whitespace-only) whitespace is still accepted, unlike ticket/filename.ts's stricter rule", () => {
+    // See the doc comment above `unsafeTicketIdShapeReason`: this is a
+    // disclosed narrowing, not an oversight — rejecting only whitespace-only
+    // (not any embedded whitespace) keeps this module strictly more
+    // permissive than `unsafeIdReason`, never stricter.
+    expect(parse(envelope({ event: "release", ticket: "ck-1 .md" })).ok).toBe(true);
+  });
+});
+
+// ============================================================================
 // Obligation 4 — ts is bounded, with an injectable `now`
 // ============================================================================
 
@@ -310,6 +366,46 @@ describe("obligation 5 — actor is an arbitrary string, not a checked identity"
 });
 
 // ============================================================================
+// Fix round 1, finding M2 / Ruling R14 — structural guard on actor/parent.
+// A NARROWER guard than ticket's: actor legitimately contains `/`.
+// ============================================================================
+
+describe("fix round 1 M2/R14 — actor/parent structural id-shape guard", () => {
+  test("an actor containing '/' is still accepted — regression guard for a real bug caught in this file's own review", () => {
+    // A first draft applied ticket's full guard (including the
+    // path-separator rule) to actor too, which rejected this exact
+    // envelope default and broke nearly every test in this file.
+    expect(parse(envelope({ event: "release", actor: "claude-code:alice/wt-auth" })).ok).toBe(true);
+    expect(parse(envelope({ event: "release", actor: "codex:ci" })).ok).toBe(true);
+  });
+
+  test("an actor containing a raw ANSI escape is rejected", () => {
+    expect(parse(envelope({ event: "release", actor: "\x1b[31malice\x1b[0m" })).ok).toBe(false);
+  });
+
+  test("an actor containing a NUL byte is rejected", () => {
+    expect(parse(envelope({ event: "release", actor: "alice\0evil" })).ok).toBe(false);
+  });
+
+  test("a whitespace-only actor is rejected", () => {
+    expect(parse(envelope({ event: "release", actor: "   " })).ok).toBe(false);
+  });
+
+  test("an actor containing a bidi override is rejected", () => {
+    expect(parse(envelope({ event: "release", actor: "alice‮" })).ok).toBe(false);
+  });
+
+  test("an actor over 200 characters is rejected", () => {
+    expect(parse(envelope({ event: "release", actor: "a".repeat(201) })).ok).toBe(false);
+  });
+
+  test("parent gets the identical guard, including the '/' regression check", () => {
+    expect(parse(envelope({ event: "release", parent: "alice/wt-auth" })).ok).toBe(true);
+    expect(parse(envelope({ event: "release", parent: "\x1b[31malice\x1b[0m" })).ok).toBe(false);
+  });
+});
+
+// ============================================================================
 // Obligation 7 — alias gets the same rigor as claim/ticket
 // ============================================================================
 
@@ -344,6 +440,53 @@ describe("obligation 7 — alias's from/to canonicalized and validated like tick
     type _assert = Expect<Equal<IsAssignable<MoveEvent["from"], AliasEvent["from"]>, false>>;
     const _typeOnly: _assert = true;
     void _typeOnly;
+  });
+});
+
+// ============================================================================
+// Fix round 1, finding M2 — alias.from/to get ticket's full structural
+// guard (reused, not re-derived — see ticketSchema's doc comment).
+// ============================================================================
+
+describe("fix round 1 M2 — alias.from/to get ticket's structural id-shape guard", () => {
+  test("a path-traversal-shaped alias.to is rejected — the exact redirect primitive obligation 7 singles out", () => {
+    const result = parse(envelope({ event: "alias", from: "TASK-12", to: "../../../../home/victim/.gitconfig" }));
+    expect(result.ok).toBe(false);
+  });
+
+  test("an alias.to containing a raw ANSI escape is rejected", () => {
+    expect(parse(envelope({ event: "alias", from: "TASK-12", to: "\x1b[2Jck-1" })).ok).toBe(false);
+  });
+
+  test("an alias.from containing a bidi override is rejected", () => {
+    expect(parse(envelope({ event: "alias", from: "task-12‮", to: "ck-1" })).ok).toBe(false);
+  });
+});
+
+// ============================================================================
+// Fix round 1, finding L6 — alias self-loop rejected, checked AFTER
+// canonicalization (a same-ticket alias that only becomes a self-loop once
+// casing is normalized must not slip through a pre-canonicalization check).
+// ============================================================================
+
+describe("fix round 1 L6 — alias self-loop rejected", () => {
+  test("an exact self-loop is rejected", () => {
+    const result = parse(envelope({ event: "alias", from: "ck-1", to: "ck-1" }));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.error.issues.some((i) => i.path === "to" && i.code === "custom")).toBe(true);
+  });
+
+  test("a self-loop that only appears after canonicalization is rejected", () => {
+    // Pre-canonicalization these differ ("CK-1" vs "ck-1"); a naive check
+    // run before the transform would miss this.
+    const result = parse(envelope({ event: "alias", from: "CK-1", to: "ck-1" }));
+    expect(result.ok).toBe(false);
+  });
+
+  test("a genuine (non-self-loop) alias still parses", () => {
+    const result = parse(envelope({ event: "alias", from: "TASK-12", to: "ck-7f3a9c" }));
+    expect(result.ok).toBe(true);
   });
 });
 

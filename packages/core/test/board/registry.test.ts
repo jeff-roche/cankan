@@ -263,8 +263,15 @@ describe("registry -- stale lock breaking", () => {
   });
 });
 
-describe("registry -- N3: a stale lock stolen mid-break is restored via link, never rename", () => {
-  test("a fresh lock stolen by a naive stale-break is put back as a FIFO (proving link, not rename) and leaves no orphaned .stale-* file", async () => {
+describe("registry -- N3: a stale lock stolen mid-break is restored, preserving identity", () => {
+  test("a fresh lock stolen by a naive stale-break is put back (preserving its FIFO identity) and leaves no orphaned .stale-* file", async () => {
+    // Note: this test alone does not discriminate `link` from `rename` --
+    // with no third actor contending for `lockPath` at the restoration
+    // instant, either primitive would produce the same observable result
+    // (a FIFO back at `lockPath`, no leftovers). It proves restoration
+    // *happens* and preserves the original file's identity. The next
+    // test ("never clobbers a third actor's lock") is what actually
+    // proves `link` over `rename` -- see its own comment for why.
     await withEnv(undefined, async () => {
       const env = hermeticEnv();
       const registryPath = resolveRegistryPath(env);
@@ -306,9 +313,9 @@ describe("registry -- N3: a stale lock stolen mid-break is restored via link, ne
         const w2 = spawnFifoWriter(stalePath1, "FRESH-TOKEN");
         await w2.exited;
 
-        // The mismatch must restore `lockPath` -- and restore it as a
-        // FIFO, which is only possible via `link` (a plain `open(path,
-        // "wx")` would create a brand-new *regular* file, never a FIFO).
+        // The mismatch must restore `lockPath`, and the restored file
+        // must still be the original FIFO (not a new regular file some
+        // other code path invented).
         await waitForPath(lockPath);
         await sleep(50); // let the restore's own unlink(stalePath) settle
         const restored = await lstat(lockPath);
@@ -338,6 +345,83 @@ describe("registry -- N3: a stale lock stolen mid-break is restored via link, ne
         const finalContents = await readdir(lockDir);
         expect(finalContents.some((f) => f.includes(".stale-"))).toBe(false);
         expect(finalContents.some((f) => f === lockBasename)).toBe(false);
+      } finally {
+        await board.cleanup();
+        await unlink(lockPath).catch(() => {});
+      }
+    });
+  }, 15000);
+
+  test("restoring a stolen lock never clobbers a fourth process's legitimate, freshly-acquired lock (this is what actually proves link over rename)", async () => {
+    // This is the test that discriminates `link(stalePath, lockPath)`
+    // from `rename(stalePath, lockPath)`. The previous test has no third
+    // party occupying `lockPath` at the moment of restoration, so
+    // `rename` -- which unconditionally overwrites its destination --
+    // would pass it identically to `link` -- which fails `EEXIST` if the
+    // destination is occupied. Verified directly: swapping `link` for
+    // `rename` in `withRegistryLock` made this test fail (the fourth
+    // process's lock was destroyed and replaced by the restored FIFO)
+    // while leaving the previous test green -- see the fix report for
+    // the exact before/after.
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const registryPath = resolveRegistryPath(env);
+      if (!registryPath) throw new Error("test setup: registry path did not resolve");
+      await mkdir(join(registryPath, ".."), { recursive: true });
+
+      const lockPath = `${registryPath}.lock`;
+      const lockDir = dirname(lockPath);
+      const lockBasename = basename(lockPath);
+      mkfifo(lockPath);
+      const initiallyStale = new Date(Date.now() - 30_000);
+      await utimes(lockPath, initiallyStale, initiallyStale);
+
+      const board = await makeBoardDir();
+      try {
+        const registerPromise = register("fifo-race-4th", board.dir, env);
+        registerPromise.catch(() => {});
+
+        // Round 1, identical setup to the previous test: get `lockPath`
+        // (the FIFO) renamed away to `stalePath` by feeding an
+        // old/stale token.
+        const w1 = spawnFifoWriter(lockPath, "OLD-TOKEN", 300);
+        await sleep(100);
+        await utimes(lockPath, new Date(Date.now() - 30_000), new Date(Date.now() - 30_000));
+        await w1.exited;
+
+        const stalePath = await waitForGlobMatch(lockDir, `${lockBasename}.stale-`);
+
+        // `lockPath` is free now (the FIFO was renamed away). Occupy it
+        // with a plain regular file -- standing in for a fourth process
+        // that legitimately acquired the lock in the gap between the
+        // staleness check and the rename. `withRegistryLock`'s pending
+        // read of `stalePath` (below) is what makes this timing safe:
+        // nothing else touches `lockPath` until that read resolves and
+        // the mismatch-restore logic runs.
+        await writeFile(lockPath, "FOURTH-PROCESS-TOKEN");
+
+        // Feed a token that mismatches "OLD-TOKEN" so the restore branch
+        // fires and attempts to give the (still-FIFO) stale copy back.
+        const w2 = spawnFifoWriter(stalePath, "FRESH-TOKEN");
+        await w2.exited;
+
+        // Give the mismatch-restore logic a moment to run: `link` must
+        // fail `EEXIST` against our occupant, be swallowed, and fall
+        // through to `unlink(stalePath)`.
+        await sleep(150);
+
+        const survivor = await lstat(lockPath);
+        expect(survivor.isFIFO()).toBe(false);
+        expect(await readFile(lockPath, "utf8")).toBe("FOURTH-PROCESS-TOKEN");
+        const leftovers = (await readdir(lockDir)).filter((f) => f.startsWith(`${lockBasename}.stale-`));
+        expect(leftovers).toEqual([]);
+
+        // Clean up the stand-in "fourth process" lock (simulating it
+        // releasing normally) so `register()`'s still-in-flight attempt
+        // can acquire for real and this test terminates deterministically.
+        await unlink(lockPath).catch(() => {});
+        const entry = await registerPromise;
+        expect((entry as { name: string }).name).toBe("fifo-race-4th");
       } finally {
         await board.cleanup();
         await unlink(lockPath).catch(() => {});

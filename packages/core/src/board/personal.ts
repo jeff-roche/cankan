@@ -148,8 +148,21 @@ export async function ensurePersonalBoard(
   try {
     await mkdir(rawPath, { mode: 0o700 });
   } catch (err) {
-    if (!isEExist(err)) throw err;
-    created = false;
+    if (isEExist(err)) {
+      created = false;
+    } else {
+      // A raw platform error here (`EACCES` on `dirname(rawPath)`, most
+      // commonly) must not escape untyped -- the same discipline this
+      // module already applies elsewhere (`TICKETS_DIR_INVALID`,
+      // `CWD_UNRESOLVABLE`, the internal lock-loss exception in
+      // `registry.ts`); an untyped error is invisible to
+      // `isCanKanError`/M3.10's exit-code map.
+      throw new CanKanError(
+        BoardErrorCodes.PERSONAL_BOARD_UNAVAILABLE,
+        `could not create the personal board directory: ${rawPath}`,
+        { cause: err, details: { path: rawPath } },
+      );
+    }
   }
 
   // F10: the personal board's `.cankan/` directory. `mkdir(recursive)` is

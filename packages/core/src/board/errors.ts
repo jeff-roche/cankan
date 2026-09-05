@@ -117,4 +117,15 @@ export const BoardErrorCodes = {
    * the ref) -- both caught in `resolve.ts` instead, after building.
    */
   REGISTERED_BOARD_IS_PERSONAL: "REGISTERED_BOARD_IS_PERSONAL",
+  /**
+   * `ensurePersonalBoard()` could not create the personal board's root
+   * directory (a filesystem error other than "it already exists" --
+   * `EACCES` on its parent, most commonly). Wrapped rather than left to
+   * escape as a raw platform error, the same discipline this module
+   * already applies to `TICKETS_DIR_INVALID` (`ref.ts`), the internal
+   * lock-loss exception (`registry.ts`), and `CWD_UNRESOLVABLE`
+   * (`resolve.ts`) -- an untyped error here would be invisible to
+   * `isCanKanError`/M3.10's exit-code map.
+   */
+  PERSONAL_BOARD_UNAVAILABLE: "PERSONAL_BOARD_UNAVAILABLE",
 } as const;

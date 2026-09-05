@@ -1,9 +1,10 @@
-import { mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { withEnv } from "../../../test-utils/src/withEnv";
 import { ensurePersonalBoard, resolvePersonalBoardPath } from "../../src/board/personal";
+import { isCanKanError } from "../../src/errors";
 import { hermeticEnv } from "../config/testHelpers";
 
 describe("resolvePersonalBoardPath -- XDG resolution (mirrors config/layers.ts's XDG_CONFIG_HOME rule)", () => {
@@ -109,6 +110,38 @@ describe("ensurePersonalBoard -- lazy, idempotent creation", () => {
       const result = await ensurePersonalBoard({ env: hermeticEnv() });
       const stats = await stat(result.board.ticketsDir);
       expect(stats.isDirectory()).toBe(true);
+    });
+  });
+
+  // Dispatch B, fix round 3, F12 (security review): a raw platform error
+  // creating the board root (EACCES on its parent, most commonly) used to
+  // escape untyped -- invisible to isCanKanError/M3.10's exit-code map,
+  // the same class of gap this module has now closed three other times
+  // (TICKETS_DIR_INVALID, the internal lock-loss exception, CWD_UNRESOLVABLE).
+  // Reproduced with a real, empirically-produced EACCES (chmod the parent
+  // read-only) rather than asserted from reasoning alone.
+  test("F12: a real EACCES creating the board root is wrapped as a typed PERSONAL_BOARD_UNAVAILABLE, never left raw", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const rawPath = resolvePersonalBoardPath(env);
+      if (!rawPath) throw new Error("test setup: personal board path did not resolve");
+      const parent = dirname(rawPath);
+      await mkdir(parent, { recursive: true });
+      await chmod(parent, 0o555); // read + execute, no write: mkdir(rawPath) inside it fails EACCES
+      try {
+        let thrown: unknown;
+        try {
+          await ensurePersonalBoard({ env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("PERSONAL_BOARD_UNAVAILABLE");
+      } finally {
+        // Restore write permission before withEnv()'s own cleanup removes
+        // the temp home tree.
+        await chmod(parent, 0o700);
+      }
     });
   });
 });

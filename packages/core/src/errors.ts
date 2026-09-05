@@ -32,11 +32,29 @@ export const ErrorCodes = {
  *
  * `details` is an open, caller-supplied structured bag — e.g. M2.3's
  * `POLICY_VIOLATION` names the pinning file, M2.10's rejection names the
- * holder. It is not pre-sanitised for display; callers that surface it in
- * CLI output are responsible for that.
+ * holder.
+ *
+ * **`details` is published by default — treat it as user-visible output, not
+ * as a debugging scratchpad.** Unlike `message`, `cause` and `stack`, which
+ * are non-enumerable, `details` is an own enumerable property: both
+ * `JSON.stringify(error)` (the shape `--json` output naturally reaches for)
+ * and the terminal's uncaught-error printer emit it without anyone opting
+ * in. So put in it only values that are safe to show the user who ran the
+ * command — a config file path they already know, the actor name holding a
+ * claim, a config key. Never credentials, tokens, environment values, a
+ * backer's HTTP response body, or text copied out of `cause.message`, which
+ * may carry any of those.
  */
 export interface CanKanErrorOptions {
   cause?: unknown;
+  details?: Readonly<Record<string, unknown>>;
+}
+
+/** The serialized form of a `CanKanError` — see `CanKanError.toJSON`. */
+export interface SerializedCanKanError {
+  name: string;
+  code: string;
+  message: string;
   details?: Readonly<Record<string, unknown>>;
 }
 
@@ -47,6 +65,10 @@ export interface CanKanErrorOptions {
  * comment. `cause` is the native ES2022 `Error.cause` (this repo's
  * `tsconfig.base.json` sets `"lib": ["ES2022"]`), passed through via
  * `super(message, { cause })`; there is no separate `cause` property here.
+ *
+ * `details` is copied and frozen on construction, so a caller that mutates
+ * the object it passed in cannot change an already-thrown error. Read the
+ * exposure warning on `CanKanErrorOptions` before putting anything in it.
  */
 export class CanKanError extends Error {
   readonly code: string;
@@ -54,21 +76,49 @@ export class CanKanError extends Error {
 
   constructor(code: string, message: string, options: CanKanErrorOptions = {}) {
     super(message, "cause" in options ? { cause: options.cause } : undefined);
-    this.name = "CanKanError";
+    // `new.target.name` so a subclass reports its own name rather than
+    // inheriting "CanKanError"; identical for direct construction.
+    this.name = new.target.name;
     this.code = code;
-    this.details = options.details;
+    this.details = options.details
+      ? Object.freeze({ ...options.details })
+      : undefined;
+  }
+
+  /**
+   * The serialized form, so `JSON.stringify` is deliberate rather than
+   * whatever the enumerable properties happen to be.
+   *
+   * Without this, `JSON.stringify(error)` drops `message` (it is
+   * non-enumerable on `Error`) while still publishing `details` — a shape
+   * that is both wrong for M3.10's `--json` renderer and quietly leakier
+   * than it looks. `cause` and `stack` are deliberately excluded: a cause
+   * chain routinely carries filesystem and HTTP internals that no user
+   * asked to see.
+   */
+  toJSON(): SerializedCanKanError {
+    return {
+      name: this.name,
+      code: this.code,
+      message: this.message,
+      ...(this.details === undefined ? {} : { details: this.details }),
+    };
   }
 }
 
 /**
  * Type guard distinguishing `CanKanError` from a plain `Error` (or anything
- * else). Implemented as a plain `instanceof` check: this is a bun workspace
- * with a single resolution of `@jeff-roche/cankan-core` (bun resolves the
- * `node_modules/@jeff-roche/cankan-core` symlink to one real module), so
- * there is no duplicated-module-instance hazard that would make
- * `instanceof` unreliable here. A `Symbol.for` brand fallback would add
- * complexity with no correctness benefit in this environment.
+ * else). Implemented as an `instanceof` check: each consumer's
+ * `node_modules/@jeff-roche/cankan-core` is a per-package symlink that bun
+ * resolves to the single `packages/core` directory, so there is no
+ * duplicated-module-instance hazard that would make `instanceof` unreliable
+ * here. A `Symbol.for` brand fallback would add complexity with no
+ * correctness benefit in this environment.
+ *
+ * The `code` check is not redundant: `Object.create(CanKanError.prototype)`
+ * satisfies `instanceof` while leaving `code` undefined, and a caller that
+ * has narrowed with this guard is entitled to a `code` that is really there.
  */
 export function isCanKanError(e: unknown): e is CanKanError {
-  return e instanceof CanKanError;
+  return e instanceof CanKanError && typeof e.code === "string";
 }

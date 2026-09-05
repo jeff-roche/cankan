@@ -114,7 +114,17 @@ async function expectCanKanError(
 }
 
 // ---------------------------------------------------------------------------
-// parseActor / formatActor -- the grammar (R-9).
+// parseActor / formatActor -- the grammar (R-9, as amended by R-11).
+//
+// R-11 (fix round 1): the `name` segment may contain an internal `U+0020`
+// space, unconditionally -- probing `tryParseActor` against
+// `makeTempRepo()`'s real fixture (`"CanKan Test"`) proved R-9's original
+// "no whitespace anywhere" made CONCEPT.md's own documented default
+// (`actor` "defaults to git user.name", conventionally "Firstname
+// Lastname") unrepresentable. `tool`/`context` still reject all whitespace;
+// every non-U+0020 whitespace character and every Unicode control/format
+// character is still rejected everywhere (log-injection / attribution-
+// spoofing concerns -- see `resolve.ts`'s file comment above the grammar).
 // ---------------------------------------------------------------------------
 
 describe("parseActor — valid grammar, and the parse -> format -> parse round trip", () => {
@@ -122,6 +132,13 @@ describe("parseActor — valid grammar, and the parse -> format -> parse round t
     ["alice", { tool: null, name: "alice", context: null }],
     ["claude-code:alice/worktree-auth", { tool: "claude-code", name: "alice", context: "worktree-auth" }],
     ["codex:ci", { tool: "codex", name: "ci", context: null }],
+    // R-11: a `name` segment may contain an internal space.
+    ["CanKan Test", { tool: null, name: "CanKan Test", context: null }],
+    ["Jeff Roche", { tool: null, name: "Jeff Roche", context: null }],
+    [
+      "claude-code:Jeff Roche/wt-auth",
+      { tool: "claude-code", name: "Jeff Roche", context: "wt-auth" },
+    ],
   ] satisfies [string, Actor][])("parseActor(%j)", (raw, expected) => {
     expect(parseActor(raw)).toEqual(expected);
   });
@@ -130,6 +147,9 @@ describe("parseActor — valid grammar, and the parse -> format -> parse round t
     "alice",
     "claude-code:alice/worktree-auth",
     "codex:ci",
+    "CanKan Test",
+    "Jeff Roche",
+    "claude-code:Jeff Roche/wt-auth",
   ])("round trips through formatActor: %j", (raw) => {
     const once = parseActor(raw);
     const formatted = formatActor(once);
@@ -138,7 +158,7 @@ describe("parseActor — valid grammar, and the parse -> format -> parse round t
   });
 });
 
-describe("parseActor — malformed inputs, probed against the real parser (brief §5)", () => {
+describe("parseActor — malformed inputs, probed against the real parser (brief §5, extended by R-11)", () => {
   // Each row was run through the actual parser first (see the implementer
   // report) rather than reasoned about; the expected-reason substring below
   // is what the parser actually reports, including the two rows where more
@@ -164,6 +184,17 @@ describe("parseActor — malformed inputs, probed against the real parser (brief
     ["a\tb", "name segment"],
     ["a\nb", "name segment"],
     ["a\x01b", "name segment"],
+    // R-11 additions -- every whitespace character other than a plain
+    // space, and every Unicode control/format character, stays rejected;
+    // `tool`/`context` reject a plain space too; leading/trailing
+    // whitespace stays malformed per segment, not only on the whole value.
+    ["a\rb", "name segment"],
+    ["a\u00a0b", "name segment"], // NBSP
+    ["a\u200db", "name segment"], // zero-width joiner (\p{Cf})
+    ["a\u202eb", "name segment"], // right-to-left override (\p{Cf})
+    ["claude code:alice", "tool segment"],
+    ["claude-code:alice/wt auth", "context segment"],
+    ["claude-code: alice", "name segment"], // leading space on `name` alone
   ])("parseActor(%j) throws ACTOR_INVALID: %s", (raw, reasonSubstring) => {
     expect(() => parseActor(raw)).toThrow();
     try {
@@ -479,7 +510,10 @@ describe("resolveActor — a malformed value at a rung is an error naming that r
       const { root, cleanup } = await makeTempRepoRoot();
       try {
         const config = await buildConfig({ root });
-        const stub = gitStub("alice bob"); // whitespace -- malformed per R-9
+        // R-11: an internal space alone is no longer malformed (a bare
+        // human `name` may contain one) -- a tab is still rejected
+        // everywhere, so it still exercises this rung's error naming.
+        const stub = gitStub("alice\tbob");
         const details = await expectCanKanError(
           () => resolveActor({ config, gitUserName: stub.fn }),
           ActorErrorCodes.ACTOR_INVALID,
@@ -491,24 +525,21 @@ describe("resolveActor — a malformed value at a rung is an error naming that r
     });
   });
 
-  test("FINDING — real git repo: makeTempRepo()'s default user.name ('CanKan Test') is malformed under R-9's grammar (embedded space)", async () => {
-    // This is the probed surprise the brief's §3 asks for, not smoothed
-    // over: R-9 bans whitespace in every segment, applied uniformly (R-5)
-    // to every rung including 'git'. `makeTempRepo()` sets a real,
-    // ordinary-looking `user.name` of "CanKan Test" -- exactly the shape
-    // most real git installations use (a first + last name) -- and it
-    // fails the actor grammar. See the implementer report for the two
-    // readings this leaves open for the controller.
+  test("real git repo: makeTempRepo()'s default user.name ('CanKan Test') resolves successfully via the git rung (R-11)", async () => {
+    // Fix round 1: this was originally a "FINDING" test asserting
+    // ACTOR_INVALID -- R-9's original "no whitespace anywhere" made
+    // CONCEPT.md's own documented default ("defaults to git user.name",
+    // conventionally "Firstname Lastname") unrepresentable, proven by this
+    // exact fixture. R-11 relaxed the `name` segment to allow an internal
+    // space, so this real end-to-end path now succeeds.
     await withEnv(undefined, async () => {
       const repo = await makeTempRepo();
       try {
         const config = await buildConfig({ root: repo.dir });
-        const details = await expectCanKanError(
-          () => resolveActor({ config, gitUserName: realGitUserNameThunk(repo.dir) }),
-          ActorErrorCodes.ACTOR_INVALID,
-        );
-        expect(details?.rung).toBe("git");
-        expect(String(details?.reason)).toContain("name segment");
+        const result = await resolveActor({ config, gitUserName: realGitUserNameThunk(repo.dir) });
+        expect(result.source).toBe("git");
+        expect(result.actor).toEqual({ tool: null, name: "CanKan Test", context: null });
+        expect(result.id as string).toBe("CanKan Test");
       } finally {
         await repo.cleanup();
       }
@@ -611,21 +642,20 @@ describe("resolveActor — parent derivation (R-10)", () => {
     });
   });
 
-  test("FINDING — real git repo: parent-from-git also fails on the default 'CanKan Test' user.name", async () => {
-    // Compounds the actor-rung finding above: with a real repo's default
-    // git config, a tool actor whose parent falls through to `git` gets
-    // ACTOR_INVALID, not a null parent -- even though R-10 explicitly says
-    // an *absent* parent must not be an error.
+  test("real git repo: parent-from-git also succeeds on the default 'CanKan Test' user.name (R-11)", async () => {
+    // Fix round 1: this was originally a "FINDING" test asserting
+    // ACTOR_INVALID for the exact reason the actor-rung finding gave --
+    // R-11's fix for `name` applies equally to a bare-name `parent`
+    // (`requireBareName` reuses the same grammar), so this real repo's
+    // default `user.name` now resolves as `parent` too, with no override
+    // needed to make the seam succeed.
     await withEnv(undefined, async () => {
       const repo = await makeTempRepo();
       try {
         const config = await buildConfig({ root: repo.dir, localActor: "codex:ci" });
-        const details = await expectCanKanError(
-          () => resolveActor({ config, gitUserName: realGitUserNameThunk(repo.dir) }),
-          ActorErrorCodes.ACTOR_INVALID,
-        );
-        expect(details?.field).toBe("parent");
-        expect(details?.source).toBe("git");
+        const result = await resolveActor({ config, gitUserName: realGitUserNameThunk(repo.dir) });
+        expect(result.parent as string | null).toBe("CanKan Test");
+        expect(result.parentSource).toBe("git");
       } finally {
         await repo.cleanup();
       }

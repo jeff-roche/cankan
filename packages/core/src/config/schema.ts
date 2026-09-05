@@ -266,15 +266,34 @@ const readySchema = z.strictObject({
  * board-root knowledge to do here. Rejects: absolute paths, any `..`
  * segment, empty, and NUL/control characters. `AGENTS.md` and
  * `docs/AGENTS.md` stay legal.
+ *
+ * **Also rejects any backslash and any drive-letter prefix** (`C:`, `d:`,
+ * `[A-Za-z]:` at position 0), found in a later review round: PLAN.md 442
+ * ships a `win-x64` `bun build --compile` target, so `C:\Users\victim\...`,
+ * `..\..\secret`, `\\server\share\file`, and a drive-relative `C:relative.md`
+ * are all real write-target escapes on that platform, not just POSIX `../`
+ * ones. This is checked **unconditionally, not via `process.platform`**: a
+ * `.cankan/config.yml` is checked in and shared by a whole team, so the same
+ * file must validate the same way on every contributor's machine — making
+ * this platform-conditional would let a value pass on Linux and fail on
+ * Windows (or vice versa), so CI and a Windows developer would disagree
+ * about whether the repo is well-formed. Rejecting backslash is a
+ * deliberate, very slight over-restriction on POSIX (which technically
+ * allows `\` as an ordinary filename character): a backslash inside a value
+ * naming a documentation file (`AGENTS.md`, `docs/AGENTS.md`) is far more
+ * likely to be a Windows path than a genuine filename, and the failure mode
+ * of accepting it is an arbitrary write target.
  */
 const AGENTS_INSTRUCTIONS_FILE_ISSUE =
-  'agents.instructions_file must be a relative path with no ".." segment, no leading "/", and no control characters';
+  'agents.instructions_file must be a relative path with no ".." segment, no leading "/" or drive letter, no backslash, and no control characters';
+
+const DRIVE_LETTER_PREFIX = /^[A-Za-z]:/;
 
 function isSafeRelativeFilePath(value: string): boolean {
   if (value.length === 0) {
     return false;
   }
-  if (value.startsWith("/")) {
+  if (value.startsWith("/") || value.includes("\\") || DRIVE_LETTER_PREFIX.test(value)) {
     return false;
   }
   for (let i = 0; i < value.length; i++) {

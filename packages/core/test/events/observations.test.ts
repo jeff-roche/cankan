@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, readdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { ulid } from "ulid";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -10,6 +10,8 @@ import {
   boardKeyFor,
   discard,
   firstSeen,
+  HARD_LINK_UNSUPPORTED_CODES,
+  hardLinkUnsupportedError,
   observe,
   recordPath,
   resolveStateDir,
@@ -464,20 +466,52 @@ describe("unwritable store is a typed hard error (required test 5)", () => {
     // file or symlink inside it. `mode: 0o700` is unaffected by `umask`
     // (also probed directly), so this must hold regardless of the
     // running process's own umask.
-    await withEnv(undefined, async () => {
-      const eventId = ulid() as EventId;
-      await observe("board-mode", eventId, { now: 1 });
+    //
+    // **Fix round 2, L4**: this test previously relied on the *ambient*
+    // umask of whatever machine ran the suite, rather than setting one --
+    // which meant it would pass even with the `mode: 0o700` guard deleted,
+    // on any machine whose ambient umask happened to already mask a
+    // default `0777` mkdir down to `0700` on its own (e.g. `umask 077`:
+    // `0777 & ~077 = 0700`, coincidentally identical to what this guard
+    // produces deliberately). Confirmed directly at the time: with the
+    // guard deleted, this test failed under `umask 022` but *passed* under
+    // `umask 077`, for the wrong reason. `process.umask(0o000)` -- the
+    // most permissive possible -- removes the ambient-umask dependency.
+    //
+    // **This test now verifies the end state, not one specific mechanism**
+    // -- disclosed honestly after fix round 2 added `ensurePrivateDir`'s
+    // ownership/mode check (Ruling R37): that check `chmod`s *any*
+    // directory back to `0o700` on every call, regardless of what `mkdir`
+    // created it as, so re-running this exact deletion today (removing
+    // only `mode: 0o700` from the `mkdir` call, leaving the `chmod` step
+    // in place) no longer fails it -- confirmed directly. What deleting
+    // *does* still fail is the `mkdir` call's doc comment's own claim: see
+    // that comment for the narrow, deliberately-untested atomicity benefit
+    // `mode: 0o700` still provides alone (closing a single-syscall window
+    // before the `chmod` step runs). This test's own guarantee -- the
+    // store never ends up world-writable after a call completes -- is
+    // still correctly and non-decoratively covered, just by more than one
+    // mechanism now, the same way `lstatPlainFileOrNull` and `O_NOFOLLOW`
+    // overlap for a symlinked record.
+    const previousUmask = process.umask(0o000);
+    try {
+      await withEnv(undefined, async () => {
+        const eventId = ulid() as EventId;
+        await observe("board-mode", eventId, { now: 1 });
 
-      const path = recordPath("board-mode", eventId);
-      const boardHashDir = dirname(path);
-      const observationsDir = dirname(boardHashDir);
-      const cankanDir = dirname(observationsDir);
+        const path = recordPath("board-mode", eventId);
+        const boardHashDir = dirname(path);
+        const observationsDir = dirname(boardHashDir);
+        const cankanDir = dirname(observationsDir);
 
-      for (const dir of [cankanDir, observationsDir, boardHashDir]) {
-        const stat = await lstat(dir);
-        expect(stat.mode & 0o777).toBe(0o700);
-      }
-    });
+        for (const dir of [cankanDir, observationsDir, boardHashDir]) {
+          const stat = await lstat(dir);
+          expect(stat.mode & 0o777).toBe(0o700);
+        }
+      });
+    } finally {
+      process.umask(previousUmask);
+    }
   });
 });
 
@@ -580,6 +614,339 @@ describe("Fix round 1, High S1 -- a planted symlink is refused, never followed o
     },
     3000,
   );
+});
+
+describe("Fix round 2, High H1 -- firstSeen() had no directory check at all", () => {
+  test("firstSeen() refuses when observations/ itself is a symlink to another directory", async () => {
+    await withEnv(undefined, async () => {
+      const home = process.env.HOME as string;
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-h1-observations-firstseen", eventId);
+      const boardHashDir = dirname(path);
+      const observationsDir = dirname(boardHashDir);
+      const cankanDir = dirname(observationsDir);
+      await mkdir(cankanDir, { recursive: true, mode: 0o700 });
+
+      const attackerTarget = join(home, "attacker-target-observations-firstseen");
+      await mkdir(attackerTarget, { recursive: true });
+      await symlink(attackerTarget, observationsDir);
+
+      await expectCode(
+        firstSeen("board-h1-observations-firstseen", eventId),
+        EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+      );
+      expect(await listFilesRecursive(attackerTarget)).toEqual([]);
+    });
+  });
+
+  test("observe() refuses when observations/ itself is a symlink to another directory (not only <boardhash>)", async () => {
+    await withEnv(undefined, async () => {
+      const home = process.env.HOME as string;
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-h1-observations-observe", eventId);
+      const boardHashDir = dirname(path);
+      const observationsDir = dirname(boardHashDir);
+      const cankanDir = dirname(observationsDir);
+      await mkdir(cankanDir, { recursive: true, mode: 0o700 });
+
+      const attackerTarget = join(home, "attacker-target-observations-observe");
+      await mkdir(attackerTarget, { recursive: true });
+      await symlink(attackerTarget, observationsDir);
+
+      await expectCode(
+        observe("board-h1-observations-observe", eventId, { now: 1 }),
+        EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+      );
+      expect(await listFilesRecursive(attackerTarget)).toEqual([]);
+    });
+  });
+
+  test("firstSeen() refuses when <boardhash> is a symlink (fix round 1 only closed this in observe())", async () => {
+    await withEnv(undefined, async () => {
+      const home = process.env.HOME as string;
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-h1-boardhash-firstseen", eventId);
+      const boardHashDir = dirname(path);
+      const observationsDir = dirname(boardHashDir);
+      await mkdir(observationsDir, { recursive: true, mode: 0o700 });
+
+      const attackerTarget = join(home, "attacker-target-boardhash-firstseen");
+      await mkdir(attackerTarget, { recursive: true });
+      // A fabricated ancient value -- if `firstSeen()` resolved through
+      // the symlink (the exact H1 gap: no directory check at all), M2.10
+      // would see this claim as ancient and expire a live lease.
+      await writeFile(join(attackerTarget, sha256Hex(eventId)), JSON.stringify({ firstSeenAtMs: 1 }), "utf8");
+      await symlink(attackerTarget, boardHashDir);
+
+      await expectCode(
+        firstSeen("board-h1-boardhash-firstseen", eventId),
+        EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+      );
+    });
+  });
+});
+
+describe("Fix round 2, Medium M1 -- ownership, not shape, is the property that matters", () => {
+  // This sandbox has no second real user account and no root, so the
+  // "attacker owns a genuine directory" scenario is reproduced by
+  // monkey-patching `process.getuid` for the duration of one call --
+  // making *this* process's own uid check see a mismatch against a
+  // directory it itself legitimately created and owns. This exercises the
+  // exact `stat.uid !== uid` branch deterministically; it does not (and,
+  // without a second uid available, cannot) prove a *different real user*
+  // is also refused -- that half rests on `lstat`'s `uid` field being the
+  // filesystem's own ownership record, which is not this module's code to
+  // verify.
+  function withFakeUid<T>(fakeUid: number, fn: () => Promise<T>): Promise<T> {
+    const real = process.getuid;
+    if (!real) {
+      throw new Error("process.getuid is unavailable -- this suite assumes POSIX");
+    }
+    process.getuid = () => fakeUid;
+    return fn().finally(() => {
+      process.getuid = real;
+    });
+  }
+
+  test("observe() refuses a <boardhash> directory whose recorded owner does not match the current (simulated) user", async () => {
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-m1-observe", eventId);
+      const boardHashDir = dirname(path);
+      await mkdir(boardHashDir, { recursive: true, mode: 0o700 });
+
+      const realUid = process.getuid?.() ?? 0;
+      await withFakeUid(realUid + 1, () =>
+        expectCode(
+          observe("board-m1-observe", eventId, { now: 1 }),
+          EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+        ),
+      );
+    });
+  });
+
+  test("firstSeen() refuses the M1 scenario exactly: a real directory, containing a plain file at the correctly-hashed record name, that the current user does not own -- every fix round 1 shape check is satisfied and only the ownership check catches it", async () => {
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-m1-firstseen", eventId);
+      const boardHashDir = dirname(path);
+      await mkdir(boardHashDir, { recursive: true, mode: 0o700 });
+      // A well-formed, honestly-shaped record -- not a symlink, not a
+      // corrupt file, not a FIFO. Every fix round 1 guard would accept
+      // this outright.
+      await writeFile(path, JSON.stringify({ firstSeenAtMs: 1 }), "utf8");
+
+      const realUid = process.getuid?.() ?? 0;
+      await withFakeUid(realUid + 1, () =>
+        expectCode(
+          firstSeen("board-m1-firstseen", eventId),
+          EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+        ),
+      );
+    });
+  });
+
+  test("a legacy directory this user owns but with group/other permission bits set is tightened to 0700 rather than trusted or rejected", async () => {
+    // The field consequence the orchestrator named: `mkdir` never chmods
+    // an *existing* directory, so a store created by the pre-fix-round-2
+    // build under a permissive umask stayed world-writable forever, and
+    // the fix round 1 `observe()` wrote into it happily. `ensurePrivateDir`
+    // must repair this in place, for a directory this user *does* own
+    // (the failure mode being guarded against is another user writing into
+    // it, which `chmod` fully remedies) -- not merely refuse it.
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-m1-legacy-perms", eventId);
+      const boardHashDir = dirname(path);
+      const observationsDir = dirname(boardHashDir);
+      const cankanDir = dirname(observationsDir);
+
+      const previousUmask = process.umask(0o000);
+      try {
+        await mkdir(boardHashDir, { recursive: true }); // no mode -- 0777 under umask 000
+      } finally {
+        process.umask(previousUmask);
+      }
+      for (const dir of [cankanDir, observationsDir, boardHashDir]) {
+        expect((await lstat(dir)).mode & 0o777).toBe(0o777);
+      }
+
+      const recorded = await observe("board-m1-legacy-perms", eventId, { now: 2 });
+      expect(recorded).toBe(2);
+
+      for (const dir of [cankanDir, observationsDir, boardHashDir]) {
+        expect((await lstat(dir)).mode & 0o777).toBe(0o700);
+      }
+    });
+  });
+});
+
+describe("Fix round 2, L1 -- tryPlaceAtomically's temp file does not leak when write() fails after open() already created it", () => {
+  test("a write failure past O_CREAT|O_EXCL (EFBIG, reproduced via a real ulimit -f) leaves no stray temp file behind", async () => {
+    // `writeFile(..., { flag: "wx" })` is `open()` (which creates the
+    // entry via O_CREAT|O_EXCL) then `write()` -- the two can fail
+    // independently. This process' own resource limits can't be lowered
+    // mid-run from JS, so this spawns a real child process with a
+    // tightened `ulimit -f`, mirroring the review's own reproduction.
+    const dir = await mkdtemp(join(tmpdir(), "cankan-l1-probe-"));
+    try {
+      const modulePath = new URL("../../src/events/observations.ts", import.meta.url).pathname;
+      const targetPath = join(dir, "target");
+      const scriptPath = join(dir, "probe.ts");
+      await writeFile(
+        scriptPath,
+        [
+          `import { tryPlaceAtomically } from ${JSON.stringify(modulePath)};`,
+          `const target = ${JSON.stringify(targetPath)};`,
+          // Comfortably larger than the 1-block (512-byte) `ulimit -f 1`
+          // set below, so the write's own EFBIG is what's exercised, not
+          // an incidental startup write of bun's own.
+          `const payload = "x".repeat(5000);`,
+          "tryPlaceAtomically(target, payload).then(",
+          '  () => { console.log("RESULT:unexpected-success"); },',
+          '  (err) => { console.log("RESULT:error", err && err.code); },',
+          ");",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = Bun.spawnSync(["bash", "-c", `ulimit -f 1; bun run ${scriptPath}`], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const stdout = result.stdout.toString();
+
+      expect(stdout).toContain("RESULT:error");
+      expect(stdout).not.toContain("unexpected-success");
+
+      // The temp file `tryPlaceAtomically` created via `O_CREAT|O_EXCL`
+      // before its `write()` half failed must not still be there --
+      // `probe.ts` is the only file this directory should contain
+      // afterward.
+      const remaining = (await readdir(dir)).sort();
+      expect(remaining).toEqual(["probe.ts"]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Fix round 2, L2 -- the retry loop tolerates a record vanishing between lstat and read, not only between link and lstat", () => {
+  test("observe() retries (rather than hard-erroring) when discard() races the read step of the self-heal loop", async () => {
+    // Reproduces the narrower window one syscall later than the existing
+    // "occupant vanished" retry: place a corrupt record, then delete it
+    // (simulating a concurrent `discard()`) exactly between the `lstat`
+    // that confirms it's a plain file and the `read` that would have
+    // consumed it -- by deleting it from a queued microtask that runs
+    // after `lstatPlainFileOrNull` resolves but before the subsequent
+    // `readPlainFile` call's own `open()` completes. Timing an exact
+    // interleave from outside `observe()` isn't available through the
+    // public API, so this test instead directly exercises the retry
+    // loop's *outcome* property: even a record that keeps vanishing and
+    // reappearing as corrupt eventually converges on `observe()` returning
+    // a value, never a raw ENOENT-derived hard error, across many trials
+    // -- consistent with the loop treating a vanished record as "retry,"
+    // not "fail."
+    await withEnv(undefined, async () => {
+      for (let trial = 0; trial < 20; trial++) {
+        const eventId = ulid() as EventId;
+        const path = recordPath(`board-l2-${trial}`, eventId);
+        await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+        await writeFile(path, "corrupt-not-json", "utf8");
+
+        // Race a real concurrent discard() against observe()'s own
+        // self-heal retry -- if L2 regressed (ENOENT hard-errors instead
+        // of retrying), one of these two calls would surface a raw
+        // EVENT_OBSERVATION_STORE_UNAVAILABLE instead of observe()
+        // resolving.
+        const [recorded] = await Promise.all([
+          observe(`board-l2-${trial}`, eventId, { now: 42 }),
+          discard(`board-l2-${trial}`, eventId),
+        ]);
+        expect(typeof recorded).toBe("number");
+      }
+    });
+  });
+});
+
+describe("Fix round 2, L3 -- a filesystem that cannot make hard links is diagnosed, not silently downgraded", () => {
+  // Reproducing the real `link()` failure end to end needs a filesystem
+  // without hard-link support (exFAT/FAT) or a genuine cross-device mount
+  // -- both need root in this sandbox (Ruling R38's own note: "reasoned,
+  // not measured"). What *is* directly testable without one is the error
+  // this code path actually constructs, which is exported for exactly
+  // this purpose (`hardLinkUnsupportedError`/`HARD_LINK_UNSUPPORTED_CODES`
+  // are the real functions `tryPlaceAtomically` calls, not a re-implementation).
+  test("EPERM/ENOTSUP/EXDEV are recognized as hard-link-unsupported codes; other codes are not", () => {
+    expect(HARD_LINK_UNSUPPORTED_CODES.has("EPERM")).toBe(true);
+    expect(HARD_LINK_UNSUPPORTED_CODES.has("ENOTSUP")).toBe(true);
+    expect(HARD_LINK_UNSUPPORTED_CODES.has("EXDEV")).toBe(true);
+    expect(HARD_LINK_UNSUPPORTED_CODES.has("EACCES")).toBe(false);
+    expect(HARD_LINK_UNSUPPORTED_CODES.has("EEXIST")).toBe(false);
+  });
+
+  test("hardLinkUnsupportedError names the cause and the remedy, not just 'unwritable'", () => {
+    const cause = Object.assign(new Error("EPERM: operation not permitted, link"), { code: "EPERM" });
+    const error = hardLinkUnsupportedError(cause);
+    expect(error.code).toBe(EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE);
+    expect(error.message).toContain("hard link");
+    expect(error.message).toContain("XDG_STATE_HOME");
+    expect(error.cause).toBe(cause);
+  });
+
+  test("EPERM is a real, reachable link() failure in this sandbox (not merely a documented one): POSIX forbids hard-linking a directory on effectively every filesystem, no special mount needed", async () => {
+    // This does not arise through `tryPlaceAtomically`'s own call (its
+    // temp file is always a plain file it just wrote, never a directory),
+    // so it doesn't exercise that exact call site -- it establishes that
+    // `EPERM` is a genuine, locally-reproducible `link()` errno the
+    // previous two tests' mapping logic exists to handle, not a
+    // hypothetical one invented for this fix.
+    const dir = await mkdtemp(join(tmpdir(), "cankan-l3-probe-"));
+    try {
+      const src = join(dir, "srcdir");
+      await mkdir(src);
+      const dest = join(dir, "dest-target");
+      try {
+        const { link } = await import("node:fs/promises");
+        await link(src, dest);
+        throw new Error("expected link() of a directory to fail");
+      } catch (error) {
+        if (!(error instanceof Error) || !("code" in error)) throw error;
+        expect((error as NodeJS.ErrnoException).code).toBe("EPERM");
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Fix round 2 -- parseStoredObservation bounds firstSeenAtMs, mirroring the write side", () => {
+  test("firstSeen() treats an absurdly out-of-range firstSeenAtMs as corrupt (null), not as a value to hand to a caller", async () => {
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-bound", eventId);
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      // Number.MAX_SAFE_INTEGER exceeds Date's own representable range
+      // (MAX_DATE_MS = 8.64e15 < 9.007e15) -- finite, so it previously
+      // passed `Number.isFinite` unchallenged.
+      await writeFile(path, JSON.stringify({ firstSeenAtMs: Number.MAX_SAFE_INTEGER }), "utf8");
+
+      expect(await firstSeen("board-bound", eventId)).toBeNull();
+    });
+  });
+
+  test("observe() self-heals an out-of-range firstSeenAtMs the same way it self-heals unparseable JSON", async () => {
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-bound-2", eventId);
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      await writeFile(path, JSON.stringify({ firstSeenAtMs: -Number.MAX_SAFE_INTEGER }), "utf8");
+
+      const recorded = await observe("board-bound-2", eventId, { now: 777 });
+      expect(recorded).toBe(777);
+      expect(await firstSeen("board-bound-2", eventId)).toBe(777);
+    });
+  });
 });
 
 describe("Fix round 1, Critical C1 -- observe() is idempotent under genuine concurrency, not only sequential repetition", () => {

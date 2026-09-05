@@ -349,6 +349,36 @@ describe("obligation 4 — ts bounded to [PROJECT_EPOCH, now + 24h]", () => {
 });
 
 // ============================================================================
+// Fix round 1, finding L4 / Ruling R13 — Date.parse silently rolls a
+// calendar-invalid instant forward (2026-02-30 → 2026-03-02) instead of
+// returning NaN; both ts and lease_until must reject the round-trip case,
+// not only the grosser 2026-13-45 shape.
+// ============================================================================
+
+describe("fix round 1 L4 — calendar round-trip check (2026-02-30 rolls forward, not NaN)", () => {
+  test("Date.parse itself does not reject 2026-02-30 — the premise this fix addresses", () => {
+    const ms = Date.parse("2026-02-30T00:00:00Z");
+    expect(Number.isNaN(ms)).toBe(false);
+    expect(new Date(ms).toISOString()).toBe("2026-03-02T00:00:00.000Z");
+  });
+
+  test("a ts of 2026-02-30 (rolls forward to March 2) is rejected", () => {
+    const result = parse(envelope({ event: "release", ts: "2026-02-30T00:00:00Z" }));
+    expect(result.ok).toBe(false);
+  });
+
+  test("a lease_until of 2026-02-30 (rolls forward to March 2) is rejected", () => {
+    const result = parse(envelope({ event: "claim", lease_until: "2026-02-30T00:00:00Z" }));
+    expect(result.ok).toBe(false);
+  });
+
+  test("a real, non-rolling ts and lease_until still pass", () => {
+    expect(parse(envelope({ event: "release", ts: "2026-09-04T10:12:00Z" })).ok).toBe(true);
+    expect(parse(envelope({ event: "claim", lease_until: "2026-09-04T12:12:00Z" })).ok).toBe(true);
+  });
+});
+
+// ============================================================================
 // Obligation 5 — actor is not an authenticated identity (doc obligation,
 // demonstrated by absence of any identity-shaped constraint)
 // ============================================================================

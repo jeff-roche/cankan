@@ -284,11 +284,50 @@ const TS_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
 const ISO_8601_UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
 
 /**
- * Bounds-checks an already shape-valid `ts` against `[PROJECT_EPOCH, now +
- * 24h]`. `now` is a parameter, not a call to `Date.now()` inside this
- * function — obligation 4 requires it injectable so a caller (a later
- * dispatch's UTC-month-rollover test, in particular) can test the boundary
- * without waiting for real time to cross it.
+ * **Fix round 1, finding L4 / Ruling R13.** `Date.parse` does not return
+ * `NaN` for a calendar-invalid-but-shape-valid instant — it silently rolls
+ * the date forward. Confirmed directly, in this engine:
+ *
+ * ```
+ * Date.parse("2026-02-30T00:00:00Z")            // → a valid number
+ * new Date(Date.parse("2026-02-30T00:00:00Z"))   // → 2026-03-02T00:00:00.000Z
+ * ```
+ *
+ * **This is not date hygiene, it is determinism across engines** (Ruling
+ * R13): JSC (this runtime) rolls `2026-02-30` forward to March 2; V8
+ * returns `NaN` for the same input. ADR 0001:811-826 requires that two
+ * peers independently reconciling the same union of events compute the
+ * same result — an engine-dependent parse of the same on-disk `ts` breaks
+ * that property directly, and "Bun-only today" is a fact about current
+ * deployment, not about the design this schema commits to. It also has a
+ * second, concrete edge: with `2026-02-30` accepted, `ts.slice(0,7)` reads
+ * `"2026-02"` while a `new Date(ts)`-derived month reads `"2026-03"` — a
+ * cross-month write waiting for dispatch 2's monthly file layout.
+ *
+ * The fix is a round-trip: parse, then re-render, then compare the
+ * date+time portion (`.slice(0, 19)`, ignoring fractional seconds and the
+ * trailing `Z`) to the original. A calendar-invalid instant never survives
+ * that round-trip unchanged.
+ */
+function isRealCalendarInstant(s: string): boolean {
+  const ms = Date.parse(s);
+  if (Number.isNaN(ms)) return false;
+  return new Date(ms).toISOString().slice(0, 19) === s.slice(0, 19);
+}
+
+/**
+ * Bounds-checks an already shape-valid, already-real-calendar-instant `ts`
+ * against `[PROJECT_EPOCH, now + 24h]`. `now` is a parameter, not a call to
+ * `Date.now()` inside this function — obligation 4 requires it injectable
+ * so a caller (a later dispatch's UTC-month-rollover test, in particular)
+ * can test the boundary without waiting for real time to cross it.
+ *
+ * By the time this runs, `event.ts` has already passed `tsSchema`'s own
+ * `isRealCalendarInstant` refine, so `Date.parse` here is only doing bound
+ * arithmetic on a value already confirmed to be a real instant — this
+ * function does not re-check calendar validity itself (fix round 1
+ * corrected an earlier version of this comment, on `leaseUntilSchema`, that
+ * claimed this without it actually being true — see L4).
  */
 function isTsWithinBounds(ts: string, nowMs: number): boolean {
   const tsMs = Date.parse(ts);
@@ -340,7 +379,10 @@ const parentSchema = z
   .transform((s) => s as ActorId)
   .optional();
 
-const tsSchema = z.string().regex(ISO_8601_UTC_PATTERN, "ts must be an ISO-8601 UTC instant (YYYY-MM-DDTHH:mm:ss[.sss]Z)");
+const tsSchema = z
+  .string()
+  .regex(ISO_8601_UTC_PATTERN, "ts must be an ISO-8601 UTC instant (YYYY-MM-DDTHH:mm:ss[.sss]Z)")
+  .refine(isRealCalendarInstant, "ts must be a real calendar instant");
 
 const eventIdSchema = z
   .string()
@@ -428,16 +470,21 @@ const createEventSchema = z.object({ ...envelopeShape, event: z.literal("create"
  * for that bound, and a legitimately long-configured lease could otherwise
  * be rejected as "too far in the future" by a rule meant for `ts` alone.
  *
- * The regex alone would admit a calendar-invalid instant shaped like the
- * pattern but meaningless as a date (`2026-13-45T00:00:00Z`) — `ts` never
- * has this gap because `isTsWithinBounds` runs every `ts` through
- * `Date.parse` regardless, but `lease_until` has no analogous downstream
- * check, so the `.refine` below closes it directly here.
+ * **Fix round 1, finding L4: this doc comment previously claimed "`ts`
+ * never has this gap because `isTsWithinBounds` runs every `ts` through
+ * `Date.parse` regardless" — that was false.** `Date.parse` alone does not
+ * reject a calendar-invalid-but-shape-valid instant (`2026-13-45T00:00:00Z`
+ * *and* `2026-02-30T00:00:00Z`, which silently rolls forward to March 2
+ * rather than returning `NaN`); `isTsWithinBounds` never caught the
+ * roll-forward case either. Both `ts` and `lease_until` now share the same
+ * real fix: `isRealCalendarInstant` (see its own doc comment for the
+ * round-trip check and why this is a determinism issue, not a hygiene one —
+ * Ruling R13), applied to `ts` in `tsSchema` and to `lease_until` here.
  */
 const leaseUntilSchema = z
   .string()
   .regex(ISO_8601_UTC_PATTERN, "lease_until must be an ISO-8601 UTC instant (YYYY-MM-DDTHH:mm:ss[.sss]Z)")
-  .refine((s) => !Number.isNaN(Date.parse(s)), "lease_until must be a real calendar instant");
+  .refine(isRealCalendarInstant, "lease_until must be a real calendar instant");
 
 const claimEventSchema = z
   .object({ ...envelopeShape, event: z.literal("claim"), lease_until: leaseUntilSchema })

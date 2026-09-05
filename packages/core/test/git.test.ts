@@ -408,8 +408,8 @@ describe("--full-tree: reads from a subdirectory resolve the same blob as from t
 });
 
 describe("every operation exercised from a secondary worktree", () => {
-  test("readRef, commitTreeToRef, readBlobFromRef, listWorktrees, gitCommonDir all work identically", async () => {
-    const repo = await tempRepo({ worktrees: 1 });
+  test("readRef, commitTreeToRef, updateRefCAS, readBlobFromRef, listWorktrees, gitCommonDir, fetch, fetchReconciliation, and push all work identically", async () => {
+    const repo = await tempRepo({ worktrees: 1, bareRemote: true });
     const worktreeDir = repo.worktreeDirs[0];
     if (!worktreeDir) throw new Error("expected a worktree");
     const adapter = await createGitAdapter(worktreeDir);
@@ -422,6 +422,7 @@ describe("every operation exercised from a secondary worktree", () => {
       files: [{ path: "events/2026-09.jsonl", content: '{"claim":true}\n' }],
     });
     expect(applied.outcome).toBe("applied");
+    if (applied.outcome !== "applied") throw new Error("unreachable");
 
     expect(await adapter.readRef(COORD_REF)).not.toBeNull();
     expect(await adapter.readBlobFromRef(COORD_REF, "events/2026-09.jsonl")).toBe('{"claim":true}\n');
@@ -435,6 +436,21 @@ describe("every operation exercised from a secondary worktree", () => {
     const primaryAdapter = await createGitAdapter(repo.dir);
     const commonDirFromPrimary = await primaryAdapter.gitCommonDir();
     expect(commonDirFromWorktree).toBe(commonDirFromPrimary);
+
+    // updateRefCAS called directly (not via commitTreeToRef), from the worktree.
+    const nextSha = git(
+      worktreeDir,
+      ["commit-tree", "-p", applied.sha, "-m", "direct CAS from worktree", git(worktreeDir, ["write-tree"]).trim()],
+    ).trim() as ObjectSha;
+    const casResult = await adapter.updateRefCAS(COORD_REF, nextSha, applied.sha);
+    expect(casResult.outcome).toBe("applied");
+
+    // fetch / fetchReconciliation / push, all from the worktree.
+    expect((await adapter.push("origin", COORD_REF)).outcome).toBe("ok");
+    expect((await adapter.fetch("origin", COORD_REF)).outcome).toBe("ok");
+    await adapter.fetchReconciliation("origin", COORD_REF, STAGING_REF);
+    const staged: string | null = await adapter.readRef(STAGING_REF);
+    expect(staged).toBe(nextSha as string);
   });
 });
 

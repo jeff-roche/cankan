@@ -1,3 +1,4 @@
+import { chmodSync, statSync } from "node:fs";
 import { afterEach, describe, expect, test } from "bun:test";
 import { monotonicFactory } from "ulid";
 import { isCanKanError } from "../../src/errors";
@@ -6,6 +7,10 @@ import { append, type EventCandidate, read } from "../../src/events/log";
 import { EventErrorCodes } from "../../src/events/errors";
 import {
   diagnose,
+  MAX_QUARANTINE_RAW_BYTES_PER_RECORD,
+  MAX_QUARANTINE_RUN_BUDGET_BYTES,
+  QUARANTINE_ESCAPE_EXPANSION_FACTOR,
+  QUARANTINE_RECORD_OVERHEAD_BYTES,
   recover,
   recoverCore,
   type RecoveryHooks,
@@ -273,7 +278,9 @@ describe("recover — the quarantine record is a byte-for-byte audit trail", () 
     // The quarantine file's own ON-DISK bytes never contain the raw ESC byte
     // either — JSON-string encoding of `raw` escapes it structurally, which
     // is what makes `cat`/`git show`-ing the file itself safe.
-    const quarantineRaw = await adapter.readBlobFromRef(COORD_REF, "quarantine/2026-09.jsonl");
+    const qPath = summary?.path ?? "";
+    expect(qPath).toMatch(/^quarantine\/2026-09\/.+\.jsonl$/);
+    const quarantineRaw = await adapter.readBlobFromRef(COORD_REF, qPath);
     expect(quarantineRaw).not.toBeNull();
     expect(quarantineRaw?.includes(ESC)).toBe(false);
 
@@ -281,22 +288,32 @@ describe("recover — the quarantine record is a byte-for-byte audit trail", () 
     // bytes, byte-for-byte, plus the reason and original position.
     const lines = (quarantineRaw ?? "").split("\n").filter((l) => l.length > 0);
     expect(lines).toHaveLength(1);
-    const record = JSON.parse(lines[0] ?? "{}") as { raw: string; month: string; line: number; reason: string };
+    const record = JSON.parse(lines[0] ?? "{}") as { raw: string; month: string; line: number; reason: string; rawTruncated: boolean };
     expect(record.raw).toBe(hostile);
     expect(record.month).toBe("2026-09");
     expect(record.line).toBe(1);
     expect(record.reason).toBe("invalid-json");
+    expect(record.rawTruncated).toBe(false);
 
     // Fix round 1's invariant: an empty `unresolved` means read() succeeds.
     expect(result.unresolved).toEqual([]);
     await read(adapter, COORD_REF, { now: NOW });
   });
 
-  test("a second recovery run appends to, rather than overwrites, existing quarantine history", async () => {
+  // Fix round 2 (Ruling R45(b)): replaces the old "appends to, rather than
+  // overwrites" test, whose whole premise (one ever-growing
+  // `quarantine/<month>.jsonl` file) was itself the NEW-1 defect — see
+  // `quarantineDirPath`'s doc comment. The regression this test now guards:
+  // a second, independent recovery cycle must not lose the first cycle's
+  // audit record, which per-call files achieve by writing a *distinct* new
+  // file rather than by appending onto a shared one.
+  test("a second, independent recovery cycle writes its own new quarantine file, never overwriting or losing the first", async () => {
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);
     await seedRef(adapter, [{ path: "events/2026-09.jsonl", content: `${validLine("ck-1")}\nbad-one\n` }]);
-    await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    const first = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    expect(first.outcome).toBe("recovered");
+    const firstPath = first.quarantined[0]?.path ?? "";
 
     // A second, independent poison + recovery cycle in the same month.
     const before = await adapter.readBlobFromRef(COORD_REF, "events/2026-09.jsonl");
@@ -309,20 +326,27 @@ describe("recover — the quarantine record is a byte-for-byte audit trail", () 
     });
     if (appended.outcome !== "applied") throw new Error("setup failed");
 
-    const result = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
-    expect(result.outcome).toBe("recovered");
-    expect(result.unresolved).toEqual([]);
+    const second = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    expect(second.outcome).toBe("recovered");
+    expect(second.unresolved).toEqual([]);
     // Fix round 1's invariant: an empty `unresolved` means read() succeeds.
     await read(adapter, COORD_REF, { now: NOW });
 
-    const quarantineRaw = await adapter.readBlobFromRef(COORD_REF, "quarantine/2026-09.jsonl");
-    const lines = (quarantineRaw ?? "").split("\n").filter((l) => l.length > 0);
-    // Both the first cycle's record and the second cycle's record survive —
-    // deleting the "read existing quarantine content first" step would
-    // leave only one.
-    expect(lines).toHaveLength(2);
-    const raws = lines.map((l) => (JSON.parse(l) as { raw: string }).raw);
-    expect(raws.sort()).toEqual(["bad-one", "bad-two"]);
+    const secondPath = second.quarantined[0]?.path ?? "";
+    // Two distinct files, not one shared, ever-growing one.
+    expect(secondPath).not.toBe(firstPath);
+
+    const firstRaw = await adapter.readBlobFromRef(COORD_REF, firstPath);
+    const secondRaw = await adapter.readBlobFromRef(COORD_REF, secondPath);
+    expect(firstRaw).not.toBeNull();
+    expect(secondRaw).not.toBeNull();
+    const firstRecord = JSON.parse((firstRaw ?? "").split("\n")[0] ?? "{}") as { raw: string };
+    const secondRecord = JSON.parse((secondRaw ?? "").split("\n")[0] ?? "{}") as { raw: string };
+    // Both the first cycle's record and the second cycle's record survive,
+    // each in its own file — deleting the "write a new file per call"
+    // design (reverting to one shared, appended-to file) would fail this
+    // assertion by making the two paths identical.
+    expect([firstRecord.raw, secondRecord.raw].sort()).toEqual(["bad-one", "bad-two"]);
   });
 });
 
@@ -694,7 +718,8 @@ describe("diagnose/recover — fix round 1, Critical 1: coalescing bounds a repe
     expect(result.quarantined).toHaveLength(1);
     expect(result.quarantined[0]?.count).toBe(NEWLINE_COUNT);
 
-    const quarantineRaw = await adapter.readBlobFromRef(COORD_REF, "quarantine/2026-09.jsonl");
+    const qPath = result.quarantined[0]?.path ?? "";
+    const quarantineRaw = await adapter.readBlobFromRef(COORD_REF, qPath);
     // One coalesced record for a byte-identical (empty-string) span is a few
     // hundred bytes; the pre-fix code produced ~24MB for this same input —
     // this assertion fails under the "delete coalescing" mutation.
@@ -744,13 +769,48 @@ describe("diagnose/recover — fix round 1, Critical 1: a failure-count cap boun
 // recovery
 // ============================================================================
 
-describe("recover — fix round 1, Critical 2: a blocked quarantine path is a typed error, never a silent deletion", () => {
-  test("a tree planted at the exact quarantine/<month>.jsonl path throws EVENT_RECOVERY_QUARANTINE_BLOCKED, with no partial write", async () => {
+describe("recover — fix round 1/2, Critical 2 & NEW-1 case 3: a blocked quarantine path is a typed error, never a silent deletion", () => {
+  // Fix round 2 (Ruling R45(b)): per-call files mean the *old*,
+  // deterministic `quarantine/<month>.jsonl` path is no longer written to
+  // at all — a blob there is now a harmless sibling of the
+  // `quarantine/<month>/` directory, not a conflict. This test replaces
+  // the old "a tree planted at the exact quarantine/<month>.jsonl path
+  // throws" test, whose premise no longer applies, and instead proves the
+  // point directly: recovery proceeds normally even with such a blob
+  // present (the reproduced NEW-1 case 3 construction — a pre-planted
+  // large blob at exactly this old-style path — is inert under the new
+  // layout for the same reason).
+  test("a blob at the old-style quarantine/<month>.jsonl path is inert — recovery proceeds normally", async () => {
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);
     await seedRef(adapter, [
       { path: "events/2026-09.jsonl", content: "bad line\n" },
-      { path: "quarantine/2026-09.jsonl/nested.txt", content: "occupying the quarantine path" },
+      { path: "quarantine/2026-09.jsonl", content: "x".repeat(1024) },
+    ]);
+
+    const result = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    expect(result.outcome).toBe("recovered");
+    expect(result.unresolved).toEqual([]);
+    await read(adapter, COORD_REF, { now: NOW });
+
+    // The old-style blob survives untouched — recovery never reads or
+    // writes it.
+    const untouched = await adapter.readBlobFromRef(COORD_REF, "quarantine/2026-09.jsonl");
+    expect(untouched).toBe("x".repeat(1024));
+  });
+
+  // Fix round 2 (NEW-1 remediation): the real remaining conflict shape one
+  // level down from the top-level path — a blob planted at the *bare*
+  // `quarantine/<month>` path (no file suffix) conflicts with this month's
+  // per-call file, since git cannot represent one path as both a blob and
+  // a directory prefix. Unlike the per-call file's own randomized name,
+  // this bare path is deterministic and therefore pre-plantable.
+  test("a blob planted at the bare quarantine/<month> path throws EVENT_RECOVERY_QUARANTINE_BLOCKED, with no partial write", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await seedRef(adapter, [
+      { path: "events/2026-09.jsonl", content: "bad line\n" },
+      { path: "quarantine/2026-09", content: "occupying the per-month quarantine directory path" },
     ]);
     const before = await adapter.readRef(COORD_REF);
 
@@ -924,7 +984,8 @@ describe("recover — fix round 1, Ruling R44: possiblyLossy names lossy UTF-8 d
     expect(result.quarantined[0]?.possiblyLossy).toBe(true);
     expect(result.monthsWithPossibleEncodingLoss).toEqual(["2026-09"]);
 
-    const quarantineRaw = await adapter.readBlobFromRef(COORD_REF, "quarantine/2026-09.jsonl");
+    const qPath = result.quarantined[0]?.path ?? "";
+    const quarantineRaw = await adapter.readBlobFromRef(COORD_REF, qPath);
     const record = JSON.parse((quarantineRaw ?? "").split("\n")[0] ?? "{}") as { possiblyLossy: boolean; raw: string };
     expect(record.possiblyLossy).toBe(true);
     // What this module received, preserved exactly (a real limitation, not
@@ -1043,5 +1104,226 @@ describe("recover — fix round 1, Low: every caller-supplied option is validate
     const adapter = await createGitAdapter(repo.dir);
     await expectCode(diagnose(adapter, COORD_REF, { now: Symbol("x") as unknown as number }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
     await expectCode(recover(adapter, COORD_REF, { now: Symbol("x") as unknown as number }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+  });
+
+  // Fix round 2, Low (NEW-5): a default parameter does not apply to an
+  // explicit `null` — only to `undefined`.
+  test("an explicit null options argument is normalized, not a raw TypeError", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await seedRef(adapter, [{ path: "events/2026-09.jsonl", content: `${validLine("ck-1")}\n` }]);
+
+    // Before the fix: `options.now` on a `null` options argument throws a
+    // raw `TypeError: Cannot read properties of null`, not a `CanKanError`
+    // — `diagnose`/`recover` would both reject with something
+    // `isCanKanError` does not recognize. Passing `now: NOW` explicitly, via
+    // a *second*, separate argument shape, is not possible here since the
+    // whole point is exercising the `null`-as-the-whole-options-object
+    // case — both calls fall back to `Date.now()`/`DEFAULT_TRAILING_MONTHS`
+    // internally, which is fine: this test only asserts neither call
+    // throws a raw, non-`CanKanError` exception.
+    await diagnose(adapter, COORD_REF, null);
+    await recover(adapter, COORD_REF, null);
+  });
+
+  // Fix round 2, Low (NEW-6): `typeof [] === "object"` and `[] !== null`,
+  // so an array previously passed the non-object check silently.
+  test("an array-valued casRetry is rejected, not silently treated as 'no overrides'", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await seedRef(adapter, [{ path: "events/2026-09.jsonl", content: "bad\n" }]);
+
+    await expectCode(
+      recover(adapter, COORD_REF, { now: NOW, casRetry: [] as unknown as never }),
+      EventErrorCodes.EVENT_RECOVERY_INVALID_OPTION,
+    );
+  });
+});
+
+// ============================================================================
+// Fix round 2 (orchestrator security + code review, Ruling R45) — NEW-1: fix
+// round 1's own `EVENT_RECOVERY_QUARANTINE_TOO_LARGE` guard was itself a
+// permanent-wedge defect
+// ============================================================================
+
+describe("recovery — fix round 2, Ruling R45: quarantine-budget constants satisfy their own required invariant", () => {
+  test("one maximally-truncated record's worst-case estimated contribution stays comfortably under the run budget", () => {
+    // See `MAX_QUARANTINE_RUN_BUDGET_BYTES`'s doc comment: this is the
+    // exact relationship that must hold for the final, defense-in-depth
+    // safety-net check in `recoverCore` to be provably unreachable under
+    // normal operation, and for `recordLineFailure`'s "always let the
+    // triggering span through" policy to never itself dominate the budget.
+    const worstCaseRecordContribution = MAX_QUARANTINE_RAW_BYTES_PER_RECORD * QUARANTINE_ESCAPE_EXPANSION_FACTOR + QUARANTINE_RECORD_OVERHEAD_BYTES;
+    expect(worstCaseRecordContribution).toBeLessThan(MAX_QUARANTINE_RUN_BUDGET_BYTES);
+    // Comfortably under, not just under — at least 2x headroom, so even a
+    // single record that alone crosses the budget cannot make one run's
+    // actual write disproportionately large relative to its stated budget.
+    expect(worstCaseRecordContribution * 2).toBeLessThan(MAX_QUARANTINE_RUN_BUDGET_BYTES);
+  });
+});
+
+describe("recover — fix round 2, Ruling R45(a): a single line's raw content is truncated before embedding, never embedded in full past MAX_QUARANTINE_RAW_BYTES_PER_RECORD", () => {
+  test("a >8 MiB adversarial line is truncated in the quarantine record, disclosed via rawTruncated, and read() succeeds after recovery", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const keep = validLine("ck-keep");
+    // 9 MiB of a single control byte — well over both read()'s 1 MiB line
+    // cap (so this is "line-too-large", fixable per Ruling R42) and this
+    // module's own `MAX_QUARANTINE_RAW_BYTES_PER_RECORD` (8 MiB). This is
+    // the exact shape NEW-1 case 1 exploited (there, 45 MiB of `\x01`
+    // bytes, whose JSON-escaped form alone — ~283 MB — exceeded fix round
+    // 1's own bound and permanently wedged the ref); scaled down here for
+    // test speed, since the mechanism under test does not depend on the
+    // exact size.
+    const poison = "\x01".repeat(9 * 1024 * 1024);
+    await seedRef(adapter, [{ path: "events/2026-09.jsonl", content: `${keep}\n${poison}\n` }]);
+
+    const result = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    expect(result.outcome).toBe("recovered");
+    expect(result.quarantined).toHaveLength(1);
+    expect(result.quarantined[0]?.reason).toBe("line-too-large");
+    expect(result.quarantined[0]?.rawTruncated).toBe(true);
+    // The full original length is still disclosed, even though the raw
+    // bytes themselves are not repeated in full.
+    expect(result.quarantined[0]?.lineBytes).toBe(Buffer.byteLength(poison, "utf8"));
+
+    const qPath = result.quarantined[0]?.path ?? "";
+    const quarantineRaw = await adapter.readBlobFromRef(COORD_REF, qPath);
+    const record = JSON.parse((quarantineRaw ?? "").split("\n")[0] ?? "{}") as { raw: string; rawTruncated: boolean };
+    expect(record.rawTruncated).toBe(true);
+    expect(record.raw.length).toBeLessThan(poison.length);
+    // Bounded, not unbounded — the entire point of the truncation: the
+    // record's own on-disk size stays a small, predictable multiple of
+    // `MAX_QUARANTINE_RAW_BYTES_PER_RECORD`, never proportional to the
+    // original line's own size (which, in NEW-1's real construction, was
+    // 45 MiB and produced a ~283 MB record).
+    expect(Buffer.byteLength(quarantineRaw ?? "", "utf8")).toBeLessThan(70 * 1024 * 1024);
+
+    expect(result.unresolved).toEqual([]);
+    const records = await read(adapter, COORD_REF, { now: NOW });
+    expect(records.map((r) => r.event.ticket as string)).toEqual(["ck-keep"]);
+  }, 30_000);
+});
+
+describe("recover — fix round 2, Ruling R45(b): repeated recovery cycles never accumulate into a shared, ever-growing quarantine file", () => {
+  test("three successive recovery cycles against a board holding a live claim each write an independent file, and none is wedged by the others' history", async () => {
+    // This is the shape NEW-1 case 2 reproduced against fix round 1: three
+    // successive real pushes recovered twice (growing one shared,
+    // append-only quarantine file to 120 MiB then 240 MiB), then
+    // permanently failed on the third, orphaning a live claim. Per-call
+    // files (Ruling R45(b)) mean no call ever reads or grows what an
+    // earlier call wrote, so this can no longer happen regardless of how
+    // many cycles run.
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await seedRef(adapter, [{ path: "events/2026-09.jsonl", content: `${validClaimLine("ck-live")}\nbad-1\n` }]);
+
+    const paths: string[] = [];
+    for (let cycle = 0; cycle < 3; cycle++) {
+      const result = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+      expect(result.outcome).toBe("recovered");
+      expect(result.unresolved).toEqual([]);
+      const p = result.quarantined[0]?.path;
+      if (p === undefined) throw new Error("expected a quarantine path");
+      paths.push(p);
+
+      // The live claim survives every cycle — recovery never touches it.
+      const records = await read(adapter, COORD_REF, { now: NOW });
+      expect(records.map((r) => r.event.ticket as string)).toEqual(["ck-live"]);
+
+      if (cycle < 2) {
+        // Seed a fresh, independent poison for the next cycle.
+        const before = await adapter.readBlobFromRef(COORD_REF, "events/2026-09.jsonl");
+        const parent = await adapter.readRef(COORD_REF);
+        if (parent === null) throw new Error("expected a ref");
+        const appended = await adapter.commitTreeToRef(COORD_REF, {
+          parent,
+          message: "seed the next poison",
+          files: [{ path: "events/2026-09.jsonl", content: `${before ?? ""}bad-${cycle + 2}\n` }],
+        });
+        if (appended.outcome !== "applied") throw new Error("setup failed");
+      }
+    }
+
+    // Every cycle wrote its own distinct file — never one shared,
+    // ever-growing path.
+    expect(new Set(paths).size).toBe(3);
+    for (const p of paths) {
+      const raw = await adapter.readBlobFromRef(COORD_REF, p);
+      expect(raw).not.toBeNull();
+    }
+  }, 20_000);
+});
+
+describe("diagnose/recover — fix round 2, Ruling R45(a): a quarantine-audit-size budget bounds many DISTINCT large lines, converging over more than one pass", () => {
+  test("five distinct >8 MiB lines exceed the run budget after four; a second pass finishes the job", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const LINE_BYTES = 8.5 * 1024 * 1024;
+    const lines: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      // Distinct single-byte content per line — never coalesces, and each
+      // is well over both read()'s 1 MiB line cap and this module's own
+      // 8 MiB per-record raw cap, so each contributes this module's own
+      // worst-case per-record estimate to the run budget.
+      lines.push(String.fromCharCode(65 + i).repeat(LINE_BYTES));
+    }
+    await seedRef(adapter, [{ path: "events/2026-09.jsonl", content: `${lines.join("\n")}\n` }]);
+
+    const report = await diagnose(adapter, COORD_REF, { now: NOW });
+    const truncatedMarker = report.failures.filter((f) => f.reason === "diagnostic-truncated");
+    expect(truncatedMarker).toHaveLength(1);
+    // Distinguishes this truncation cause from the count-cap one (a
+    // different message) — proves the budget check, not the unrelated
+    // MAX_DIAGNOSTIC_FAILURES cap, is what stopped the walk here.
+    expect(truncatedMarker[0]?.message).toContain("budget");
+    const realFailures = report.failures.filter((f) => f.reason !== "diagnostic-truncated");
+    expect(realFailures).toHaveLength(4);
+    expect(realFailures.every((f) => f.reason === "line-too-large")).toBe(true);
+
+    const firstPass = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    expect(firstPass.outcome).toBe("recovered");
+    expect(firstPass.quarantined).toHaveLength(4);
+    expect(firstPass.quarantined.every((q) => q.rawTruncated)).toBe(true);
+    expect(firstPass.unresolved.some((f) => f.reason === "diagnostic-truncated")).toBe(true);
+
+    // One pass was not enough — the 5th line was never even scanned
+    // (truncated before reaching it), so read() still refuses.
+    await expectCode(read(adapter, COORD_REF, { now: NOW }), EventErrorCodes.EVENT_LOG_LINE_TOO_LARGE);
+
+    const secondPass = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    expect(secondPass.outcome).toBe("recovered");
+    expect(secondPass.quarantined).toHaveLength(1);
+    expect(secondPass.unresolved).toEqual([]);
+
+    await read(adapter, COORD_REF, { now: NOW });
+  }, 60_000);
+});
+
+// ============================================================================
+// Fix round 2 — NEW-2: an unrelated git-level failure must never be
+// misdiagnosed as a blocked quarantine path
+// ============================================================================
+
+describe("recover — fix round 2, NEW-2: an unrelated git-level failure is never misdiagnosed as a blocked quarantine path", () => {
+  test("a read-only object store makes the commit fail with GIT_COMMAND_FAILED, not EVENT_RECOVERY_QUARANTINE_BLOCKED", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await seedRef(adapter, [{ path: "events/2026-09.jsonl", content: "bad line\n" }]);
+
+    // Before the fix: fix round 1's catch around `commitTreeToRef` relabeled
+    // *any* `GIT_COMMAND_FAILED` there as `EVENT_RECOVERY_QUARANTINE_BLOCKED`
+    // — including one with nothing to do with a blocked quarantine path,
+    // like this one (confirmed directly: `git hash-object -w --stdin`
+    // against a read-only `.git/objects` fails with "insufficient
+    // permission for adding an object to repository database").
+    const objectsDir = `${repo.dir}/.git/objects`;
+    const originalMode = statSync(objectsDir).mode;
+    chmodSync(objectsDir, 0o555);
+    try {
+      await expectCode(recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY }), GitErrorCodes.GIT_COMMAND_FAILED);
+    } finally {
+      chmodSync(objectsDir, originalMode);
+    }
   });
 });

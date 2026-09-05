@@ -254,32 +254,55 @@ export const EventErrorCodes = {
    */
   EVENT_RECOVERY_INVALID_OPTION: "EVENT_RECOVERY_INVALID_OPTION",
   /**
-   * `recovery.ts`'s `recover()` found something already occupying the
-   * `quarantine/` audit path it needs to write into — either a non-blob
-   * entry at the specific `quarantine/<month>.jsonl` path a fixable failure
-   * needs, a blob planted at the literal top-level `quarantine` path (which
-   * conflicts with *every* `quarantine/<month>.jsonl` write, since git
-   * cannot represent a path as both a blob and a directory prefix in one
-   * tree), or a `commitTreeToRef` failure consistent with that same
-   * conflict (fix round 1, Critical 2 — orchestrator security review).
+   * `recovery.ts`'s `recover()` found something already occupying a
+   * `quarantine/` path it needs to use as a directory — either the literal
+   * top-level `quarantine` path, or one specific month's bare
+   * `quarantine/<month>` path (fix round 2: checked at both levels, once
+   * per attempt for the former and once per month touched for the latter —
+   * see `assertQuarantineDirectoryUsable`). Git cannot represent a path as
+   * both a blob and a directory prefix in one tree, so a blob planted at
+   * either exact path blocks every write this run would otherwise make
+   * under it (fix round 1, Critical 2 — orchestrator security review;
+   * generalized to the per-month path in fix round 2, NEW-1 remediation).
    * **Deliberately refuses to fall back to rewriting the month file without
    * its matching audit record** — writing the fix without the quarantine
    * record would silently delete the offending line with no audit trail,
    * which is the one thing this module must never do. `details` names the
    * exact blocked path; the message states the remediation (rebuild the
-   * ref's tree to remove the conflicting entry).
+   * ref's tree to remove the conflicting entry). **Fix round 2 (NEW-2):
+   * no longer also raised as a speculative relabel of an unrelated
+   * `commitTreeToRef` failure** — a real conflict is now always caught by
+   * one of the two proactive probes above, before the commit is even
+   * attempted, so a `commitTreeToRef` failure that still occurs is never
+   * this code; it propagates as `GIT_COMMAND_FAILED` with its genuine
+   * cause intact.
    */
   EVENT_RECOVERY_QUARANTINE_BLOCKED: "EVENT_RECOVERY_QUARANTINE_BLOCKED",
   /**
    * `recovery.ts`'s `recover()` found that the quarantine audit content it
-   * would need to write for this call exceeds its own resource bound (fix
-   * round 1, Critical 1 — orchestrator security review). Refuses to write a
-   * disproportionately large quarantine blob into the coordination ref
-   * (which every peer then fetches and stores permanently) rather than
-   * silently doing so — an operator hitting this should re-run recovery
-   * with a narrower `trailingMonths`, or expect to need more than one
-   * recovery pass to fully clear an unusually large amount of distinct
-   * invalid content.
+   * actually built for this call exceeds its own absolute resource ceiling.
+   * **Fix round 2 (Ruling R45): this is now a last-resort safety net, not
+   * the primary defense.** Fix round 1's version of this check compared the
+   * full built string against a fixed bound *after* constructing it, and —
+   * because it was checked against one ever-growing, append-only
+   * `quarantine/<month>.jsonl` file — could become a **permanent,
+   * unrecoverable wedge**: a single adversarial line's `JSON.stringify`-
+   * escaped form alone could exceed the bound (measured: up to 6.3x
+   * expansion), and/or prior calls' already-committed history could push
+   * every future call over it once accumulated size alone approached the
+   * ceiling (reproduced: three successive real pushes recovered twice,
+   * then permanently failed on the third). Both root causes are now closed
+   * upstream, before this code is ever reached in practice: each call
+   * writes its own new quarantine file per month (never reads or grows an
+   * earlier call's), a single line's raw content embedded in one record is
+   * capped (truncated, disclosed via `rawTruncated`) rather than embedded
+   * in full, and the run-wide byte budget is estimated and enforced
+   * *during diagnosis* (converging over more than one `recover()` pass via
+   * the existing `"diagnostic-truncated"` reason) rather than discovered
+   * only after the string is already built. This code firing at all would
+   * indicate a mismatch between this module's own size-estimation
+   * constants and reality, not a permanently unrecoverable ref — see this
+   * error's own message for the operator-facing remediation.
    */
   EVENT_RECOVERY_QUARANTINE_TOO_LARGE: "EVENT_RECOVERY_QUARANTINE_TOO_LARGE",
 } as const;

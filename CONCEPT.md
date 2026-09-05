@@ -35,7 +35,7 @@ vibe-kanban is an orchestration UI; we're the data layer it lacks. GitHub Projec
 
 | Signal | Proposal |
 |---|---|
-| `backlog/` or `.backlog/` or `backlog.config.yml` | Reuse the existing task directory as-is; existing tasks are already local, no import needed |
+| `backlog/` or `.backlog/` or `backlog.config.yml` | Reuse the existing task directory as-is; existing tasks are already local, no import needed. `adopt` must still set `task_prefix: ck` and relabel any pre-existing `task-N` tickets into the `ck-` namespace with alias events — `task_prefix` is a single global value, so leaving them behind orphans them from `backlog browser` |
 | `.beads/` | Connect beads backer; import issues with `origin: beads:…` |
 | git remote on github.com | Offer GitHub Issues (not defaulted — many GitHub repos don't use Issues) |
 | `JIRA_*` env vars | Offer Jira |
@@ -43,9 +43,9 @@ vibe-kanban is an orchestration UI; we're the data layer it lacks. GitHub Projec
 
 Detection only pre-selects the wizard. `cankan init --backer github --backer jira` skips it; `cankan init --no-backers` works even in a repo with Backlog.md and beads present. Remote backers get an auth step (`gh auth` reuse for GitHub; token + site URL for Jira) and a status-mapping preview before anything is written. Backers can be added any time with `cankan backer add <name>`.
 
-**The local format is Backlog.md-compatible by construction.** Rather than inventing a new ticket format, tickets use Backlog.md's directory layout and frontmatter schema (`backlog/tasks/<ID> - <title>.md`, same field names, same AC checklist syntax), with CanKan-specific fields (`origin`, `claim`, `actor`, aliases, external metadata) namespaced under a `cankan:` key that Backlog.md ignores. A user who starts with nothing and later runs `npm i -g backlog.md` gets a working `backlog browser` immediately. A Backlog.md user who uninstalls it loses nothing.
+**The local format is Backlog.md-compatible by construction.** Rather than inventing a new ticket format, tickets use Backlog.md's directory layout and frontmatter schema (`backlog/tasks/<ID> - <title>.md`, same field names, same AC checklist syntax), with CanKan-specific fields (`origin`, `claim`, `actor`, aliases, external metadata) namespaced under a `cankan:` key. Backlog.md ignores that key on read but **deletes it on write** — verified against `backlog.md@1.51.0` in `docs/decisions/0002-ids-and-backlog-compat.md` — so the `cankan:` block is a disposable cache that CanKan re-derives from the event log after an external write, never the only copy of anything. A user who starts with nothing and later runs `npm i -g backlog.md` gets a working `backlog browser` immediately, provided `cankan init` wrote `task_prefix: ck` into `backlog/config.yml`, which it must do on every init and not only when adopting an existing `backlog/`. A Backlog.md user who uninstalls it loses nothing.
 
-**IDs: hash-based natively, renumbered on adoption.** Native tickets are `ck-a1b2c3` — collision-free across branches, worktrees, and machines with no coordination. Imported tickets keep their origin's ID as the display ID (`#123`, `PROJ-45`, `bd-x1y2`) while getting a `ck-` ID underneath, so two backers with overlapping numbering never collide. Backlog.md expects `PREFIX-N`; if its parser turns out to require numeric IDs (verify in Phase 0), `cankan adopt backlog` renumbers in one pass and writes alias events so `cankan show ck-a1b2c3`, old branch names, and commit references still resolve. Sequential IDs otherwise never exist in CanKan.
+**IDs: hash-based natively, relabelled on adoption.** Native tickets are `ck-a1b2c3` — collision-free across branches, worktrees, and machines with no coordination. Imported tickets keep their origin's ID as the display ID (`#123`, `PROJ-45`, `bd-x1y2`) while getting a `ck-` ID underneath, so two backers with overlapping numbering never collide. Phase 0 settled the Backlog.md question: its parser does **not** require numeric IDs and its allocator ignores non-numeric suffixes, so `ck-` IDs are never renumbered. What `cankan adopt backlog` must still do is relabel any pre-existing `task-N` tickets into the `ck-` namespace, writing alias events so old branch names and commit references still resolve — `task_prefix` is a single global value, so the two families cannot both be visible at once. Backlog.md's own `create` writes an uppercase `id: CK-1` under a lowercase filename, so `ck-1` and `CK-1` are the same ticket. Sequential IDs otherwise never exist in CanKan. See `docs/decisions/0002-ids-and-backlog-compat.md`.
 
 **Adopting a backer later** (`cankan adopt <backer> [--filter …]`): push selected existing tickets up (creating issues) and set `origin` on each, or link to existing issues by title match with a confirmation prompt. Because origin is per ticket, adoption can be partial — send the backend tickets to Jira and leave the rest native. Reversible via the event log.
 
@@ -156,12 +156,12 @@ Every ticket has a `ck-` hash ID; that's what the event log and coordination ref
 The load-bearing decision; comes first because it can't be retrofitted.
 
 - **Definitions travel in the branch** (or live in the external tracker). PR diffs show spec changes.
-- **Claims and status events live on a dedicated orphan ref** (`refs/cankan/coordination`). Worktrees share `.git`, so every worktree sees every claim instantly with no server. Cross-machine sharing = push/pull that ref. Protected-branch-safe (beads' pattern).
-- The ref holds an **append-only JSONL event log**: `{ts, actor, ticket, event: claim|release|renew|move|comment, ...}`. Append-only merges trivially; board state = fold(events) over backer definitions.
+- **Claims and status events live on a dedicated orphan ref** (`refs/cankan/coordination`). Worktrees share `.git`, so every worktree sees every claim instantly with no server. Cross-machine sharing means pushing and fetching that ref with an **explicit refspec** (`refs/cankan/coordination:refs/cankan/coordination`) on every call — a default `git push`, `git fetch` or `git clone` never touches it, and no config flag can change that. Protected-branch-safe (beads' pattern).
+- The ref holds an **append-only JSONL event log**: `{ts, actor, ticket, event: claim|release|renew|move|comment, ...}`. Append-only means events never conflict *semantically* — no event has to be reconciled against another. It does not prevent git-level conflicts on the ref pointer itself: when local and remote have both advanced, the push is rejected non-fast-forward and the fetch has to land on a staging ref before the two sides are unioned and replayed. Board state = fold(events) over backer definitions.
 - **Fallback mode** (if Phase 0 fails or a user opts out): Backlog.md-style read-side branch scanning plus claim files in-branch. Documented as lossy.
 
 ### 4. Concurrency: atomic leased claims
-`cankan claim <id>` is compare-and-swap: succeeds only if unclaimed or expired. Records actor, timestamp, lease (default 2h, renewed on each MCP call / `cankan renew`). Expired claims return to Ready. `ready` = open, unclaimed, no open `blocks` deps. Locally: file lock + commit on the coordination ref. Across machines: optimistic push, retry on rejection. Real-time cross-machine channel deferred until asked for.
+`cankan claim <id>` is compare-and-swap: succeeds only if unclaimed or expired. Records actor, timestamp, lease (default 2h, renewed on each MCP call / `cankan renew`). Expired claims return to Ready — expiry is measured against the reader's own first-observation time for the claim, never the timestamp in the event, which is written by whoever pushed it. `ready` = open, unclaimed, no open `blocks` deps. Locally: `git update-ref` compare-and-swap on the coordination ref (a file lock was measured and rejected; see `docs/decisions/0001-coordination-ref.md`). Across machines: optimistic push, retry on rejection. Real-time cross-machine channel deferred until asked for.
 
 ### 5. Identity: actors, human or agent, with optional parent
 `alice`, `claude-code:alice/worktree-auth`, `codex:ci`. Agents inherit a parent human from config or git author. Board groups by actor or human. Identical commands for both.
@@ -226,7 +226,7 @@ See "Configuration" below. Repo config (`.cankan/config.yml`) is checked in and 
 
 **Multi-agent workflows?** Decisions 3–5 and 8: shared ref, leased CAS claims, actor identity, hooks for dispatch, `discovered-from`, `prime`.
 
-**Cross-branch / worktree?** Decision 3. Definitions in-branch, coordination on a shared ref visible through shared `.git`. Hash IDs for native tickets; append-only events prevent conflicts.
+**Cross-branch / worktree?** Decision 3. Definitions in-branch, coordination on a shared ref visible through shared `.git`. Hash IDs for native tickets; append-only events prevent semantic conflicts, though the ref pointer itself still needs reconciliation when both sides advance.
 
 **Project management features?** Frontmatter strings (`milestone`, `release`, `phase`) plus `board --group-by`. Promote to objects only in Phase 4 if demand is real. Epics are parent-child tickets.
 
@@ -290,7 +290,9 @@ columns:                       # board columns; status values must map into thes
 coordination:
   ref: refs/cankan/coordination
   mode: shared-ref             # shared-ref | branch-scan (fallback)
-  push_ref: true               # push/pull the coordination ref with normal git remote ops
+  push_ref: true               # push/fetch the coordination ref alongside normal git remote ops
+                               # (CanKan always supplies the explicit refspec itself; plain
+                               #  git push/fetch/clone never move this ref)
 
 claims:
   lease: 2h                    # default lease; agents renew on activity

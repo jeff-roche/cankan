@@ -848,6 +848,10 @@ for no additional correctness benefit.
 
 ### CONCEPT.md should be revised
 
+**Applied 2026-09-04, after M1 merged.** The revisions below have since been
+made to `CONCEPT.md`; they are retained here as the record of what this
+decision changed and why. Line numbers refer to the pre-revision file.
+
 This ADR does not itself edit `CONCEPT.md`; it records what a future
 revision of it should say, since the design decisions above make parts of
 its current text stale.
@@ -879,6 +883,13 @@ its current text stale.
   prevent the ref pointer from needing reconciliation.
 
 ### PLAN.md notation should be revised
+
+**Applied 2026-09-04, after M1 merged.** M2.6's signature now reads
+`updateRefCAS(ref, newSha, oldSha)`; M2.6 and M2.7 both gained M1.3 in
+*Depends on*; M2.7's *Creates* no longer scopes the `branch-scan` fallback
+and now names the lease-observation store, which also has an ownership-matrix
+row. Retained as the record of what changed and why; line numbers refer to
+the pre-revision file.
 
 This ADR does not itself edit `PLAN.md` either, for the same reason: it
 records what should change, not the change itself.

@@ -684,6 +684,10 @@ output.
   ("reuse the existing task directory as-is; no import needed") is
   incomplete once native `ck-` tickets are also in play and should be
   revised to describe this migration.
+- **Applied 2026-09-04, after M1 merged.** The CONCEPT.md and PLAN.md
+  revisions in this section have since been made; they are retained as the
+  record of what this decision changed and why. Line numbers below refer to
+  the pre-revision files.
 - CONCEPT.md line 46 ("with CanKan-specific fields ... namespaced under a
   `cankan:` key that Backlog.md ignores") should be corrected: Backlog.md
   ignores the block on read but deletes it on write. The compatibility

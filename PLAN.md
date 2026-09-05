@@ -45,6 +45,7 @@ Every piece of the system and the single task that creates it. If a piece isn't 
 | Ticket store (read/write/list files on disk) | M2.5 | M2.8 (state fold) |
 | Git adapter (`simple-git` wrapper: refs, worktrees, commit, orphan ref ops) | M2.6 | M2.7 (event log) |
 | Event log (append, read, ULIDs, monthly files) on the coordination ref | M2.7 | M2.8 (state fold), M2.10 (claims) |
+| Lease-observation store (`$XDG_STATE_HOME/cankan/`, reader-local first-observation times) | M2.7 | M2.10 (claims) |
 | Board state fold (tickets ⊕ events → `BoardState`) | M2.8 | **M2.9 [wire]** |
 | Core smoke test: create ticket → event → fold → query | **M2.9 [wire]** | — |
 | Claims: CAS, leases, renew, release, expire | M2.10 | M2.11 (ready) |
@@ -240,14 +241,14 @@ All M2 tasks live in `packages/core`. **M2.1 owns the package's public surface**
 - **Done when:** CRUD tests on a temp board; concurrent writes to different tickets don't corrupt.
 
 ### M2.6 Git adapter
-- **Creates:** `git/adapter.ts` wrapping `simple-git`: `readRef`, `updateRefCAS(ref, expectedOld, new)`, `readBlobFromRef`, `commitTreeToRef` (build a commit on an orphan ref without touching the worktree), `listWorktrees`, `fetch/push ref`. Implements the locking approach chosen in M1.2.
-- **Depends on:** M2.1, M1.2
+- **Creates:** `git/adapter.ts` wrapping `simple-git`: `readRef`, `updateRefCAS(ref, newSha, oldSha)` (argument order per M1.2's ADR — the *third* argument is the compare; inverting it yields a CAS that always succeeds), `readBlobFromRef`, `commitTreeToRef` (build a commit on an orphan ref without touching the worktree), `listWorktrees`, `fetch/push ref`. Implements the locking approach chosen in M1.2 — `git update-ref` CAS, plus the ref-name validation, cwd pinning and `--end-of-options` obligations that ADR records.
+- **Depends on:** M2.1, M1.2, M1.3
 - **Done when:** two processes calling `updateRefCAS` with the same expected old value → exactly one succeeds; works from a secondary worktree.
 
 ### M2.7 Event log
-- **Creates:** `events/schema.ts` (event union), `events/log.ts` (`append(event)`, `read({since, ticket, actor})`, monthly file layout under the coordination ref, ULID ids), `events/ref.ts` (initialize the ref; `mode: branch-scan` fallback reads `.cankan/events/` in-tree instead).
+- **Creates:** `events/schema.ts` (event union, validated at the boundary — ids are ULIDs on read as well as on mint), `events/log.ts` (`append(event)`, `read({since, ticket, actor})`, monthly file layout under the coordination ref, ULID ids, aggregation across month boundaries so a claim made before a UTC rollover is still visible after it), `events/ref.ts` (initialize the ref), and the lease-observation store under `$XDG_STATE_HOME/cankan/` (reader-local first-observation times, hashed path components, discarded on release) that M1.2's ADR requires for lease expiry. `mode: branch-scan` is **not** built here — M1.2 chose `shared-ref` and directs that the fallback stay documented and unimplemented until a concrete blocker appears.
 - **Wires:** git adapter (M2.6) to the JSONL format; append = read tree → add line → commit via CAS → retry on conflict.
-- **Depends on:** M2.6
+- **Depends on:** M2.6, M1.3
 - **Done when:** appends from two worktrees interleave without loss; `read()` returns them in ULID order.
 
 ### M2.8 Board state fold

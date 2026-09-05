@@ -1,0 +1,219 @@
+/**
+ * Locating and reading the three *file* layers of CONCEPT.md "Layers and
+ * precedence" (245-260) — global, repo, repo-local — resolving XDG paths per
+ * "Data directories (XDG)" (262-270). `env` and `default` are not files and
+ * have no path or parse step; `resolve.ts` handles them directly.
+ *
+ * This file is deliberately ignorant of `!policy` semantics. It hands back
+ * the parsed `yaml` `Document` (not just the validated JS value) so
+ * `resolve.ts` can walk the AST for `!policy`-tagged nodes itself — the
+ * `customTags` a caller wants registered are a parameter here, not a
+ * decision this file makes.
+ */
+
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { type Document, type Tags, parseDocument } from "yaml";
+import type { z } from "zod";
+import { CanKanError } from "../errors";
+import { ConfigErrorCodes } from "./errors";
+
+// ---------------------------------------------------------------------------
+// Contract §1 — layer identity. `resolve.ts` imports these; `index.ts`
+// re-exports them.
+// ---------------------------------------------------------------------------
+
+/** The five layers of CONCEPT.md "Layers and precedence", highest first. */
+export type ConfigLayer = "env" | "repo-local" | "repo" | "global" | "default";
+
+/** One config file that was found and parsed. Missing layers are absent. */
+export interface LoadedLayer {
+  layer: Exclude<ConfigLayer, "env" | "default">;
+  /** Absolute path of the file this layer was read from. */
+  file: string;
+  /** The parsed, schema-validated contents of that one file. */
+  data: Readonly<Record<string, unknown>>;
+}
+
+// ---------------------------------------------------------------------------
+// Path resolution (R11). Always reads from the injected `env`, never from
+// `process.env` directly — that is what lets the XDG-fallback branch be
+// tested without touching the developer's real environment (R11's
+// testability note; see the tests for why `process.env.X = undefined` can't
+// be used to exercise this).
+// ---------------------------------------------------------------------------
+
+/**
+ * `$XDG_CONFIG_HOME/cankan/config.yml`, defaulting to
+ * `$HOME/.config/cankan/config.yml` when `XDG_CONFIG_HOME` is unset or
+ * empty (R11).
+ */
+export function resolveGlobalConfigPath(
+  env: Readonly<Record<string, string | undefined>>,
+): string {
+  const xdgConfigHome = env.XDG_CONFIG_HOME;
+  const configHome =
+    xdgConfigHome !== undefined && xdgConfigHome.length > 0
+      ? xdgConfigHome
+      : join(env.HOME ?? "", ".config");
+  return join(configHome, "cankan", "config.yml");
+}
+
+/** `<repoRoot>/.cankan/config.yml`. */
+export function resolveRepoConfigPath(repoRoot: string): string {
+  return join(repoRoot, ".cankan", "config.yml");
+}
+
+/** `<repoRoot>/.cankan/local.yml`. */
+export function resolveRepoLocalConfigPath(repoRoot: string): string {
+  return join(repoRoot, ".cankan", "local.yml");
+}
+
+// ---------------------------------------------------------------------------
+// YAML parsing (R16 — the credential-leak mitigation) and per-layer schema
+// validation (R12, R13, S2).
+// ---------------------------------------------------------------------------
+
+/** A file that was read and parsed as YAML, but not yet schema-validated. */
+export interface ParsedYamlFile {
+  doc: Document.Parsed;
+  absPath: string;
+}
+
+function isEnoent(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    (err as { code?: unknown }).code === "ENOENT"
+  );
+}
+
+/**
+ * Reads and parses one YAML file. Returns `undefined` when the file does
+ * not exist (R12 — a missing layer is normal, not an error). Throws on any
+ * other read failure, and on a YAML syntax error.
+ *
+ * R16: `yaml@2.9.0`'s `YAMLParseError.message` quotes the offending source
+ * line verbatim — a syntax error near `personal.remote` would otherwise put
+ * a credential-bearing git URL straight into a message that gets logged.
+ * The message here is **always our own construction** from
+ * `doc.errors[0].linePos`; the original `YAMLParseError` goes into `cause`
+ * only, never into `message` or `details`. No `version` option is passed
+ * (S3) — `yaml`'s default is already YAML 1.2, under which `off`/`on` stay
+ * plain strings rather than booleanizing, exactly what `sync.auto_push`
+ * needs. `customTags` changes which tags resolve, not the schema version.
+ */
+export async function readYamlFile(
+  absPath: string,
+  customTags: Tags,
+): Promise<ParsedYamlFile | undefined> {
+  let text: string;
+  try {
+    text = await readFile(absPath, "utf8");
+  } catch (err) {
+    if (isEnoent(err)) {
+      return undefined;
+    }
+    throw new CanKanError(ConfigErrorCodes.INVALID_CONFIG, `${absPath}: could not be read`, {
+      cause: err,
+      details: { file: absPath },
+    });
+  }
+
+  const doc = parseDocument(text, { customTags });
+  if (doc.errors.length > 0) {
+    const cause = doc.errors[0];
+    const pos = cause?.linePos?.[0];
+    const location = pos ? `${pos.line}:${pos.col}` : "?:?";
+    throw new CanKanError(
+      ConfigErrorCodes.INVALID_CONFIG,
+      `${absPath}:${location}: YAML syntax error`,
+      { cause, details: { file: absPath } },
+    );
+  }
+
+  return { doc, absPath };
+}
+
+const MAX_ISSUE_KEY_DISPLAY_LEN = 40;
+
+function truncateForDisplay(value: string): string {
+  return value.length > MAX_ISSUE_KEY_DISPLAY_LEN
+    ? `${value.slice(0, MAX_ISSUE_KEY_DISPLAY_LEN)}…`
+    : value;
+}
+
+/**
+ * Describes one zod issue for R13's "names the offending key" — built from
+ * `issue.path` (and, for `unrecognized_keys`, `issue.keys`), never from
+ * `issue.message`.
+ *
+ * S2: for every issue kind *except* `unrecognized_keys`, zod's own
+ * `issue.message` never echoes an input value (verified: public issue
+ * objects carry only `{expected, code, path, message}`, no `input`) — but
+ * R13 says build our own text regardless, so this does, uniformly.
+ * `unrecognized_keys` is the one real exception: the offending key is not
+ * in `issue.path` at all, it is in `issue.keys`, and zod's own
+ * `issue.message` interpolates it verbatim. A YAML indentation mistake can
+ * turn a *value* into a *key* (e.g. a credential-bearing string used as an
+ * unintended map key), so that key is truncated to ~40 characters before it
+ * ever reaches a message or `details`. This bounds, but does not eliminate,
+ * the exposure — a ~40-character prefix of a secret is still a fragment of
+ * it, tracked here as accepted residual exposure rather than a full fix.
+ */
+function describeIssue(issue: z.core.$ZodIssue): string {
+  const pathStr = issue.path.length > 0 ? issue.path.join(".") : "(root)";
+  if (issue.code === "unrecognized_keys") {
+    const keys = issue.keys.map(truncateForDisplay).join(", ");
+    return `unrecognized key(s) [${keys}] at "${pathStr}"`;
+  }
+  return `invalid value at "${pathStr}" (${issue.code})`;
+}
+
+function buildLayerValidationError(absPath: string, error: z.ZodError): CanKanError {
+  const message = `${absPath}: ${error.issues.map(describeIssue).join("; ")}`;
+  return new CanKanError(ConfigErrorCodes.INVALID_CONFIG, message, {
+    cause: error,
+    details: { file: absPath },
+  });
+}
+
+/** A parsed-and-validated layer, plus the raw `Document` for `!policy` detection. */
+export interface ValidatedLayer {
+  layer: LoadedLayer;
+  doc: Document.Parsed;
+}
+
+/**
+ * Reads, parses, and schema-validates one layer file. Returns `undefined`
+ * when the file does not exist (R12). Throws a `CanKanError` naming the
+ * file for a read failure, a YAML syntax error (R16), or a schema
+ * validation failure (R13/S2).
+ */
+export async function loadValidatedLayer(
+  layer: LoadedLayer["layer"],
+  absPath: string,
+  schema: z.ZodType,
+  customTags: Tags,
+): Promise<ValidatedLayer | undefined> {
+  const parsed = await readYamlFile(absPath, customTags);
+  if (!parsed) {
+    return undefined;
+  }
+
+  const raw = parsed.doc.toJS() ?? {};
+  const result = schema.safeParse(raw);
+  if (!result.success) {
+    throw buildLayerValidationError(absPath, result.error);
+  }
+
+  return {
+    layer: {
+      layer,
+      file: absPath,
+      data: Object.freeze(result.data as Record<string, unknown>),
+    },
+    doc: parsed.doc,
+  };
+}

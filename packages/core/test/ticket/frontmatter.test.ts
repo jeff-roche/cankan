@@ -344,3 +344,122 @@ describe("frontmatter structural and YAML errors never echo source text", () => 
     expect(error.details?.issues).toBeDefined();
   });
 });
+
+describe("round 1 fix-in: YAML anchors/aliases are rejected outright (I-1, I-2)", () => {
+  test("(I-1) an alias-expansion bomb surfaces as a CanKanError, not a raw ReferenceError", () => {
+    // Reproduced by the security reviewer: doc.errors is empty for this
+    // fixture (it is syntactically valid YAML), and yaml@2.9.0 only throws
+    // its resource-exhaustion guard inside toJS(), which used to sit
+    // outside every try/catch in this module.
+    function buildAliasBomb(depth: number): string {
+      let src = "a0: &a0 [x, x, x, x, x, x, x, x, x, x]\n";
+      for (let i = 1; i <= depth; i++) {
+        src += `a${i}: &a${i} [*a${i - 1}, *a${i - 1}, *a${i - 1}, *a${i - 1}, *a${i - 1}, *a${i - 1}, *a${i - 1}, *a${i - 1}, *a${i - 1}, *a${i - 1}]\n`;
+      }
+      return src;
+    }
+    const raw = `---\nid: ck-1\ntitle: t\nstatus: todo\n${buildAliasBomb(3)}---\nbody\n`;
+
+    let thrown: unknown;
+    try {
+      parseTicketFile(raw);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeDefined();
+    expect(isCanKanError(thrown)).toBe(true);
+    expect((thrown as { code: string }).code).toBe(TicketErrorCodes.FRONTMATTER_MALFORMED);
+  });
+
+  test("(I-2) a cyclic anchor does not return a JSON.stringify-hostile frontmatter object", () => {
+    // Reproduced by the security reviewer: `x: &a [*a]` used to return
+    // normally from parseTicketFile with a self-referential `frontmatter.x`
+    // that JSON.stringify cannot encode — a shared-board denial of service
+    // via one committed ticket file.
+    const raw = "---\nid: ck-1\ntitle: t\nstatus: todo\nx: &a [*a]\n---\nb\n";
+
+    let thrown: unknown;
+    try {
+      parseTicketFile(raw);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeDefined();
+    expect(isCanKanError(thrown)).toBe(true);
+    expect((thrown as { code: string }).code).toBe(TicketErrorCodes.FRONTMATTER_MALFORMED);
+  });
+});
+
+describe("round 1 fix-in: setScalarField on an existing empty/null scalar field (I-4)", () => {
+  test("succeeds and produces reparseable YAML, instead of splicing into a zero-width range with no separating space", () => {
+    // Reproduced by the security reviewer: an unknown/passthrough field
+    // left blank (`epic:` with nothing after it — a legitimate real-world
+    // state) is a `null` scalar with a zero-width range positioned right
+    // after the colon. Splicing the new value straight into that range
+    // used to produce `epic:EPIC-9` (no space), which the reparse then
+    // rejected as malformed YAML with the misleading FRONTMATTER_REJECTED
+    // code.
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\nepic:\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+
+    const mutated = setScalarField(parsed, "epic", "EPIC-9");
+    const output = serializeTicketFile(mutated);
+
+    expect(output).toBe("---\nid: ck-1\ntitle: x\nstatus: To Do\nepic: EPIC-9\n---\nbody\n");
+    // The reparse inside setScalarField must have succeeded silently; this
+    // is a second, independent confirmation via a fresh parse of the result.
+    expect(parseTicketFile(output).frontmatter.status).toBe("To Do");
+  });
+});
+
+describe("round 1 fix-in: mutation on a CRLF-authored ticket file uses the file's own newline convention (M-4)", () => {
+  const CRLF_TICKET = "---\r\nid: ck-1\r\ntitle: x\r\nstatus: To Do\r\n---\r\nbody\r\n";
+
+  test("round-trips byte-identically with no mutation", () => {
+    const parsed = parseTicketFile(CRLF_TICKET);
+    expect(serializeTicketFile(parsed)).toBe(CRLF_TICKET);
+  });
+
+  test("appending a new scalar field uses \\r\\n, not \\n", () => {
+    const parsed = parseTicketFile(CRLF_TICKET);
+    const mutated = setScalarField(parsed, "priority", "high");
+    const output = serializeTicketFile(mutated);
+    expect(output).toBe("---\r\nid: ck-1\r\ntitle: x\r\nstatus: To Do\r\npriority: high\r\n---\r\nbody\r\n");
+    expect(output).not.toContain("high\n---"); // would indicate a bare LF was mixed in
+  });
+
+  test("inserting a cankan: block uses \\r\\n throughout", () => {
+    const parsed = parseTicketFile(CRLF_TICKET);
+    const mutated = setCankanBlock(parsed, { display_id: "PROJ-1" });
+    const output = serializeTicketFile(mutated);
+    expect(output).toBe(
+      "---\r\nid: ck-1\r\ntitle: x\r\nstatus: To Do\r\ncankan:\r\n  display_id: PROJ-1\r\n---\r\nbody\r\n",
+    );
+  });
+});
+
+describe("round 1 fix-in: setScalarField guards (M-5, M-6)", () => {
+  test("(M-5) rejects a key containing a newline, before it can inject a second frontmatter line", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    let thrown: unknown;
+    try {
+      setScalarField(parsed, "evil\nrole: admin", "x");
+    } catch (e) {
+      thrown = e;
+    }
+    expect(isCanKanError(thrown)).toBe(true);
+  });
+
+  test("(M-6) rejects setting a field that is currently a sequence, with a clear error rather than an indirect schema-validation failure", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\nassignee: [alice]\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    let thrown: unknown;
+    try {
+      setScalarField(parsed, "assignee", "bob");
+    } catch (e) {
+      thrown = e;
+    }
+    expect(isCanKanError(thrown)).toBe(true);
+  });
+});

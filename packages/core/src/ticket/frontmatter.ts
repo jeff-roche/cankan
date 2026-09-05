@@ -1,5 +1,14 @@
 import matter from "gray-matter";
-import { type ParsedNode, type Scalar, isMap, isScalar, parseDocument, stringify } from "yaml";
+import {
+  type ParsedNode,
+  type Scalar,
+  isMap,
+  isScalar,
+  parseDocument,
+  stringify,
+  visit,
+} from "yaml";
+import type { Document } from "yaml";
 import { CanKanError, ErrorCodes } from "../errors";
 import { TicketErrorCodes } from "./errors";
 import { type CankanBlock, type TicketFrontmatter, ticketFrontmatterSchema } from "./schema";
@@ -53,6 +62,22 @@ import { type CankanBlock, type TicketFrontmatter, ticketFrontmatterSchema } fro
  * about (`{ language: "yaml" }`, and a *partial* `engines` map naming an
  * unrelated language): both leave the payload executing. `callMatter` below
  * is the single call site; every parse goes through it.
+ *
+ * ## A YAML syntax error's error code depends on which parser caught it
+ *
+ * A plain YAML syntax error inside frontmatter (e.g. an unterminated flow
+ * sequence) is usually caught by gray-matter's own `js-yaml` engine
+ * *inside* `callMatter`, before `yaml.parseDocument` in
+ * `parseFrontmatterData` ever runs — so it surfaces as
+ * `TicketErrorCodes.FRONTMATTER_REJECTED` (the security-gate code), not
+ * `FRONTMATTER_MALFORMED` (whose own doc comment says "invalid YAML").
+ * `FRONTMATTER_MALFORMED` is reachable too, but only for YAML that
+ * gray-matter's more lenient `js-yaml` tolerates (or silently mis-parses —
+ * see the tab-indentation test) while `yaml`'s stricter parser rejects.
+ * Both paths avoid echoing source text into `message`/`details` either way
+ * (Ruling 4), but a downstream consumer that branches on the exact code
+ * (M3.10's exit-code mapping) should not assume "malformed YAML" always
+ * means `FRONTMATTER_MALFORMED`.
  */
 
 type GrayMatterEngines = NonNullable<NonNullable<Parameters<typeof matter>[1]>["engines"]>;
@@ -193,6 +218,23 @@ function formatYamlErrorMessage(
     : "Ticket frontmatter YAML is invalid";
 }
 
+/**
+ * True if `doc` contains a YAML anchor/alias anywhere (e.g. `&a`/`*a`).
+ * Backlog.md never emits one, and this module rejects them outright rather
+ * than ever calling `doc.toJS()` on one — see `parseFrontmatterData`'s
+ * comment for why.
+ */
+function containsAlias(doc: Document): boolean {
+  let found = false;
+  visit(doc, {
+    Alias() {
+      found = true;
+      return visit.BREAK;
+    },
+  });
+  return found;
+}
+
 function parseFrontmatterData(frontmatterText: string, path: string | undefined) {
   const doc = parseDocument(frontmatterText);
   if (doc.errors.length > 0) {
@@ -206,7 +248,45 @@ function parseFrontmatterData(frontmatterText: string, path: string | undefined)
       { cause: error },
     );
   }
-  return { doc, data: doc.toJS() as unknown };
+
+  // Anchors/aliases are rejected outright, before `toJS()` ever runs. Two
+  // independent reasons, both confirmed by execution against yaml@2.9.0:
+  // (1) `yaml` enforces its alias-expansion resource-exhaustion limit at
+  // `toJS()` time, not `parseDocument()` time — `doc.errors` is empty for a
+  // 175-byte file with a handful of nested anchors, and `toJS()` throws a
+  // raw `ReferenceError` ("Excessive alias count indicates a resource
+  // exhaustion attack") that is not a `YAMLParseError` and is not caught by
+  // the check above. (2) A cyclic anchor (`x: &a [*a]`) does not throw at
+  // all — `toJS()` returns a self-referential object that `JSON.stringify`
+  // cannot encode, breaking every `--json` consumer that touches it later,
+  // far from where the ticket was parsed. Backlog.md never emits an anchor
+  // or alias, so rejecting them here costs nothing real.
+  if (containsAlias(doc)) {
+    throw new CanKanError(
+      TicketErrorCodes.FRONTMATTER_MALFORMED,
+      path
+        ? `Ticket frontmatter at ${path} uses a YAML anchor or alias, which is not supported`
+        : "Ticket frontmatter uses a YAML anchor or alias, which is not supported",
+    );
+  }
+
+  // `toJS()` is a third-party throw site independent of the `doc.errors`
+  // check above (see the anchor/alias comment) — wrapped defensively so a
+  // future `yaml` release's new failure mode still surfaces as a
+  // `CanKanError`, not a raw exception with `isCanKanError() === false`.
+  let data: unknown;
+  try {
+    data = doc.toJS();
+  } catch (cause) {
+    throw new CanKanError(
+      TicketErrorCodes.FRONTMATTER_MALFORMED,
+      path
+        ? `Ticket frontmatter at ${path} could not be converted from YAML`
+        : "Ticket frontmatter could not be converted from YAML",
+      { cause },
+    );
+  }
+  return { doc, data };
 }
 
 function validateFrontmatter(data: unknown, path: string | undefined): TicketFrontmatter {
@@ -293,17 +373,31 @@ function scalarText(value: string | number | boolean): string {
   return stringify(value, { lineWidth: 0 }).replace(/\r?\n$/, "");
 }
 
+// A bare YAML plain key may not contain a newline or a colon-space
+// sequence — either would let a caller-supplied `key` inject a second
+// frontmatter line via the "append new key" branch below. `key` is not
+// attacker-controlled today (only this module's own callers choose it),
+// but the security lens is on for this task and the guard is one check.
+const UNSAFE_KEY_RE = /[\n\r]|: /;
+
 /**
  * Sets one top-level scalar frontmatter field (e.g. `status`) via a
  * targeted splice of the field's value range in the raw frontmatter text.
  * Nothing else in the file changes: unknown keys, key order, quoting,
  * indentation, list style, the rest of the frontmatter, and the entire body
  * are untouched, byte for byte. If `key` is not already present, a new
- * `key: value` line is appended just before the closing delimiter.
+ * `key: value` line is appended just before the closing delimiter, using
+ * whatever newline convention the file's own opening delimiter uses (so a
+ * CRLF-authored file does not get an LF line mixed into it).
  *
  * Deliberately scoped to a single scalar — this is not a general YAML
- * editor. A ticket id passed as `value` must already carry whatever casing
- * belongs on disk (`ticket/id.ts`'s `keepOnDiskIdCasing`); never pass
+ * editor. Throws (the shared `USAGE` code) if the existing field is not a
+ * scalar (e.g. `assignee: [alice]` is a sequence) — this would otherwise
+ * fail only later, indirectly, when the reparse's schema validation
+ * rejects the resulting shape.
+ *
+ * A ticket id passed as `value` must already carry whatever casing belongs
+ * on disk (`ticket/id.ts`'s `keepOnDiskIdCasing`); never pass
  * `normalizeTicketIdForComparison`'s output here.
  */
 export function setScalarField(
@@ -311,29 +405,64 @@ export function setScalarField(
   key: string,
   value: string | number | boolean,
 ): ParsedTicket {
+  if (UNSAFE_KEY_RE.test(key)) {
+    throw new CanKanError(ErrorCodes.USAGE, "Field name is not a valid single-line YAML key", {
+      details: { key },
+    });
+  }
+
   const split = requireSplit(ticket);
   const { map } = findTopLevelPair(split.frontmatterText);
   const pair = map?.items.find((item) => isScalar(item.key) && item.key.value === key);
+
+  if (pair?.value && !isScalar(pair.value)) {
+    throw new CanKanError(
+      ErrorCodes.USAGE,
+      `Field "${key}" is not a scalar; setScalarField only sets scalar fields`,
+      { details: { key } },
+    );
+  }
+
   const newValueText = scalarText(value);
+  const newline = detectNewline(split);
 
   let newFrontmatterText: string;
   if (pair?.value && isRangedNode(pair.value)) {
     const [start, end] = pair.value.range;
+    // An existing key with no value (`epic:` — a zero-width, `null`
+    // scalar) has `start === end`, positioned immediately after the
+    // colon. Splicing the new value straight into that zero-width range
+    // butts it against the colon with no separating space
+    // (`epic:EPIC-9`), which the reparse below then rejects as malformed
+    // YAML — a real, reachable case for any passthrough/unknown field left
+    // blank, not just a theoretical one.
+    const replacement = start === end ? ` ${newValueText}` : newValueText;
     newFrontmatterText =
-      split.frontmatterText.slice(0, start) + newValueText + split.frontmatterText.slice(end);
+      split.frontmatterText.slice(0, start) + replacement + split.frontmatterText.slice(end);
   } else {
-    newFrontmatterText = `${split.frontmatterText}${key}: ${newValueText}\n`;
+    newFrontmatterText = `${split.frontmatterText}${key}: ${newValueText}${newline}`;
   }
 
   return reparseWithFrontmatter(ticket, split, newFrontmatterText);
 }
 
-function indentBlock(text: string): string {
+function indentBlock(text: string, newline: string): string {
   return text
     .replace(/\r?\n$/, "")
-    .split("\n")
+    .split(/\r?\n/)
     .map((line) => (line.length > 0 ? `  ${line}` : line))
-    .join("\n");
+    .join(newline);
+}
+
+/**
+ * The newline convention already used by this ticket file, derived from its
+ * own opening delimiter line. Freshly-generated bytes (an appended
+ * `key: value` line, an inserted/replaced `cankan:` block) use this instead
+ * of hardcoding `"\n"`, so a CRLF-authored file does not end up with mixed
+ * line endings after a mutation.
+ */
+function detectNewline(split: TicketFileSplit): string {
+  return split.opening.endsWith("\r\n") ? "\r\n" : "\n";
 }
 
 /**
@@ -350,9 +479,12 @@ export function setCankanBlock(
   const split = requireSplit(ticket);
   const { map } = findTopLevelPair(split.frontmatterText);
   const pair = map?.items.find((item) => isScalar(item.key) && item.key.value === "cankan");
+  const newline = detectNewline(split);
 
   const replacementText =
-    block === undefined ? "" : `cankan:\n${indentBlock(stringify(block, { lineWidth: 0 }))}\n`;
+    block === undefined
+      ? ""
+      : `cankan:${newline}${indentBlock(stringify(block, { lineWidth: 0 }), newline)}${newline}`;
 
   let newFrontmatterText: string;
   if (pair && isRangedNode(pair.key) && pair.value && isRangedNode(pair.value)) {

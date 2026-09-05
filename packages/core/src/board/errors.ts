@@ -65,4 +65,39 @@ export const BoardErrorCodes = {
    * repeatedly, before ever publishing a write."
    */
   REGISTRY_LOCK_LOST: "REGISTRY_LOCK_LOST",
+  /**
+   * `resolveBoard()`'s `cwd` does not exist (`fs.realpath` failed
+   * `ENOENT`). Never falls through to the personal board for this --
+   * CONCEPT.md §6c's privacy default means an unresolvable, explicitly
+   * requested location must be a visible error, not a silent
+   * reclassification into "the user's private board."
+   */
+  CWD_NOT_FOUND: "CWD_NOT_FOUND",
+  /**
+   * `resolveBoard({ flag: { kind: "repo" } })` was called from a `cwd` that
+   * is not inside an inited repo board -- including a `cwd` inside the
+   * personal board's own tree, which the addendum-2 privacy fix excludes
+   * from counting as "a repo" for this purpose too. An explicit `--board
+   * repo` request must fail visibly rather than silently fall through to
+   * the personal board (same reasoning CONCEPT.md §6c's privacy default
+   * applies to the no-flag case).
+   */
+  NOT_INSIDE_REPO_BOARD: "NOT_INSIDE_REPO_BOARD",
+  /**
+   * `resolveBoard({ flag: { kind: "name", name } })` found no registry
+   * entry for `name` at all. Distinct from `BOARD_DIRECTORY_MISSING`
+   * (`registry.ts`), which is "registered, but its directory vanished" --
+   * this is "never registered in the first place."
+   */
+  BOARD_NOT_REGISTERED: "BOARD_NOT_REGISTERED",
+  /**
+   * `resolveBoard({ flag: { kind: "name", name } })` found a registered
+   * entry whose canonical directory *is* the personal board. `register()`
+   * refuses this at write time (`CANNOT_REGISTER_PERSONAL_BOARD`) for a
+   * path matching exactly, but a hand-edited `repos.yml` entry can still
+   * reach the personal board through a symlink alias that only
+   * `buildBoardRef`'s canonicalization reveals -- caught here instead of
+   * letting an explicit repo selector resolve to the personal board.
+   */
+  REGISTERED_BOARD_IS_PERSONAL: "REGISTERED_BOARD_IS_PERSONAL",
 } as const;

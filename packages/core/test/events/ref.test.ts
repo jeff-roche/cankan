@@ -197,6 +197,38 @@ describe("initRef — fix round 1, S3: refuses to report success on a ref that i
     }
   });
 
+  test("fix round 5, Low E: the race-winner path also carries the real cause (untested by fix round 4's own test)", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const other = await createGitAdapter(repo.dir);
+
+    const hooks: InitRefHooks = {
+      beforeCas: async () => {
+        // A concurrent process wins the create-the-ref race with a ref
+        // planted directly at a blob -- unusable, not merely "someone
+        // else's valid ref." This drives `initRefCore`'s *other*
+        // `checkRefUsability` call site (the one after losing the
+        // `parent: null` race, `ref.ts`'s `winnerResult` branch) rather
+        // than the `existing !== null` branch fix round 4's own Low 1
+        // test already covers.
+        const blobSha = rawGit(repo.dir, ["hash-object", "-w", "--stdin"], "not a tree or a commit").trim() as ObjectSha;
+        const planted = await other.updateRefCAS(COORD_REF, blobSha, null);
+        if (planted.outcome !== "applied") throw new Error("setup failed");
+      },
+    };
+
+    try {
+      await initRefCore(adapter, COORD_REF, { now: NOW }, hooks);
+      throw new Error("expected initRefCore() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_REF_UNUSABLE);
+      expect(error.cause).toBeDefined();
+      if (!isCanKanError(error.cause)) throw new Error("expected error.cause to be a CanKanError");
+      expect(error.cause.code).toBe(GitErrorCodes.GIT_COMMAND_FAILED);
+    }
+  });
+
   test("fix round 2, NEW-1: a peer-planted directory at the fixed probe path does not make a healthy ref look unusable", async () => {
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);

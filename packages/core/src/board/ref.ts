@@ -208,8 +208,18 @@ function checkContainment(root: string, resolved: string, configValue: string): 
  * Never creates anything. See the file header's "Board resolution is
  * read-only" note for why this replaces the old create-then-realpath
  * approach.
+ *
+ * Exported (`resolve.ts`'s `canonicalPersonalPath`): comparing a candidate
+ * board's already-`realpath`'d `root`/`ticketsDir` against a *raw*
+ * personal-board path is the same category error a symlinked-ancestor
+ * `$XDG_DATA_HOME` reopens for a personal board that has not been created
+ * yet (raw and canonical forms disagree exactly there) — this function is
+ * the correct canonicalization for "the personal board's path, whether or
+ * not it exists," reused rather than re-derived for the same reason
+ * `isContained` is shared between this file, `resolve.ts`, and
+ * `registry.ts`.
  */
-async function realpathExistingPrefix(target: string): Promise<string> {
+export async function realpathExistingPrefix(target: string): Promise<string> {
   const suffix: string[] = [];
   let current = target;
   for (;;) {

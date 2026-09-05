@@ -859,6 +859,109 @@ describe("fix round 2 -- F8: canonicalPersonalPath's guard must not vanish just 
   });
 });
 
+describe("fix round 3 -- F10: canonicalPersonalPath's fallback must canonicalize, not just avoid undefined", () => {
+  // F8's fix (fall back to the *raw* path rather than `undefined`) is
+  // itself incomplete: if `$XDG_DATA_HOME` is a symlink (FreeBSD ships
+  // `/home -> /usr/home` by default) AND the personal board has never
+  // been created, the raw fallback and the already-`realpath`'d
+  // `ref.ticketsDir`/`ref.root` it's compared against disagree on the
+  // symlinked prefix -- the exact category error this whole phase opened
+  // with, one level deeper. `realpathExistingPrefix` (reused from
+  // `ref.ts`) resolves the deepest *existing* ancestor -- which, here, is
+  // the symlink itself -- and re-appends the rest, so the fallback is
+  // canonical even though the path it names does not fully exist yet.
+  async function setUpSymlinkedDataHome(): Promise<{
+    homeParent: string;
+    dataLink: string;
+    realData: string;
+    cleanup: () => Promise<void>;
+  }> {
+    const homeParent = await mkdtemp(join(tmpdir(), "cankan-resolve-f10-"));
+    const realData = join(homeParent, "realdata");
+    const dataLink = join(homeParent, "datalink");
+    await mkdir(realData, { recursive: true });
+    await symlink(realData, dataLink);
+    return {
+      homeParent,
+      dataLink,
+      realData,
+      cleanup: () => rm(homeParent, { recursive: true, force: true }),
+    };
+  }
+
+  test("F10: --board <name> against a steered-ancestor entry is refused even when $XDG_DATA_HOME is itself a symlink and the personal board was never created", async () => {
+    const setup = await setUpSymlinkedDataHome();
+    try {
+      await withEnv({ XDG_DATA_HOME: setup.dataLink }, async () => {
+        const env = hermeticEnv();
+        // Deliberately no ensurePersonalBoard() call.
+        await writeRepoConfigFile(setup.dataLink, "config.yml", "tickets_dir: cankan/personal/backlog/tasks\n");
+        await register("umbrella", setup.dataLink, env);
+        const outsider = await makeTempRepo();
+        try {
+          let thrown: unknown;
+          try {
+            await resolveBoard({ cwd: outsider.dir, flag: { kind: "name", name: "umbrella" }, env });
+          } catch (err) {
+            thrown = err;
+          }
+          expect(isCanKanError(thrown)).toBe(true);
+          expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+        } finally {
+          await outsider.cleanup();
+        }
+      });
+    } finally {
+      await setup.cleanup();
+    }
+  });
+
+  test("F10: a no-flag resolution from that same symlinked-ancestor repo also falls through to personal", async () => {
+    const setup = await setUpSymlinkedDataHome();
+    try {
+      await withEnv({ XDG_DATA_HOME: setup.dataLink }, async () => {
+        const env = hermeticEnv();
+        await writeRepoConfigFile(setup.dataLink, "config.yml", "tickets_dir: cankan/personal/backlog/tasks\n");
+
+        const board = await resolveBoard({ cwd: setup.dataLink, env });
+        expect(board.kind).toBe("personal");
+      });
+    } finally {
+      await setup.cleanup();
+    }
+  });
+});
+
+describe("fix round 3 -- F11: the enclosing direction (F6) composed with the cwd-walk entry points (F7)", () => {
+  // F6's third `isContained` clause was tested only via `--board <name>`;
+  // F7's walk-path tests only exercise the *into* direction. Dropping F6's
+  // clause with no other change fails only the two `--board <name>` F6
+  // tests -- the walk-based rows flip with nothing noticing. This is the
+  // one test in the gap: the *enclosing* direction, reached by `cd`ing
+  // into a `$HOME`-rooted board directly (no registry involved at all).
+  test("F11: a $HOME-rooted board with tickets_dir steered to enclose the personal board is refused via --board repo and no-flag, not only --board <name>", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      await ensurePersonalBoard({ env });
+      const home = env.HOME;
+      if (!home) throw new Error("test setup: HOME not set by hermeticEnv()");
+      await writeRepoConfigFile(home, "config.yml", "tickets_dir: .local\n");
+
+      let thrown: unknown;
+      try {
+        await resolveBoard({ cwd: home, flag: { kind: "repo" }, env });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("NOT_INSIDE_REPO_BOARD");
+
+      const board = await resolveBoard({ cwd: home, env });
+      expect(board.kind).toBe("personal");
+    });
+  });
+});
+
 describe("resolveBoard -- BoardRef.name agrees between cwd resolution and --board <name>", () => {
   test("a registered repo's name comes from the registry, not the directory's basename, when resolved with no flag or --board repo", async () => {
     await withEnv(undefined, async () => {

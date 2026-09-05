@@ -133,13 +133,13 @@ export const EventErrorCodes = {
    * ultimately depends on. Raised instead of `initRef` silently reporting
    * success. **Fix round 2, NEW-1**: a peer-triggerable `GIT_BLOB_AMBIGUOUS`
    * (a directory or non-blob entry planted at the probe path) is *not*
-   * treated as unusable — see `ref.ts`'s `assertRefIsUsable` doc comment.
+   * treated as unusable — see `ref.ts`'s `checkRefUsability` doc comment.
    * **Known residual gap** (Orchestrator Ruling R19): a ref planted at a
    * raw tree, or at *any* annotated tag (fix round 2 doc correction — not
    * only one peeling to a tree; a tag pointing straight at a commit is
    * unusable too, since `commit-tree -p` needs its argument to resolve
    * directly to a commit), is *also* unusable but is not detected by this
-   * code — see `ref.ts`'s `assertRefIsUsable` doc comment for why, and for
+   * code — see `ref.ts`'s `checkRefUsability` doc comment for why, and for
    * the M2.6 addition (an object-type query) that would close it.
    */
   EVENT_REF_UNUSABLE: "EVENT_REF_UNUSABLE",

@@ -43,6 +43,26 @@ const USABILITY_PROBE_PATH = "events/.cankan-ref-usability-probe";
 type RefUsability = "usable" | "absent" | "unusable";
 
 /**
+ * `checkRefUsability`'s full result: the outcome plus, for `"unusable"`,
+ * the underlying error that produced it. **Fix round 4, Low 1**: the fix
+ * round 3 refactor (`assertRefIsUsable` throwing directly →
+ * `checkRefUsability` returning a bare `RefUsability` string) silently
+ * dropped this — both `initRefCore` call sites passed `refUnusableError`
+ * a hardcoded `undefined` for `cause`, so `EVENT_REF_UNUSABLE` stopped
+ * carrying the real `GIT_COMMAND_FAILED` (or whatever else) that actually
+ * explains *why* the ref is unusable, a diagnosability regression against
+ * fm8's "identify the offending ref/commit/file" (and, transitively,
+ * whatever underlying git failure produced that state) that fix round 2's
+ * `EVENT_REF_UNUSABLE` originally provided. `cause` is `undefined` for
+ * `"usable"`/`"absent"` (there is nothing to explain) and the real caught
+ * error for `"unusable"`.
+ */
+interface RefUsabilityResult {
+  readonly usability: RefUsability;
+  readonly cause?: unknown;
+}
+
+/**
  * `readRef` returning non-null only proves *some* git object exists at
  * `ref` — not that it is a usable coordination ref (fix round 1, S3).
  * Verified directly (real `update-ref`/`commit-tree`, not assumed): a ref
@@ -118,20 +138,20 @@ type RefUsability = "usable" | "absent" | "unusable";
  * ref, which is worse than leaving this one case undetected until the
  * M2.6 addition lands.
  */
-async function checkRefUsability(adapter: GitAdapter, validatedRef: string): Promise<RefUsability> {
+async function checkRefUsability(adapter: GitAdapter, validatedRef: string): Promise<RefUsabilityResult> {
   try {
     await adapter.readBlobFromRef(validatedRef, USABILITY_PROBE_PATH);
-    return "usable";
+    return { usability: "usable" };
   } catch (cause) {
     if (isCanKanError(cause)) {
       if (cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
-        return "usable";
+        return { usability: "usable" };
       }
       if (cause.code === GitErrorCodes.GIT_REF_NOT_FOUND) {
-        return "absent";
+        return { usability: "absent" };
       }
     }
-    return "unusable";
+    return { usability: "unusable", cause };
   }
 }
 
@@ -248,12 +268,15 @@ export async function initRefCore(
     // Fix round 1, S3 / fix round 3, L2: confirm the ref is usable before
     // reporting success — see `checkRefUsability`'s doc comment for what
     // each outcome means.
-    const usability = await checkRefUsability(adapter, validatedRef);
+    const { usability, cause } = await checkRefUsability(adapter, validatedRef);
     if (usability === "usable") {
       return;
     }
     if (usability === "unusable") {
-      throw refUnusableError(validatedRef, existing, undefined);
+      // Fix round 4, Low 1: `cause` threads the real underlying error
+      // (e.g. `GIT_COMMAND_FAILED`) back through — see
+      // `RefUsabilityResult`'s doc comment.
+      throw refUnusableError(validatedRef, existing, cause);
     }
     // usability === "absent": the ref existed a moment ago but is gone now
     // (a concurrent local deletion/reset) — fall straight through to the
@@ -309,11 +332,12 @@ export async function initRefCore(
   // — the same single-attempt reasoning applies a second time rather than
   // this function growing a retry loop to chase an increasingly
   // pathological race.
-  const winnerUsability = await checkRefUsability(adapter, validatedRef);
-  if (winnerUsability === "unusable") {
-    throw refUnusableError(validatedRef, winner, undefined);
+  const winnerResult = await checkRefUsability(adapter, validatedRef);
+  if (winnerResult.usability === "unusable") {
+    // Fix round 4, Low 1: see the identical note at the other call site above.
+    throw refUnusableError(validatedRef, winner, winnerResult.cause);
   }
-  if (winnerUsability === "absent") {
+  if (winnerResult.usability === "absent") {
     throw new CanKanError(
       EventErrorCodes.EVENT_REF_INIT_RACE_UNRESOLVED,
       "the ref existed immediately after this function's own write, but vanished again before it could be confirmed usable",

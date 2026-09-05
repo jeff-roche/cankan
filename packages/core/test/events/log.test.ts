@@ -549,6 +549,38 @@ describe("read — filters", () => {
     await expect(read(adapter, COORD_REF, { now: SEPT_15_MS, since: appended.event.id })).resolves.toEqual([]);
   });
 
+  test("fix round 5, Low F: a Symbol or a hostile toString for since is rejected with a CanKanError, not a leaked native error", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    // Before the fix: `isValidEventId`'s `ULID_PATTERN.test(value)`
+    // coerces its argument via `ToString` -- a `Symbol` throws a raw,
+    // unwrapped `TypeError` ("Cannot convert a symbol to a string"), and
+    // an object with a throwing `toString` lets that object's own error
+    // escape straight out of `read()`. Neither is a `CanKanError`.
+    try {
+      await read(adapter, COORD_REF, { now: SEPT_15_MS, since: Symbol("x") as unknown as EventId });
+      throw new Error("expected read() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+    }
+
+    const hostile = {
+      toString(): string {
+        throw new Error("hostile toString");
+      },
+    };
+    try {
+      await read(adapter, COORD_REF, { now: SEPT_15_MS, since: hostile as unknown as EventId });
+      throw new Error("expected read() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+    }
+  });
+
   test("ticket matches case-insensitively, canonicalized the same way append canonicalizes on write", async () => {
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);
@@ -937,6 +969,97 @@ describe("append — fix round 3 sweep: casRetry.maxAttempts validated against w
     const adapter = await createGitAdapter(repo.dir);
     const appended = await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: { maxAttempts: 3, backoffMs: () => 0 } });
     expect(appended.event.ticket as string).toBe("ck-1");
+  });
+});
+
+// ============================================================================
+// Fix round 5 — the corrected invariant applied to each option's own TYPE,
+// not just its value: three function-typed AppendOptions fields reached a
+// call site with no typeof check, each leaking a raw TypeError past
+// isCanKanError.
+// ============================================================================
+
+describe("append — fix round 5, High B: casRetry.backoffMs's own type validated at option-validation time", () => {
+  test("rejects a non-function backoffMs immediately, on a completely uncontended repo", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // Before the fix: `backoffMs` is only ever *called* between a failed
+    // attempt and the next one, so this exact non-function value would
+    // have passed silently here (no contention, no call) and only crashed
+    // with a raw TypeError the first time two workers actually raced --
+    // this test asserts it is caught immediately instead, matching every
+    // other option-shape check in this function.
+    for (const bad of [123, "x", {}] as const) {
+      try {
+        await append(adapter, COORD_REF, claim("ck-1"), { casRetry: { backoffMs: bad as unknown as (n: number) => number } });
+        throw new Error("expected append() to reject");
+      } catch (error) {
+        if (!isCanKanError(error)) throw error;
+        expect(error.code).toBe(EventErrorCodes.EVENT_APPEND_INVALID_OPTION);
+      }
+    }
+  });
+});
+
+describe("append — fix round 5, Medium C: ulidFactory's own type validated", () => {
+  test("rejects a non-function ulidFactory with a CanKanError, not a raw TypeError", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    for (const bad of [123, "x", {}] as const) {
+      try {
+        await append(adapter, COORD_REF, claim("ck-1"), { ulidFactory: bad as unknown as (seedTime?: number) => string });
+        throw new Error("expected append() to reject");
+      } catch (error) {
+        if (!isCanKanError(error)) throw error;
+        expect(error.code).toBe(EventErrorCodes.EVENT_APPEND_INVALID_OPTION);
+      }
+    }
+  });
+
+  test("a ulidFactory returning garbage is still caught downstream by parseEvent, unchanged by this fix", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { ulidFactory: () => "not-a-ulid" }),
+      EventErrorCodes.EVENT_APPEND_REJECTED,
+    );
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-2"), { ulidFactory: () => 12345 as unknown as string }),
+      EventErrorCodes.EVENT_APPEND_REJECTED,
+    );
+  });
+});
+
+describe("append — fix round 5, Low D: casRetry.sleep's own type, and casRetry: null", () => {
+  test("rejects a non-function sleep", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    try {
+      await append(adapter, COORD_REF, claim("ck-1"), {
+        casRetry: { backoffMs: () => 0, sleep: 123 as unknown as (ms: number) => Promise<void> },
+      });
+      throw new Error("expected append() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_APPEND_INVALID_OPTION);
+    }
+  });
+
+  test("rejects casRetry: null, which otherwise dies inside withCasRetry with a raw TypeError", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    try {
+      await append(adapter, COORD_REF, claim("ck-1"), { casRetry: null as unknown as undefined });
+      throw new Error("expected append() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_APPEND_INVALID_OPTION);
+    }
   });
 });
 

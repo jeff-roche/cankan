@@ -281,7 +281,16 @@ function validateNowForMinting(now: number): void {
  * more caller-supplied entry point for an event id.
  */
 function validateSince(since: string): void {
-  if (!isValidEventId(since)) {
+  // Fix round 5, Low F: `typeof` checked *before* `isValidEventId`, whose
+  // `ULID_PATTERN.test(value)` coerces its argument via `ToString` —
+  // confirmed by probe (task-2-report.md's fix-round-5 addendum) that a
+  // `Symbol` throws a raw, unwrapped `TypeError` ("Cannot convert a symbol
+  // to a string") and an object with a throwing `toString` lets that
+  // object's own error escape straight out of `read()` — both the same
+  // past-`isCanKanError` shape this dispatch has now closed at every site
+  // it was found. Short-circuits before `isValidEventId` is ever called,
+  // so neither coercion path is reached for a non-string `since`.
+  if (typeof since !== "string" || !isValidEventId(since)) {
     // Obligation E: `since` is a caller-supplied string that has not yet
     // been validated as safe to publish — unlike `now`/`trailingMonths`
     // (numbers, whose string form is always a safe numeric literal), an
@@ -608,6 +617,17 @@ export interface AppendOptions {
    * `(seedTime?: number) => string`, and `monotonicFactory()`'s return
    * value accepts an explicit seed time — confirmed by probe, see
    * task-2-report.md).
+   *
+   * **Its own type is validated (fix round 5, Medium C); its *return
+   * value* already was, indirectly.** A non-function `ulidFactory`
+   * (confirmed by probe: `123`, `"x"`, `{}`) throws a raw, unwrapped
+   * `TypeError` ("... is not a function") the moment `append` tries to
+   * call it — the same past-`isCanKanError` shape closed for `ticket`
+   * (fix round 4) and `since` (fix round 4/5). A function that returns
+   * garbage (`() => "not-a-ulid"`, `() => 12345`) needed no separate fix:
+   * it already lands as `EVENT_APPEND_REJECTED` via `parseEvent`
+   * (Ruling R11), since the minted `id` is validated as part of the exact
+   * bytes about to be committed either way.
    */
   readonly ulidFactory?: (seedTime?: number) => string;
   /**
@@ -615,10 +635,27 @@ export interface AppendOptions {
    * reimplemented here. `maxAttempts` and `backoffMs`'s return value are
    * each validated against `withCasRetry`'s own loop/sleep domain before
    * this reaches M2.6 (fix round 3 sweep, Ruling R27; fix round 4, Medium
-   * 2) — see `MAX_CAS_ATTEMPTS`/`MAX_BACKOFF_MS`'s doc comments. `sleep`
-   * is passed through entirely unvalidated: overriding the actual wait
-   * primitive with a broken implementation is a caller-side bug, not a
-   * numeric value this module can meaningfully bound.
+   * 2) — see `MAX_CAS_ATTEMPTS`/`MAX_BACKOFF_MS`'s doc comments.
+   *
+   * **Fix round 5 — the object's own type, and its two function-typed
+   * fields' types, are also validated, at option-validation time (not
+   * inside the retry loop).** `casRetry: null` previously reached
+   * `withCasRetry` and died inside M2.6 with a raw `TypeError`
+   * ("null is not an object"); a non-function `backoffMs`/`sleep`
+   * (`123`, `"x"`, `{}`) previously threw a raw `TypeError` the first time
+   * it was actually *called* — for `backoffMs` specifically, that call
+   * only ever happens between a failed attempt and the next one, so an
+   * uncontended board never triggers it and every test or lightly-loaded
+   * production append would pass, with the crash arriving the first time
+   * two workers genuinely race. Both are the same past-`isCanKanError`
+   * shape as `ulidFactory`'s above, closed the same way: a `typeof` check
+   * before either function is ever invoked. `sleep`'s own *behavior*
+   * remains entirely the caller's responsibility once its type is
+   * confirmed — overriding the actual wait primitive with a broken
+   * implementation is a caller-side bug, not a value this module can
+   * meaningfully bound, which is the distinction `ticket`'s fix already
+   * drew between "can't bound the semantics" and "can still bound the
+   * type."
    */
   readonly casRetry?: CasRetryOptions;
   /**
@@ -759,6 +796,18 @@ export async function appendCore(
   // persistent lanes (not one shared, one disposable) are what preserve
   // monotonicity within an injected-clock sequence while still isolating it
   // from the real-clock path.
+  // Fix round 5, Medium C: `options.ulidFactory`'s own *type* — checked
+  // before it is ever called (`mint(now)`, below). A non-function value
+  // (confirmed by probe: `123`, `"x"`, `{}`) throws a raw, unwrapped
+  // `TypeError` the moment `append` tries to call it as a function — the
+  // same past-`isCanKanError` shape closed for `ticket` (fix round 4).
+  // Its *return* value needed no separate check: a malformed minted id
+  // already lands as `EVENT_APPEND_REJECTED` via `parseEvent`.
+  if (options.ulidFactory !== undefined && typeof options.ulidFactory !== "function") {
+    throw new CanKanError(EventErrorCodes.EVENT_APPEND_INVALID_OPTION, `ulidFactory must be a function, got ${typeof options.ulidFactory}`, {
+      details: { type: typeof options.ulidFactory },
+    });
+  }
   const mint = options.ulidFactory ?? (options.now !== undefined ? injectedClockUlidFactory : defaultUlidFactory);
   const maxExistingBlobBytes = options.maxExistingBlobBytes ?? MAX_MONTH_BLOB_BYTES;
   // Fix round 2 (Low) / fix round 4, Low 2: `NaN` would otherwise silently
@@ -781,6 +830,16 @@ export async function appendCore(
       { details: { maxExistingBlobBytes: typeof maxExistingBlobBytes === "number" ? maxExistingBlobBytes : null } },
     );
   }
+  // Fix round 5, Low D: `casRetry` itself being `null` slips past every
+  // `options.casRetry?.foo` optional-chained check below (`null?.foo` is
+  // safely `undefined`) and instead dies *inside* `withCasRetry`
+  // (`git/retry.ts`) with a raw `TypeError` ("null is not an object") the
+  // moment it tries `options.maxAttempts` on it. Checked once, up front,
+  // before any of the field-level checks that would otherwise silently
+  // treat `null` as "no override supplied."
+  if (options.casRetry === null) {
+    throw new CanKanError(EventErrorCodes.EVENT_APPEND_INVALID_OPTION, "casRetry must be an object, got null");
+  }
   // Fix round 3 sweep, Ruling R27: `casRetry.maxAttempts` is forwarded
   // as-is to `withCasRetry` (`git/retry.ts`), which does not validate it
   // itself — see `MAX_CAS_ATTEMPTS`'s doc comment for the two distinct
@@ -793,6 +852,37 @@ export async function appendCore(
       `casRetry.maxAttempts must be an integer in [1, ${MAX_CAS_ATTEMPTS}], got ${casMaxAttempts}`,
       { details: { maxAttempts: casMaxAttempts, max: MAX_CAS_ATTEMPTS } },
     );
+  }
+  // Fix round 5, High B: `casRetry.backoffMs`'s own *type*, checked here —
+  // at option-validation time, alongside `maxAttempts` — rather than only
+  // inside `withValidatedBackoff`'s wrapper at retry time. This matters
+  // because of *when* `backoffMs` is actually called: only between a
+  // failed attempt and the next one, so an uncontended board never
+  // invokes it — every test and every lightly-loaded production `append`
+  // would pass regardless, and a non-function value (confirmed by probe:
+  // `123`, `"x"`, `{}`) would only throw its raw, unwrapped `TypeError`
+  // the first time two workers genuinely race. Checking the type here
+  // surfaces the same defect immediately, on the very first call,
+  // matching every other option-shape check in this function.
+  const casBackoffMs = options.casRetry?.backoffMs;
+  if (casBackoffMs !== undefined && typeof casBackoffMs !== "function") {
+    throw new CanKanError(EventErrorCodes.EVENT_APPEND_INVALID_OPTION, `casRetry.backoffMs must be a function, got ${typeof casBackoffMs}`, {
+      details: { type: typeof casBackoffMs },
+    });
+  }
+  // Fix round 5, Low D: `casRetry.sleep`'s own type — its *behavior* once
+  // confirmed to be a function remains entirely the caller's
+  // responsibility (overriding the actual wait primitive with a broken
+  // implementation is a caller-side bug, not a value this module can
+  // meaningfully bound), but a non-function value still throws a raw,
+  // unwrapped `TypeError` the first time `withCasRetry` calls it, which a
+  // `typeof` check closes completely regardless of what `sleep` is used
+  // for.
+  const casSleep = options.casRetry?.sleep;
+  if (casSleep !== undefined && typeof casSleep !== "function") {
+    throw new CanKanError(EventErrorCodes.EVENT_APPEND_INVALID_OPTION, `casRetry.sleep must be a function, got ${typeof casSleep}`, {
+      details: { type: typeof casSleep },
+    });
   }
 
   // The id is minted once, before the retry loop — not per attempt. A retry

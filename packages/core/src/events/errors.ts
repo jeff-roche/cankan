@@ -30,7 +30,7 @@ export const EventErrorCodes = {
   EVENT_APPEND_REJECTED: "EVENT_APPEND_REJECTED",
   /**
    * An `AppendOptions` field (or a value returned by one) was shaped
-   * wrong. Raised before any git invocation, at three sites:
+   * wrong. Raised before any git invocation, at seven sites:
    * - `maxExistingBlobBytes` (fix round 2, Low; fix round 4, Low 2):
    *   must be `>= 0` (`Number.POSITIVE_INFINITY` — the documented
    *   recovery-write bypass — is explicitly allowed). `typeof v !==
@@ -39,11 +39,24 @@ export const EventErrorCodes = {
    *   object) is neither `NaN` nor `< 0` in JavaScript's own comparison
    *   semantics and previously passed both checks, silently disabling the
    *   cap.
+   * - `ulidFactory` (fix round 5, Medium C): must be a function — a
+   *   non-function value throws a raw, unwrapped `TypeError` the moment
+   *   `append` calls it.
+   * - `casRetry` itself (fix round 5, Low D): must not be `null` —
+   *   `null?.foo` optional-chains safely to `undefined` everywhere this
+   *   module checks a sub-field, so `null` previously slipped past every
+   *   one of them and died *inside* `withCasRetry` (M2.6) instead.
    * - `casRetry.maxAttempts` (fix round 3 sweep, Ruling R27): must be a
    *   finite integer in `[1, MAX_CAS_ATTEMPTS]` (`log.ts`) —
    *   `withCasRetry`'s own loop bound does not validate this itself,
    *   confirmed directly (`Infinity` makes the loop unbounded; `NaN`
    *   makes it never run even once).
+   * - `casRetry.backoffMs` itself (fix round 5, High B): must be a
+   *   function, checked at option-validation time rather than only inside
+   *   the wrapper described next — `backoffMs` is only ever called
+   *   between a failed attempt and the next one, so an uncontended board
+   *   never triggers a non-function value's `TypeError`, and the crash
+   *   would otherwise arrive the first time two workers actually race.
    * - `casRetry.backoffMs`'s *return value* (fix round 4, Medium 2): must
    *   be a finite number in `[0, MAX_BACKOFF_MS]` — an in-range
    *   `setTimeout` delay is not clamped the way an out-of-range one is,
@@ -52,6 +65,9 @@ export const EventErrorCodes = {
    *   firing immediately, defeating the same "bounded retry" obligation
    *   `maxAttempts` closes for attempt count, reachable instead through
    *   backoff duration.
+   * - `casRetry.sleep` itself (fix round 5, Low D): must be a function —
+   *   its behavior once confirmed to be one remains entirely the
+   *   caller's own responsibility.
    */
   EVENT_APPEND_INVALID_OPTION: "EVENT_APPEND_INVALID_OPTION",
   /**
@@ -127,6 +143,20 @@ export const EventErrorCodes = {
    * event's `id` compare as "not greater than," so `read()` returns `[]`
    * on a board that has events. All three are rejected here, before
    * either failure mode can occur.
+   *
+   * **`since`'s own validator needed a second fix (fix round 5, Low F).**
+   * `isValidEventId`'s `ULID_PATTERN.test(value)` coerces its argument via
+   * `ToString` — confirmed directly that a `Symbol` throws a raw,
+   * unwrapped `TypeError` ("Cannot convert a symbol to a string") and an
+   * object with a throwing `toString` lets that object's own error escape
+   * straight out of `read()`, neither as a `CanKanError`. A `typeof value
+   * !== "string"` check before the pattern test, short-circuiting before
+   * either coercion path runs, closes both.
+   *
+   * **`ticket` shares the same shape (fix round 4, corrected sweep) but a
+   * different message**, since it fails at a different consumer
+   * (`canonicalizeTicketId`'s `.toLowerCase()`, not a regex test) — see
+   * `log.ts`'s `validateTicketFilter`.
    */
   EVENT_LOG_INVALID_WINDOW: "EVENT_LOG_INVALID_WINDOW",
   /**

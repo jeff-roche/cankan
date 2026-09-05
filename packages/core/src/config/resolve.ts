@@ -679,9 +679,16 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
   // symlinked `.cankan` DIRECTORY is exactly that case: the repo and
   // repo-local guards both reject, and the filename in the message flipped
   // between `config.yml` and `local.yml` run to run (~25% locally). Settle
-  // all three, then rethrow in a fixed layer precedence -- repo, then
-  // repo-local, then global -- so a board with several broken layers always
-  // names the same one, and names the most specific.
+  // all three, then rethrow in a fixed order so a board with several broken
+  // layers always names the same file.
+  //
+  // That order is `repo`, then `repo-local`, then `global` -- deliberately
+  // NOT `FILE_LAYER_ORDER` (below), which is precedence order and puts
+  // `repo-local` first. Reporting order answers a different question than
+  // precedence does: `.cankan/config.yml` is the checked-in file a board
+  // must have to be inited, and the one a hostile-repo failure is actually
+  // about, whereas `local.yml` is optional and gitignored. Naming the
+  // required file first is what tells a user which one to go fix.
   const settled = await Promise.allSettled([
     globalPath
       ? loadValidatedLayer("global", globalPath, globalConfigSchema, POLICY_TAGS, false)
@@ -707,8 +714,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
   ]);
 
   const [globalSettled, repoSettled, repoLocalSettled] = settled;
-  // Precedence order, not array order: the most specific layer's failure is
-  // the one worth reporting.
+  // Reporting order (see above), not array order and not FILE_LAYER_ORDER.
   for (const outcome of [repoSettled, repoLocalSettled, globalSettled]) {
     if (outcome.status === "rejected") {
       throw outcome.reason;

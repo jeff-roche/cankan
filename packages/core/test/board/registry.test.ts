@@ -823,6 +823,72 @@ describe("registry -- F11: a hand-edited entry whose stored path is itself a sym
   });
 });
 
+describe("registry -- fix round 6: entry.path must be canonicalized the same existence-tolerant way the personal board's own path is", () => {
+  // This is the regression test for a real macOS CI failure: PR #92's
+  // build failed deterministically on macOS (2/2 runs) at a test that had
+  // been green on Linux 620/620 across three separate rounds. Root cause,
+  // confirmed against the code: `listRegisteredBoards` canonicalized the
+  // personal board's own path (`canonicalPersonalPath`, three-tier,
+  // existence-tolerant) but compared it against `entry.path` *raw* -- on
+  // macOS, `$TMPDIR` sits under `/var/folders/...`, itself a symlink to
+  // `/private/var/folders/...`, so with the personal board not yet
+  // created, the canonical form (`/private/var/folders/...`) and the raw
+  // stored form (`/var/folders/...`) disagreed even for an *exact* match,
+  // not only for a deliberate symlink alias. The consequence is not a
+  // test artifact: F7's guarantee ("the personal board can never be
+  // registered as a repo board") silently did not hold on macOS whenever
+  // the personal board had not been created yet.
+  //
+  // This test simulates the identical mechanism on *any* platform,
+  // including this Linux machine, by making `$XDG_DATA_HOME` itself a
+  // symlink -- the same category of prefix mismatch `canonicalPersonalPath`'s
+  // own three-tier fallback exists to close, now proven to require BOTH
+  // sides of the comparison to go through it, not just one.
+  test("a hand-edited entry naming the personal board's exact raw path is still caught when $XDG_DATA_HOME is itself a symlink", async () => {
+    const homeParent = await mkdtemp(join(tmpdir(), "cankan-registry-datahome-link-"));
+    const realData = join(homeParent, "realdata");
+    const dataLink = join(homeParent, "datalink");
+    await mkdir(realData, { recursive: true });
+    await symlink(realData, dataLink);
+    try {
+      await withEnv({ XDG_DATA_HOME: dataLink }, async () => {
+        const env = hermeticEnv();
+        // Deliberately no ensurePersonalBoard() call -- the personal
+        // board has never been created, the exact state that let this
+        // bug through (a created board's own directory would already be
+        // a real entry on disk, and stat/realpath would resolve
+        // `entry.path` through the symlink transparently regardless of
+        // this bug).
+        const rawPersonalPath = resolvePersonalBoardPath(env);
+        if (!rawPersonalPath) throw new Error("test setup: personal board path did not resolve");
+
+        const registryPath = resolveRegistryPath(env);
+        if (!registryPath) throw new Error("test setup: registry path did not resolve");
+        await writeFileEnsuringDir(
+          registryPath,
+          `version: 1\nrepos:\n  - name: sneaky\n    path: ${rawPersonalPath}\n    last_seen: 2026-01-01T00:00:00.000Z\n`,
+        );
+
+        const listing = await listRegisteredBoards(env);
+        expect(listing.boards).toHaveLength(0);
+        expect(listing.skipped).toHaveLength(1);
+        expect(listing.skipped[0]?.reason).toBe("is the personal board");
+
+        let thrown: unknown;
+        try {
+          await findRegisteredBoard("sneaky", env);
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+      });
+    } finally {
+      await rm(homeParent, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("registry -- F7: the personal board can never be registered as a repo board", () => {
   test("register() refuses the personal board's own directory", async () => {
     await withEnv(undefined, async () => {

@@ -95,7 +95,7 @@ import { basename, dirname, join } from "node:path";
 import { CanKanError, isCanKanError } from "../errors";
 import type { BoardRef } from "../types";
 import { BoardErrorCodes } from "./errors";
-import { canonicalPersonalPath, ensurePersonalBoard } from "./personal";
+import { canonicalPersonalPath, ensurePersonalBoard, isPersonalBoardPath } from "./personal";
 import { buildBoardRef, isContained } from "./ref";
 import { findRegisteredBoard, listRegisteredBoards } from "./registry";
 
@@ -319,8 +319,14 @@ async function walkForBoard(startDir: string, env: Env): Promise<WalkResult | un
   let current = startDir;
   for (;;) {
     if (await isDirectory(join(current, ".cankan"))) {
-      const personalPath = await canonicalPersonalPath(env);
-      if (personalPath !== undefined && isContained(personalPath, current)) {
+      // `current` already descends from `canonicalCwd`'s `realpath`, so
+      // it is already canonical -- routed through the shared
+      // `isPersonalBoardPath` anyway (fix round 6) for the same reason
+      // every personal-board comparison in this module now is: so this
+      // stays correct even if `current`'s own canonicalization guarantee
+      // is ever weakened by a future change, rather than relying on
+      // every call site to independently get that guarantee right.
+      if (await isPersonalBoardPath(current, env)) {
         return { kind: "personal-tree" };
       }
       return { kind: "repo", root: current };
@@ -358,8 +364,6 @@ export async function resolveBoard(options: ResolveBoardOptions): Promise<BoardR
         details: { name: flag.name },
       });
     }
-    const personalPath = await canonicalPersonalPath(env);
-
     // Pre-check, by root only, *before* buildBoardRef ever runs (security
     // review) -- mirroring walkForBoard's own pre-check for the cwd-walk
     // paths. `register()`/`listRegisteredBoards()` refuse a registry
@@ -373,16 +377,19 @@ export async function resolveBoard(options: ResolveBoardOptions): Promise<BoardR
     // that read (a malformed personal config, a `tickets_dir` there
     // escaping its own root, a bad `coordination.ref`) would publish
     // exactly the personal board's own path this error is written to
-    // withhold.
-    if (personalPath !== undefined) {
-      const canonicalEntryPath = await realpath(entry.path).catch(() => entry.path);
-      if (isContained(personalPath, canonicalEntryPath)) {
-        throw new CanKanError(
-          BoardErrorCodes.REGISTERED_BOARD_IS_PERSONAL,
-          `board "${flag.name}" resolves into the personal board; a registry entry cannot alias it -- use "--board personal" instead`,
-          { details: { name: flag.name } },
-        );
-      }
+    // withhold. `isPersonalBoardPath` canonicalizes `entry.path`
+    // existence-tolerantly before comparing (fix round 6, security
+    // review) -- a plain `realpath(entry.path).catch(() => entry.path)`
+    // here would fall back to the *raw* path if `entry.path` vanished in
+    // the narrow race between `findRegisteredBoard`'s own existence check
+    // and this one, comparing it asymmetrically against the already
+    // fully-canonicalized personal path.
+    if (await isPersonalBoardPath(entry.path, env)) {
+      throw new CanKanError(
+        BoardErrorCodes.REGISTERED_BOARD_IS_PERSONAL,
+        `board "${flag.name}" resolves into the personal board; a registry entry cannot alias it -- use "--board personal" instead`,
+        { details: { name: flag.name } },
+      );
     }
 
     const ref = await buildBoardRef({ kind: "repo", name: entry.name, root: entry.path, env });
@@ -390,7 +397,12 @@ export async function resolveBoard(options: ResolveBoardOptions): Promise<BoardR
     // registered *ancestor* of the personal board is only knowable once
     // `buildBoardRef` has resolved `ticketsDir`, so it still runs after
     // building -- this repo's own config is not the personal board's, so
-    // reading it first carries none of the pre-check's risk above.
+    // reading it first carries none of the pre-check's risk above. Both
+    // `ref.root` and `ref.ticketsDir` are already canonical
+    // (`buildBoardRef`'s own guarantee), so `aliasesPersonalBoard` can
+    // compare them directly against `canonicalPersonalPath`'s result
+    // without needing `isPersonalBoardPath`'s own re-canonicalization.
+    const personalPath = await canonicalPersonalPath(env);
     if (personalPath !== undefined && aliasesPersonalBoard(ref, personalPath)) {
       throw new CanKanError(
         BoardErrorCodes.REGISTERED_BOARD_IS_PERSONAL,

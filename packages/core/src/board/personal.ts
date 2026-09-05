@@ -47,7 +47,7 @@ import { dirname, join } from "node:path";
 import { CanKanError } from "../errors";
 import type { BoardRef } from "../types";
 import { BoardErrorCodes } from "./errors";
-import { buildBoardRef, realpathExistingPrefix } from "./ref";
+import { buildBoardRef, isContained, realpathExistingPrefix } from "./ref";
 import { resolveDataHome } from "./xdg";
 
 /**
@@ -67,63 +67,109 @@ export function resolvePersonalBoardPath(
 }
 
 /**
- * The personal board's own path, for comparison against something that is
- * already canonical (a `BoardRef`'s `root`/`ticketsDir`, both `realpath`'d
- * by `buildBoardRef`). Shared by `resolve.ts` and `registry.ts` -- both
- * need the identical fallback chain, and a second, independently-drifting
- * copy of a security-relevant comparison is exactly the risk this file's
- * own `isContained`/`realpathExistingPrefix` reuse already avoids one
- * layer down (security review, fix round 5, H1: a first version of this
- * had two byte-for-byte-identical copies, one per file, that no test could
- * ever catch diverging, since each file's tests only exercised its own
- * copy).
+ * Canonicalizes `path` even when it (or some suffix of it) does not fully
+ * exist yet, in three tiers, each a fallback for the last:
  *
- * Resolved in three tiers, each a fallback for the last:
- *
- * 1. `realpath(raw)` -- the board exists; fully canonical.
- * 2. `realpathExistingPrefix(raw)` (`ref.ts`'s own technique for a
- *    `tickets_dir` that doesn't fully exist yet) -- the board (or some
+ * 1. `realpath(path)` -- `path` exists; fully canonical.
+ * 2. `realpathExistingPrefix(path)` (`ref.ts`'s own technique for a
+ *    `tickets_dir` that doesn't fully exist yet) -- `path` (or some
  *    ancestor of it) does not exist yet, but everything that *does* exist
- *    along the path is still resolved canonically and the missing suffix
- *    is re-appended verbatim. This is what keeps the comparison correct
- *    when `$XDG_DATA_HOME` itself sits behind a symlink (FreeBSD ships
- *    `/home -> /usr/home` by default) and the personal board has never
- *    been created: a raw, un-resolved path here would disagree with the
- *    already-`realpath`'d value it gets compared against on exactly the
- *    symlinked prefix, defeating the comparison the same way an
- *    unresolved `BoardRef.root` would.
- * 3. The raw path itself -- only if even that fails (an ancestor is
- *    unreadable, say). A guard comparing a possibly non-canonical path is
- *    still better than one skipped entirely: every caller of this function
- *    treats `undefined` as "nothing to compare against, skip the check,"
- *    and a personal board that has never been created (the *ordinary*
- *    state of a fresh `cankan` install) is not evidence that no alias
- *    check is needed -- it is the single most common state a fresh
- *    install is in.
+ *    along it is still resolved canonically and the missing suffix is
+ *    re-appended verbatim. This is what keeps a comparison against this
+ *    result correct when an ancestor sits behind a symlink (macOS:
+ *    `$TMPDIR` under `/var/folders/...`, itself a symlink to
+ *    `/private/var/folders/...`; FreeBSD ships `/home -> /usr/home` by
+ *    default) and `path` has never been created: a raw, un-resolved
+ *    result here would disagree with an already-`realpath`'d value it
+ *    gets compared against on exactly the symlinked prefix, the same way
+ *    comparing an unresolved `BoardRef.root` against a resolved one would.
+ * 3. `path` itself, raw -- only if even that fails (an ancestor is
+ *    unreadable, say). Returning something is still better than throwing:
+ *    every caller of the personal-board helpers below treats `undefined`
+ *    as "nothing to compare against, skip the check," and this function
+ *    never returns that -- only its callers do, when there is genuinely no
+ *    path to canonicalize at all (see `canonicalPersonalPath` below).
  *
- * `undefined` only when no data home can be resolved at all.
+ * Exported as a small, general building block rather than folded into a
+ * single personal-board-specific function: **both sides of a personal-board
+ * comparison must go through the same existence-tolerant canonicalization,
+ * not just the personal-board side** (security review, fix round 6:
+ * `registry.ts`'s `listRegisteredBoards` compared this function's
+ * three-tier result against a registry entry's *raw, uncanonicalized*
+ * stored path -- on a host where `$TMPDIR`/`$XDG_DATA_HOME` sits behind a
+ * symlink, the two sides disagreed even for an *exact* match, silently
+ * defeating the "is the personal board" check entirely, not merely missing
+ * a symlink alias as documented). `isPersonalBoardPath` below is the
+ * shared predicate that canonicalizes both sides with this one function,
+ * so that asymmetry is structurally impossible rather than merely absent
+ * at any one call site today.
+ */
+async function canonicalizeExistenceTolerant(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    try {
+      return await realpathExistingPrefix(path);
+    } catch {
+      return path;
+    }
+  }
+}
+
+/**
+ * The personal board's own path, existence-tolerant canonicalized (see
+ * `canonicalizeExistenceTolerant` above). `undefined` only when no data
+ * home can be resolved at all.
+ *
+ * Shared by `resolve.ts` and `registry.ts`'s `listRegisteredBoards` -- a
+ * second, independently-drifting copy of a security-relevant fallback
+ * chain is exactly the risk this file's own `isContained`/
+ * `realpathExistingPrefix` reuse already avoids one layer down (fix round
+ * 5, H1: a first version of this had two byte-for-byte-identical copies,
+ * one per file, that no test could catch diverging).
  *
  * **Not** used by `registry.ts`'s `register()`: that function's own
- * `targetPath` is already `realpath`'d before this comparison runs, so it
+ * `targetPath` is already `realpath`'d before its comparison runs, so it
  * can never equal a personal path that does not exist, and this stronger
  * (and more expensive) fallback would buy it nothing. `register()` keeps
  * its own plain, two-tier `resolveCanonicalPersonalPath` (`realpath`, or
- * `undefined`) for that reason.
+ * `undefined`) for that reason -- re-confirmed sound in fix round 6's own
+ * security review, not merely left alone by inertia.
  */
 export async function canonicalPersonalPath(
   env: Readonly<Record<string, string | undefined>>,
 ): Promise<string | undefined> {
   const raw = resolvePersonalBoardPath(env);
   if (!raw) return undefined;
-  try {
-    return await realpath(raw);
-  } catch {
-    try {
-      return await realpathExistingPrefix(raw);
-    } catch {
-      return raw;
-    }
-  }
+  return canonicalizeExistenceTolerant(raw);
+}
+
+/**
+ * Whether `candidate` -- any absolute path, not necessarily existing, and
+ * not necessarily already canonical -- names the personal board itself, or
+ * something inside it. Canonicalizes **both** `candidate` and the personal
+ * board's own path with the identical existence-tolerant chain
+ * (`canonicalizeExistenceTolerant`) before comparing, rather than
+ * requiring every call site to canonicalize its own candidate correctly
+ * (fix round 6, security review: `registry.ts`'s `listRegisteredBoards`
+ * compared a canonical personal path against a *raw* registry entry path,
+ * which silently failed to match even an exact alias whenever an ancestor
+ * of the data home sits behind a symlink -- a category of bug this
+ * predicate makes structurally impossible at every site that uses it,
+ * rather than merely absent at the sites someone remembered to check by
+ * hand).
+ *
+ * `false` when the personal board's own path cannot be resolved at all
+ * (no data home) -- there is nothing to be "inside" in that case.
+ */
+export async function isPersonalBoardPath(
+  candidate: string,
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<boolean> {
+  const personalPath = await canonicalPersonalPath(env);
+  if (personalPath === undefined) return false;
+  const canonicalCandidate = await canonicalizeExistenceTolerant(candidate);
+  return isContained(personalPath, canonicalCandidate);
 }
 
 export interface EnsurePersonalBoardOptions {

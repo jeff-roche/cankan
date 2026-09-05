@@ -470,9 +470,17 @@ describe("F1 — a coordination ref that is itself a symbolic ref", () => {
       ["commit-tree", "-p", mainTipAtSymrefTime, "-m", "hijack attempt", git(repo.dir, ["write-tree"]).trim()],
     ).trim() as ObjectSha;
 
-    // The shipped function itself, not a hand-copied argv: this is what
-    // makes `--no-deref` a regression-guarded property of `adapter.ts`
-    // rather than a fact about git's own behavior in isolation.
+    // The shipped function itself, not a hand-copied argv. Note, honestly:
+    // this particular scenario (a *stale* compare) rejects identically
+    // whether or not `--no-deref` is present — a stale compare mismatches
+    // main's current tip whether `update-ref` dereferences through to main
+    // or compares against the symref's own stored target, since both are
+    // the same value here. This test asserts the CAS invariant holds across
+    // a symref swap either way; it is the *next* test (a matching compare)
+    // that actually discriminates `--no-deref`'s presence — confirmed
+    // directly by temporarily removing `--no-deref` from `adapter.ts` and
+    // observing this test still pass while the next one fails (see the
+    // report's RED-probe transcript for fix round 1's final review pass).
     const result = await updateRefCASCore(repo.dir, COORD_REF, newSha, mainTipAtSymrefTime as RefSha);
 
     // Observed for this task: with a *stale* compare value (main has since
@@ -517,10 +525,9 @@ describe("F1 — a coordination ref that is itself a symbolic ref", () => {
     }
 
     // COORD_REF is no longer a symref — `--no-deref` wrote directly to its
-    // own path, converting it to a normal ref pointing at newSha. Checked
-    // with `LC_ALL=C` pinned, matching every other stderr-shaped assertion
-    // in this module (git()'s own helper calls do not assert on stderr
-    // text, so they were never subject to this).
+    // own path, converting it to a normal ref pointing at newSha.
+    // `LC_ALL=C` pinned for consistency with the transport; this assertion
+    // is exit-code-only and would not be locale-sensitive regardless.
     const symrefCheck = Bun.spawnSync(["git", "symbolic-ref", "-q", "--end-of-options", COORD_REF], {
       cwd: repo.dir,
       stdout: "pipe",

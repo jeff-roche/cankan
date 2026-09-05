@@ -765,6 +765,14 @@ describe("fix round 2, finding 4: the deadline timer must not keep the process a
       // a real filesystem path to import, not a package specifier.
       const runnerPath = join(import.meta.dir, "..", "..", "src", "hooks", "runner.ts");
       const scriptPath = join(dir, "probe.ts");
+      // Fix round 3 (Ruling 17): the invariant this test actually proves is
+      // "the process exits well before timeoutMs" -- the margin just needs
+      // to be wide enough that a cold `bun` process spawn on a small,
+      // possibly-macOS CI runner can't make the passing side flake, and
+      // that the broken side still fails clearly. The pass threshold is
+      // derived from `LEAK_TEST_TIMEOUT_MS` (half of it) rather than a
+      // second, unrelated magic number, so the relationship stays visible.
+      const LEAK_TEST_TIMEOUT_MS = 2_000;
       // A fake ConfigResult inlined directly (not imported from this test
       // file) -- this script runs as its own separate `bun` process with
       // no access to this file's module scope. `runHooks` only ever reads
@@ -782,7 +790,7 @@ const cfg = {
 };
 
 const startedAt = Date.now();
-await runHooks({ cfg, event: "close", repoRoot: ${JSON.stringify(dir)}, timeoutMs: 500 });
+await runHooks({ cfg, event: "close", repoRoot: ${JSON.stringify(dir)}, timeoutMs: ${LEAK_TEST_TIMEOUT_MS} });
 console.log("runHooks resolved at +" + (Date.now() - startedAt) + "ms");
 `;
       await writeFile(scriptPath, script);
@@ -806,13 +814,17 @@ console.log("runHooks resolved at +" + (Date.now() - startedAt) + "ms");
       expect(exitCode).toBe(0);
       expect(stdout).toContain("runHooks resolved at +");
       // Before the fix: the process stayed alive for essentially the
-      // whole 500ms `timeoutMs` (the leaked deadline timer) even though
-      // `runHooks` itself resolved in a few ms (findings file: a
+      // whole `LEAK_TEST_TIMEOUT_MS` (the leaked deadline timer) even
+      // though `runHooks` itself resolved in a few ms (findings file: a
       // default-30s-timeout hook returning in ~3ms kept the real process
       // alive for +30002ms). After the fix, the entire process -- bun
-      // startup, the hook, and exit -- should complete in a small
-      // fraction of that.
-      expect(elapsedMs).toBeLessThan(300);
+      // startup, the hook, and exit -- should complete well under it.
+      // Half of `LEAK_TEST_TIMEOUT_MS`, not an unrelated constant: wide
+      // enough to absorb a cold `bun` spawn on a small/macOS CI runner
+      // without flaking the passing side, while a broken side still fails
+      // unambiguously (it would land near the full `LEAK_TEST_TIMEOUT_MS`,
+      // not just over the threshold).
+      expect(elapsedMs).toBeLessThan(LEAK_TEST_TIMEOUT_MS / 2);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

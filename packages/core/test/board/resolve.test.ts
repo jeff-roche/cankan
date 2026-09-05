@@ -962,6 +962,46 @@ describe("fix round 3 -- F11: the enclosing direction (F6) composed with the cwd
   });
 });
 
+describe("fix round 4 -- G2: --board <name> pre-checks a symlink-aliased entry's root before ever loading its config", () => {
+  test("a malformed personal config is never read, let alone published, when a symlink-aliased registry entry is rejected", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+      // Bad enough that buildBoardRef would throw loudly (INVALID_CONFIG,
+      // naming the personal board's own .cankan/config.yml) if it were
+      // ever loaded -- the whole point of this test is that it is not.
+      await writeRepoConfigFile(personal.board.root, "config.yml", "tickets_dir: [not, closed\n");
+      const linkParent = await mkdtemp(join(tmpdir(), "cankan-resolve-g2-"));
+      const outsider = await makeTempRepo();
+      try {
+        const linkPath = join(linkParent, "personal-alias");
+        await symlink(personal.board.root, linkPath);
+
+        const registryPath = resolveRegistryPath(env);
+        if (!registryPath) throw new Error("test setup: registry path did not resolve");
+        await writeFileEnsuringDir(
+          registryPath,
+          `version: 1\nrepos:\n  - name: sneaky\n    path: ${linkPath}\n    last_seen: 2026-01-01T00:00:00.000Z\n`,
+        );
+
+        let thrown: unknown;
+        try {
+          await resolveBoard({ cwd: outsider.dir, flag: { kind: "name", name: "sneaky" }, env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+        expect((thrown as Error).message).not.toContain(personal.board.root);
+        expect(detailsAsString(thrown)).not.toContain(personal.board.root);
+      } finally {
+        await outsider.cleanup();
+        await rm(linkParent, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
 describe("resolveBoard -- BoardRef.name agrees between cwd resolution and --board <name>", () => {
   test("a registered repo's name comes from the registry, not the directory's basename, when resolved with no flag or --board repo", async () => {
     await withEnv(undefined, async () => {

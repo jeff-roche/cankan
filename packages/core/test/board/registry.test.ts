@@ -1,4 +1,5 @@
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -15,7 +16,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { withEnv } from "../../../test-utils/src/withEnv";
-import { ensurePersonalBoard } from "../../src/board/personal";
+import { ensurePersonalBoard, resolvePersonalBoardPath } from "../../src/board/personal";
 import { buildBoardRef } from "../../src/board/ref";
 import {
   findRegisteredBoard,
@@ -25,7 +26,7 @@ import {
   resolveRegistryPath,
 } from "../../src/board/registry";
 import { isCanKanError } from "../../src/errors";
-import { hermeticEnv } from "../config/testHelpers";
+import { hermeticEnv, writeFileEnsuringDir } from "../config/testHelpers";
 
 async function makeBoardDir(): Promise<{ dir: string; cleanup: () => Promise<void> }> {
   const dir = await mkdtemp(join(tmpdir(), "cankan-registry-board-"));
@@ -268,6 +269,73 @@ describe("registry -- stale lock breaking", () => {
 
         const listing = await listRegisteredBoards(env);
         expect(listing.boards.map((b) => b.name)).toEqual(["api"]);
+      } finally {
+        await board.cleanup();
+      }
+    });
+  });
+
+  // Security review (G4): the old break condition required
+  // `readLockToken` to succeed *before* a lockfile could even be
+  // considered stale. A lockfile this process cannot read the token of
+  // -- unreadable, or a directory -- could therefore never be judged
+  // stale no matter how old it was, and `register()` would wedge forever
+  // (never recovering without a manual `rm`). `withRegistryLock` always
+  // creates its own lockfile via `open(path, "wx")` + `writeFile` at
+  // default mode, so anything shaped like this was never created by
+  // cankan and is broken unconditionally once aged -- see the fix.
+  test("G4: an unreadable stale lockfile is broken, not permanently wedged", async () => {
+    await withEnv(undefined, async () => {
+      const board = await makeBoardDir();
+      try {
+        const env = hermeticEnv();
+        const registryPath = resolveRegistryPath(env);
+        if (!registryPath) throw new Error("test setup: registry path did not resolve");
+        await mkdir(join(registryPath, ".."), { recursive: true });
+
+        const lockPath = `${registryPath}.lock`;
+        await writeFile(lockPath, "");
+        await chmod(lockPath, 0o000);
+        const staleTime = new Date(Date.now() - 30_000);
+        await utimes(lockPath, staleTime, staleTime);
+
+        try {
+          const entry = await register("api", board.dir, env);
+          expect(entry.name).toBe("api");
+        } finally {
+          // In case the fix somehow left the original (now-unreadable)
+          // file behind, restore permissions before withEnv()'s own
+          // cleanup tries to remove the temp home tree.
+          await chmod(lockPath, 0o700).catch(() => {});
+        }
+      } finally {
+        await board.cleanup();
+      }
+    });
+  });
+
+  test("G4: a directory-shaped stale lockfile is broken, not permanently wedged", async () => {
+    await withEnv(undefined, async () => {
+      const board = await makeBoardDir();
+      try {
+        const env = hermeticEnv();
+        const registryPath = resolveRegistryPath(env);
+        if (!registryPath) throw new Error("test setup: registry path did not resolve");
+        await mkdir(join(registryPath, ".."), { recursive: true });
+
+        const lockPath = `${registryPath}.lock`;
+        await mkdir(lockPath, { recursive: true });
+        const staleTime = new Date(Date.now() - 30_000);
+        await utimes(lockPath, staleTime, staleTime);
+
+        const entry = await register("api", board.dir, env);
+        expect(entry.name).toBe("api");
+
+        // A directory-shaped foreign object can't be `unlink`ed -- confirm
+        // the fix's `rm(recursive)` actually cleaned up the renamed-away
+        // copy rather than leaking a `.stale-*` directory behind.
+        const registryDirEntries = await readdir(dirname(registryPath));
+        expect(registryDirEntries.some((name) => name.includes(".stale-"))).toBe(false);
       } finally {
         await board.cleanup();
       }
@@ -840,6 +908,47 @@ describe("registry -- F7: the personal board can never be registered as a repo b
       expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
       expect((thrown as Error).message).not.toContain(personal.board.root);
       expect(detailsAsString(thrown)).not.toContain(personal.board.root);
+    });
+  });
+
+  // Security review (G3): the check above only worked once the personal
+  // board actually existed on disk (`resolveCanonicalPersonalPath`
+  // returns `undefined` when `realpath` fails, and the "is the personal
+  // board" skip is gated on it not being `undefined`). With the personal
+  // board never created, a hand-edited entry naming its exact future path
+  // used to fall through to the ordinary `stat`-based "directory no
+  // longer exists" skip instead -- publishing the personal board's own
+  // path as `BOARD_DIRECTORY_MISSING`, exactly the outcome the check
+  // above exists to prevent. Fixed by giving `listRegisteredBoards` the
+  // same three-tier canonicalization `resolve.ts`'s `canonicalPersonalPath`
+  // uses (`resolveCanonicalOrExistingPersonalPath`).
+  test("G3: a hand-edited entry naming the personal board's own (not-yet-created) path is still skipped as 'is the personal board'", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      // Deliberately no ensurePersonalBoard() call.
+      const personalPath = resolvePersonalBoardPath(env);
+      if (!personalPath) throw new Error("test setup: personal board path did not resolve");
+
+      const registryPath = resolveRegistryPath(env);
+      if (!registryPath) throw new Error("test setup: registry path did not resolve");
+      await writeFileEnsuringDir(
+        registryPath,
+        `version: 1\nrepos:\n  - name: sneaky\n    path: ${personalPath}\n    last_seen: 2026-01-01T00:00:00.000Z\n`,
+      );
+
+      const listing = await listRegisteredBoards(env);
+      expect(listing.boards).toHaveLength(0);
+      expect(listing.skipped).toHaveLength(1);
+      expect(listing.skipped[0]?.reason).toBe("is the personal board");
+
+      let thrown: unknown;
+      try {
+        await findRegisteredBoard("sneaky", env);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
     });
   });
 });

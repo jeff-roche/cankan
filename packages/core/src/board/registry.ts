@@ -28,7 +28,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { link, mkdir, open, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { stringify } from "yaml";
 import { z } from "zod";
@@ -48,13 +48,14 @@ import { loadValidatedLayer } from "../config/layers";
 import { CanKanError, isCanKanError } from "../errors";
 import { BoardErrorCodes } from "./errors";
 import { resolvePersonalBoardPath } from "./personal";
-// F1 (dispatch B security review, fix round 1): the personal-board checks
-// below (`register()`, `listRegisteredBoards()`) need the same "equal to,
-// or beneath" containment test ADR 0002's `tickets_dir` check already
-// uses -- an exact-string `===` only refused the personal board's exact
-// root, not a registered *subdirectory* of it. Reused from `ref.ts` rather
-// than re-derived, same module.
-import { isContained } from "./ref";
+// The personal-board checks below (`register()`, `listRegisteredBoards()`)
+// need the same "equal to, or beneath" containment test ADR 0002's
+// `tickets_dir` check already uses -- an exact-string `===` only refused
+// the personal board's exact root, not a registered *subdirectory* of it.
+// `realpathExistingPrefix` is `listRegisteredBoards`'s three-tier
+// canonicalization fallback (see `resolveCanonicalOrExistingPersonalPath`
+// below). Both reused from `ref.ts` rather than re-derived, same module.
+import { isContained, realpathExistingPrefix } from "./ref";
 import { resolveDataHome } from "./xdg";
 
 // ---------------------------------------------------------------------------
@@ -149,17 +150,43 @@ function requireRegistryPath(env: Readonly<Record<string, string | undefined>>):
   return registryPath;
 }
 
+/**
+ * Wraps a raw filesystem failure as a typed `REGISTRY_UNAVAILABLE`
+ * (security review: an audit of this file found several bare `await`s on
+ * filesystem calls that could surface a raw, untyped platform error on
+ * the ordinary public API -- no hostile input required, just an
+ * unwritable data home or a lockfile directory that stops being
+ * writable mid-acquisition). `path` names whatever this specific
+ * operation was acting on, for the error's own `details`.
+ */
+function wrapRegistryError(err: unknown, path: string, message: string): CanKanError {
+  return new CanKanError(BoardErrorCodes.REGISTRY_UNAVAILABLE, `${message}: ${path}`, {
+    cause: err,
+    details: { path },
+  });
+}
+
 async function ensureRegistryDir(registryPath: string): Promise<void> {
-  await mkdir(dirname(registryPath), { recursive: true });
+  const dir = dirname(registryPath);
+  try {
+    await mkdir(dir, { recursive: true });
+  } catch (err) {
+    throw wrapRegistryError(err, dir, "could not create the board registry's directory");
+  }
 }
 
 /**
  * The personal board's own canonical path, or `undefined` when it cannot
- * be resolved (no data home) or does not exist yet (nothing to collide
- * with -- `register()`'s `targetPath` is already realpath'd, so it can
- * never equal a path that does not exist). Used by both `register()` (F7:
- * refuse registering the personal board as a repo board) and
- * `listRegisteredBoards` (F7: skip a hand-edited entry that points at it).
+ * be resolved (no data home) or does not exist yet. Used by `register()`
+ * to refuse registering the personal board (or a location inside it) as a
+ * repo board -- `targetPath` there is always `realpath`'d before
+ * comparison, so it can never equal a personal path that does not exist,
+ * which is what makes the plain `undefined`-on-failure form safe to keep
+ * using there.
+ *
+ * `listRegisteredBoards` does **not** use this function -- see
+ * `resolveCanonicalOrExistingPersonalPath` below for why it needs a
+ * stronger fallback.
  */
 async function resolveCanonicalPersonalPath(
   env: Readonly<Record<string, string | undefined>>,
@@ -170,6 +197,38 @@ async function resolveCanonicalPersonalPath(
     return await realpath(raw);
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * The personal board's own path, resolved the same three-tier way
+ * `resolve.ts`'s `canonicalPersonalPath` is: `realpath` first, then
+ * `realpathExistingPrefix` (the deepest already-existing ancestor,
+ * re-appending the rest verbatim), then the raw path as a last resort.
+ * `undefined` only when no data home can be resolved at all.
+ *
+ * Used by `listRegisteredBoards`'s "is this registry entry the personal
+ * board" check, which -- unlike `register()` -- compares against a
+ * registry entry's *stored* path, not something already guaranteed to
+ * exist: with the personal board never created, `resolveCanonicalPersonalPath`
+ * (the plain form) returns `undefined`, which made the "is the personal
+ * board" skip never fire at all -- exactly the fresh-install hole
+ * `resolve.ts`'s `canonicalPersonalPath` closes on the resolver side,
+ * closed here on the registry-read side too (security review).
+ */
+async function resolveCanonicalOrExistingPersonalPath(
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<string | undefined> {
+  const raw = resolvePersonalBoardPath(env);
+  if (!raw) return undefined;
+  try {
+    return await realpath(raw);
+  } catch {
+    try {
+      return await realpathExistingPrefix(raw);
+    } catch {
+      return raw;
+    }
   }
 }
 
@@ -255,11 +314,21 @@ function toEntry(raw: RawRegistryEntry): RegistryEntry {
 
 /**
  * Lists every board in the registry, split into `boards` (directory
- * confirmed present) and `skipped` (directory missing, not a directory,
- * or -- F7 -- the personal board's own path smuggled into a hand-edited
- * `repos.yml`) -- one bad entry never breaks the read for every other
- * one. `--board all` (dispatch B) consumes `boards`; `--board <name>` can
- * filter `boards` by name, or use `findRegisteredBoard` below directly.
+ * confirmed present) and `skipped` (directory missing, not a directory, or
+ * the personal board's own path smuggled into a hand-edited `repos.yml`).
+ * `--board all` consumes `boards`; `--board <name>` can filter `boards` by
+ * name, or use `findRegisteredBoard` below directly.
+ *
+ * Two different failure granularities, deliberately: a per-*entry* problem
+ * (its directory is gone, isn't a directory, or is the personal board) is
+ * caught in the loop below and reported as a `skipped` row -- one bad
+ * entry never breaks the read for the others. A *file-wide* schema
+ * violation (a malformed `name`, a relative `path`, ...) fails the whole
+ * read instead, via `readRegistryRaw`'s schema validation below -- every
+ * entry in the file, not just the bad one, since `repos.yml` is validated
+ * as a single document and a corrupted row is as likely to signal
+ * file-level damage as a one-off typo. Only entries that pass that
+ * file-wide validation ever reach the per-entry checks in this function.
  *
  * Returns an empty listing (never throws) when no registry file exists,
  * or when no data directory can even be located.
@@ -272,7 +341,7 @@ export async function listRegisteredBoards(
     return { boards: [], skipped: [] };
   }
   const raw = await readRegistryRaw(registryPath);
-  const personalPath = await resolveCanonicalPersonalPath(env);
+  const personalPath = await resolveCanonicalOrExistingPersonalPath(env);
 
   const boards: RegistryEntry[] = [];
   const skipped: SkippedRegistryEntry[] = [];
@@ -448,12 +517,16 @@ class LockLostError extends Error {}
  * `finally` reads `lockPath` *before* the restore lands, sees a token
  * that is not its own, correctly declines to unlink (it is not the file
  * this call wrote) -- and the subsequent `link` then re-establishes an
- * orphaned lockfile carrying the *victim's own abandoned token* with a
- * freshly-bumped mtime. Both the process that broke the lock and the
+ * orphaned lockfile carrying the *victim's own abandoned token*, its
+ * mtime unchanged from the original acquisition (`link` bumps ctime, not
+ * mtime) -- so the orphan is typically already stale by the time it
+ * lands, rather than needing a fresh `LOCK_STALE_MS` window to age out.
+ * Both the process that broke the lock and the
  * victim then spin to `REGISTRY_LOCK_TIMEOUT` (or `register()`'s
  * `LockLostError` retry path, then `REGISTRY_LOCK_LOST` once that's
- * exhausted), and the orphan only clears once it ages past
- * `LOCK_STALE_MS` and some later call breaks it for real. No two writes
+ * exhausted), until some later call breaks the orphan for real -- often
+ * on its very next attempt, since (as above) the orphan's mtime rarely
+ * needs to age any further. No two writes
  * are ever both published -- that guarantee holds -- but this is a stall
  * a caller can observe, not merely "one lost registry row." `fn` is
  * handed `assertStillHeld` (below) to re-check identity immediately
@@ -476,38 +549,78 @@ async function withRegistryLock<T>(
       await handle.close();
       break;
     } catch (err) {
-      if (!isEExist(err)) throw err;
+      if (!isEExist(err)) {
+        throw wrapRegistryError(err, lockPath, "could not acquire the registry lock");
+      }
 
-      const observedToken = await readLockToken(lockPath);
-      const stats = await stat(lockPath).catch(() => undefined);
-      if (observedToken !== undefined && stats && Date.now() - stats.mtimeMs > LOCK_STALE_MS) {
+      // `lstat`, not `stat` (security review, G4): `stat` follows a
+      // symlink, so a *dangling*-symlink-shaped lockfile always looked
+      // "not there" here -- `stats` came back `undefined`, the whole
+      // staleness branch below was skipped every time, and the lock could
+      // never be judged stale no matter how old it was. `lstat` reports
+      // the symlink's own mtime instead, so this shape ages out exactly
+      // like an ordinary stale lockfile does.
+      const stats = await lstat(lockPath).catch(() => undefined);
+      if (!stats) {
+        continue; // vanished between our open() and now -- retry acquisition
+      }
+
+      if (Date.now() - stats.mtimeMs > LOCK_STALE_MS) {
+        // Read *after* confirming staleness by age alone (G4): the old
+        // code additionally required `readLockToken` to succeed before
+        // ever considering the lock stale, which meant a lockfile this
+        // call could not *read* the token of -- unreadable (`EACCES`), or
+        // a directory (`readFile` on a directory fails `EISDIR`) -- could
+        // never be judged stale and so could never be broken, wedging
+        // every future `register()` call at this data home until someone
+        // manually removed it. `withRegistryLock` always creates its own
+        // lockfile via `open(path, "wx")` + `writeFile` at the platform
+        // default mode, so anything this call cannot read the token of
+        // was never created by cankan at all -- there is no token to
+        // identity-check against for a foreign object, and (now that
+        // staleness is judged by age alone, not by token-readability) it
+        // is discarded unconditionally once aged, rather than left
+        // permanently unbreakable.
+        const observedToken = await readLockToken(lockPath);
         const stalePath = `${lockPath}.stale-${randomUUID()}`;
         try {
           await rename(lockPath, stalePath);
         } catch (renameErr) {
-          if (!isEnoent(renameErr)) throw renameErr;
+          if (!isEnoent(renameErr)) {
+            throw wrapRegistryError(renameErr, lockPath, "could not break a stale registry lock");
+          }
           continue; // already gone -- retry acquisition from scratch
         }
 
-        const renamedToken = await readLockToken(stalePath);
-        if (renamedToken !== observedToken) {
-          // We renamed away a *fresh* lock a new holder created in the
-          // gap between our stat/token-read and this rename -- give it
-          // back without risking a clobber (see docstring).
-          //
-          // N2 (round 2 review): tolerate *any* `link` failure here, not
-          // only `EEXIST` -- some filesystems (exFAT, some FUSE/network
-          // mounts) cannot hard-link at all and fail `EPERM`/`EMLINK`.
-          // Either way the outcome is the same: this call gives up on
-          // restoring its stolen copy and lets `assertStillHeld` handle
-          // the consequences for whoever actually holds (or held) the
-          // lock, rather than letting an untyped filesystem error escape
-          // `withRegistryLock` and leak `stalePath` behind it.
-          await link(stalePath, lockPath).catch(() => {});
-          await unlink(stalePath).catch(() => {});
+        if (observedToken === undefined) {
+          // A foreign lockfile-shaped object (see above) -- nothing to
+          // identity-check against, so nothing to risk by discarding it
+          // outright once it is confirmed stale. `rm(recursive)`, not
+          // `unlink`: a foreign object can be a directory (`unlink` fails
+          // `EISDIR`/`EPERM` against one), and this is the one branch that
+          // must handle that shape without leaking `stalePath` behind.
+          await rm(stalePath, { recursive: true, force: true }).catch(() => {});
         } else {
-          // Confirmed genuinely stale -- discard it and retry acquisition.
-          await unlink(stalePath).catch(() => {});
+          const renamedToken = await readLockToken(stalePath);
+          if (renamedToken !== observedToken) {
+            // We renamed away a *fresh* lock a new holder created in the
+            // gap between our staleness check and this rename -- give it
+            // back without risking a clobber (see docstring).
+            //
+            // Tolerate *any* `link` failure here, not only `EEXIST` --
+            // some filesystems (exFAT, some FUSE/network mounts) cannot
+            // hard-link at all and fail `EPERM`/`EMLINK`. Either way the
+            // outcome is the same: this call gives up on restoring its
+            // stolen copy and lets `assertStillHeld` handle the
+            // consequences for whoever actually holds (or held) the lock,
+            // rather than letting an untyped filesystem error escape
+            // `withRegistryLock` and leak `stalePath` behind it.
+            await link(stalePath, lockPath).catch(() => {});
+            await unlink(stalePath).catch(() => {});
+          } else {
+            // Confirmed genuinely stale -- discard it and retry acquisition.
+            await unlink(stalePath).catch(() => {});
+          }
         }
 
         if (Date.now() > deadline) {
@@ -551,8 +664,12 @@ async function withRegistryLock<T>(
 async function writeRegistryAtomic(registryPath: string, data: RawRegistryFile): Promise<void> {
   const dir = dirname(registryPath);
   const tmpPath = join(dir, `.repos.yml.tmp-${randomUUID()}`);
-  await writeFile(tmpPath, stringify(data), "utf8");
-  await rename(tmpPath, registryPath);
+  try {
+    await writeFile(tmpPath, stringify(data), "utf8");
+    await rename(tmpPath, registryPath);
+  } catch (err) {
+    throw wrapRegistryError(err, registryPath, "could not write the board registry");
+  }
 }
 
 /**
@@ -589,7 +706,12 @@ export async function register(
   if (!isValidBoardName(name)) {
     throw invalidNameError(name);
   }
-  const canonicalPath = await realpath(targetPath);
+  let canonicalPath: string;
+  try {
+    canonicalPath = await realpath(targetPath);
+  } catch (err) {
+    throw wrapRegistryError(err, targetPath, "could not resolve the path to register");
+  }
   const personalPath = await resolveCanonicalPersonalPath(env);
   // F1: containment, not equality -- `register("leak", "<personal>/backlog")`
   // must be refused too, not only an exact match on the personal board's

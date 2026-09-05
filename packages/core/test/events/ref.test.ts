@@ -172,6 +172,50 @@ describe("initRef — fix round 1, S3: refuses to report success on a ref that i
     expect(refAfter as string | null).toBe(blobSha as string);
   });
 
+  test("fix round 2, NEW-1: a peer-planted directory at the fixed probe path does not make a healthy ref look unusable", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // A peer with push access — this module's own trust model — plants a
+    // directory (not a plain file) at the exact, predictable
+    // `USABILITY_PROBE_PATH` `assertRefIsUsable` reads (the path is public
+    // source, so it is exactly as predictable to an adversary as to this
+    // test). The board is otherwise perfectly healthy: a real commit with a
+    // real month file.
+    const planted = await adapter.commitTreeToRef(COORD_REF, {
+      parent: null,
+      message: "peer-planted directory at the usability probe path",
+      files: [
+        { path: "events/2026-09.jsonl", content: "" },
+        { path: "events/.cankan-ref-usability-probe/x", content: "hostile" },
+      ],
+    });
+    if (planted.outcome !== "applied") throw new Error("setup failed");
+
+    // Before this fix: `readBlobFromRef`'s own three-way check raised
+    // `GIT_BLOB_AMBIGUOUS` for the directory collision (ls-tree resolved a
+    // `040000` tree entry, not the expected `100644` blob), and
+    // `assertRefIsUsable` mapped *any* thrown error to `EVENT_REF_UNUSABLE`
+    // — reporting a fabricated hard failure on a board that is entirely
+    // healthy. A fix for a fail-open that creates a peer-triggerable
+    // fail-closed is strictly worse than the fail-open it replaced.
+    await expect(initRef(adapter, COORD_REF, { now: NOW })).resolves.toBeUndefined();
+
+    // And the ref really is healthy: append/read both still work normally
+    // against it, proving `GIT_BLOB_AMBIGUOUS` here was never evidence of
+    // an actually-broken ref.
+    const candidate = {
+      event: "release",
+      ts: "2026-09-15T09:00:00Z",
+      actor: "alice",
+      ticket: "ck-1",
+    } as unknown as EventCandidate;
+    const appended = await append(adapter, COORD_REF, candidate, { now: NOW });
+    expect(appended.month).toBe("2026-09");
+    const records = await read(adapter, COORD_REF, { now: NOW });
+    expect(records).toHaveLength(1);
+  });
+
   test("known residual gap (Orchestrator Ruling R19): a ref planted at a raw tree is NOT caught by this fix", async () => {
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);
@@ -194,7 +238,12 @@ describe("initRef — fix round 1, S3: refuses to report success on a ref that i
 });
 
 // ============================================================================
-// Fix round 1, S4/Ruling R20 — the fm10 ref gate, exercised on initRef too
+// Fix round 1, S4/Ruling R20 — end-to-end fm10 coverage, exercised on initRef
+// too. Fix round 2, Ruling R24: this is an end-to-end assertion, not a guard
+// on ref.ts's own validateCoordinationRef call specifically — see log.test.ts's
+// identical framing note above its own fm10 describe block for the full
+// reasoning (the adapter's ensureValidRef re-checks the same thing on every
+// git call regardless).
 // ============================================================================
 
 describe("initRef — the fm10 ref gate", () => {

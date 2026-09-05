@@ -18,18 +18,24 @@
  * not because either calls the other.
  */
 
-import { CanKanError } from "../errors";
+import { CanKanError, isCanKanError } from "../errors";
 import type { GitAdapter } from "../git/index";
-import { validateCoordinationRef } from "../git/index";
+import { GitErrorCodes, validateCoordinationRef } from "../git/index";
 import { EventErrorCodes } from "./errors";
 import { monthKeyUtc } from "./log";
 
 /**
- * A deliberately-nonexistent path, used only to probe whether a ref's
- * resolved target behaves like a tree-ish object (fix round 1, S3) — see
- * `assertRefIsUsable`. Never a real month file name, so a legitimate,
- * already-populated coordination ref can never coincidentally collide with
- * it.
+ * A path used only to probe whether a ref's resolved target behaves like a
+ * tree-ish object (fix round 1, S3) — see `assertRefIsUsable`. Not a real
+ * month file name, so an *accidental* collision with a legitimate,
+ * already-populated coordination ref is not a concern. **This does not mean
+ * a hostile collision is impossible** (fix round 2, NEW-1) — this module's
+ * own stated trust model is "whoever has push access," and a peer with push
+ * access controls the *entire* tree, including whatever path is chosen
+ * here. Choosing a different or less-guessable path would not close that;
+ * see `assertRefIsUsable`'s doc comment for the actual fix (distinguishing
+ * *which* failure a collision here produces, not hiding the collision
+ * surface).
  */
 const USABILITY_PROBE_PATH = "events/.cankan-ref-usability-probe";
 
@@ -42,44 +48,75 @@ const USABILITY_PROBE_PATH = "events/.cankan-ref-usability-probe";
  * fails forever with an opaque `GIT_COMMAND_FAILED` — and `initRef` could
  * never repair it, because it kept seeing "non-null" and returning.
  *
- * Probed here via the adapter's own `readBlobFromRef`, against a path
- * (`USABILITY_PROBE_PATH`) that is never a real month file: `readBlobFromRef`
- * resolves `ref` to a commit and runs `ls-tree` against it, which requires
- * its target to be tree-ish. A blob target fails that call outright
- * (`ls-tree` cannot list a blob), which this function converts into a
- * named, diagnosable `EVENT_REF_UNUSABLE` — instead of `initRef` reporting
- * success on a ref nothing downstream can actually use. A usable target
- * (a real commit, or — see the residual gap below — a bare tree) returns
- * `null` for this nonexistent path without throwing, which this function
- * treats as "usable."
+ * Probed here via the adapter's own `readBlobFromRef`, against
+ * `USABILITY_PROBE_PATH`: `readBlobFromRef` resolves `ref` to a commit and
+ * runs `ls-tree` against it, which requires its target to be tree-ish. A
+ * blob target fails that call outright (`ls-tree` cannot list a blob) with
+ * `GIT_COMMAND_FAILED` — the one failure this function converts into a
+ * named, diagnosable `EVENT_REF_UNUSABLE`.
+ *
+ * **Fix round 2, NEW-1 — `GIT_BLOB_AMBIGUOUS` is not evidence of an
+ * unusable ref; it is proof of the opposite, and the first version of this
+ * function treated it as unusable anyway.** `readBlobFromRef` raises
+ * `GIT_BLOB_AMBIGUOUS` only *after* `ls-tree` has already succeeded against
+ * a genuinely tree-ish commit — it means the probe *path itself* resolved
+ * to something unexpected (a directory, a symlink, a non-`100644` mode),
+ * not that the ref's target isn't tree-ish. Confirmed directly to be
+ * peer-triggerable, exactly matching this module's own trust model: a peer
+ * with push access plants a tree (or any non-blob entry) at
+ * `USABILITY_PROBE_PATH` — a path they can predict from this very source
+ * file — and the *original* fix-round-1 version of this function reported
+ * `EVENT_REF_UNUSABLE` on an otherwise completely healthy board, while
+ * `append`/`read` against that same ref continued to work fine. A fix for
+ * a fail-open that creates a peer-triggerable fail-closed is strictly
+ * worse than the fail-open it replaced. `GIT_BLOB_AMBIGUOUS` is therefore
+ * treated as "usable" (this function returns normally); only
+ * `GIT_COMMAND_FAILED` — a genuine "not tree-ish at all" failure, the blob
+ * case this function exists to catch — is treated as unusable. Any other
+ * error is also treated as unusable (fail closed on the unexpected), since
+ * only `GIT_BLOB_AMBIGUOUS` has a proven benign explanation.
  *
  * **Known residual gap, out of this fix's reach (Orchestrator Ruling
- * R19).** A ref planted at a raw **tree**, or an **annotated tag** peeling
- * to one, is *also* unusable — a later `append`'s `commit-tree -p <ref>`
- * requires a real commit, not a bare tree, and fails the same way the blob
- * case does — but is **not** caught here: `ls-tree` operates identically on
- * any tree-ish object, tree or commit alike, so this probe cannot tell them
- * apart with the surface `GitAdapter` exposes today. Closing that fully
- * would need an object-type query (e.g. `git cat-file -t <sha>`) that does
- * not exist on `GitAdapter`. Adding one is M2.6's call, not this
- * dispatch's: R19 scopes this fix to `events/`, using only M2.6's existing
- * public surface, and explicitly defers the cleaner fix (the new adapter
- * primitive) to a follow-up recommendation rather than this dispatch
- * editing `git/` to expand its own blast radius. A write-based probe (e.g.
- * attempting `commitTreeToRef` with `parent: existing` to see whether
- * `commit-tree -p` accepts it) was considered and rejected: it would give
- * `initRef` a side effect — a redundant commit — on every call against an
- * already-healthy ref, which is worse than leaving this one case
- * undetected until the M2.6 addition lands.
+ * R19).** A ref planted at a raw **tree**, or at **any annotated tag**
+ * (fix round 2 doc correction: not only one peeling to a tree — verified
+ * directly that a tag pointing at a *commit* is unusable too, since
+ * `append`'s later `commit-tree -p <ref>` requires `<ref>` to resolve
+ * straight to a commit object, and a tag object never does, regardless of
+ * what it tags), is *also* unusable — but is **not** caught here: `ls-tree`
+ * operates identically on any tree-ish object (tree, commit, or a
+ * tag peeled to either), so this probe cannot tell them apart with the
+ * surface `GitAdapter` exposes today. Closing that fully would need an
+ * object-type query (e.g. `git cat-file -t <sha>`) that does not exist on
+ * `GitAdapter`. Adding one is M2.6's call, not this dispatch's: R19 scopes
+ * this fix to `events/`, using only M2.6's existing public surface, and
+ * explicitly defers the cleaner fix (the new adapter primitive) to a
+ * follow-up recommendation rather than this dispatch editing `git/` to
+ * expand its own blast radius. A write-based probe (e.g. attempting
+ * `commitTreeToRef` with `parent: existing` to see whether `commit-tree -p`
+ * accepts it) was considered and rejected: it would give `initRef` a side
+ * effect — a redundant commit — on every call against an already-healthy
+ * ref, which is worse than leaving this one case undetected until the
+ * M2.6 addition lands.
  */
-async function assertRefIsUsable(adapter: GitAdapter, validatedRef: string): Promise<void> {
+async function assertRefIsUsable(adapter: GitAdapter, validatedRef: string, resolvedSha: string): Promise<void> {
   try {
     await adapter.readBlobFromRef(validatedRef, USABILITY_PROBE_PATH);
   } catch (cause) {
+    if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
+      return;
+    }
     throw new CanKanError(
       EventErrorCodes.EVENT_REF_UNUSABLE,
       `ref exists but does not resolve to a usable coordination ref: ${validatedRef}`,
-      { cause, details: { ref: validatedRef } },
+      // Fix round 2, NEW-3 (the spirit of it, not the letter): ADR
+      // 0001:1176-1178 asks for the offending object identified alongside
+      // the ref. There is no *commit* to name here — the whole defect is
+      // that `validatedRef` does not resolve to one — so `sha` (not
+      // `commit`) is the object it actually resolved to instead, already
+      // in the caller's hands from its own `readRef` call and safe to
+      // publish for the same module-derived reason `log.ts`'s `commit`
+      // fields are.
+      { cause, details: { ref: validatedRef, sha: resolvedSha } },
     );
   }
 }
@@ -160,7 +197,7 @@ export async function initRefCore(
   if (existing !== null) {
     // Fix round 1, S3: confirm the ref is usable before reporting success —
     // see `assertRefIsUsable`'s doc comment.
-    await assertRefIsUsable(adapter, validatedRef);
+    await assertRefIsUsable(adapter, validatedRef, existing);
     return;
   }
 
@@ -202,5 +239,5 @@ export async function initRefCore(
   // Fix round 1, S3: the winner might not be a usable coordination ref
   // either (see `assertRefIsUsable`) — confirm before reporting success
   // here too, symmetrically with the `existing !== null` branch above.
-  await assertRefIsUsable(adapter, validatedRef);
+  await assertRefIsUsable(adapter, validatedRef, winner);
 }

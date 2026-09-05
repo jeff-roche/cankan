@@ -8,38 +8,97 @@
  *
  * ## The canonicalization ruling (binding)
  * `BoardRef.root` and `BoardRef.ticketsDir` are always the `fs.realpath`
- * of the underlying directory — never a string-constructed or
- * caller-supplied path — for every `kind` and every source. M2.6's
- * `GitAdapter` returns symlink-resolved paths for everything it touches;
- * comparing an unresolved `root` against one of those fails silently on
- * macOS (`$TMPDIR` sits under `/var/folders/...`, itself a symlink to
- * `/private/var/...`) and passes trivially on Linux. Both fields are
- * realpath'd before this function returns, precisely so M2.5/M2.8/M2.14
- * never have to re-derive this themselves.
+ * of the underlying directory, or of the underlying directory's deepest
+ * *existing* ancestor with the remaining, not-yet-existing components
+ * re-appended (see `realpathExistingPrefix` below) — never a
+ * string-constructed or caller-supplied path — for every `kind` and every
+ * source. M2.6's `GitAdapter` returns symlink-resolved paths for
+ * everything it touches; comparing an unresolved `root` against one of
+ * those fails silently on macOS (`$TMPDIR` sits under `/var/folders/...`,
+ * itself a symlink to `/private/var/...`) and passes trivially on Linux.
+ *
+ * ## Board resolution is read-only (controller ruling, fix round 1)
+ * **`buildBoardRef` never creates `tickets_dir`, and never creates or
+ * touches anything else on disk.** An earlier version of this function
+ * created `tickets_dir` with `mkdir(..., { recursive: true })` when it
+ * did not already exist, gated behind a defense-in-depth
+ * `assertNoSymlinkComponent` guard. That guard had a deterministic bypass
+ * (F1: it early-returned on a *string-prefix* test, `rel.startsWith("..")`,
+ * for exactly the class of path the ADR names as the wrong
+ * implementation — a directory literally named `..evil` is genuinely
+ * contained by *component*, so `isContained` correctly says "contained,"
+ * but the guard's prefix test treated it as "not really contained" and
+ * skipped the walk entirely, letting `mkdir(recursive)` follow a
+ * committed symlink there before anything could look). Demonstrated live
+ * against both an outside-root escape and a `.git` write.
+ *
+ * The controller ruling removes the write instead of narrowing it:
+ * PLAN.md M3.2 already assigns "writes ... tickets dir" to `init`, so
+ * creation was never this function's job in the first place, and the
+ * `mkdir` call was the *only* reason the bypass had any blast radius —
+ * without it, nothing this function does can ever materialize a
+ * directory anywhere. `assertNoSymlinkComponent` is deleted entirely,
+ * not kept alongside the fix.
+ *
+ * Creation now belongs to whichever caller actually needs `tickets_dir`
+ * to exist: `personal.ts`'s `ensurePersonalBoard()` creates it and calls
+ * `buildBoardRef` a second time afterward (so the returned `ticketsDir`
+ * is a full realpath of something that now really exists — this is how
+ * ADR 0002 step (b) stays discharged even though this function no longer
+ * creates anything itself); M3.2's `init` owns the repo-board case (not
+ * built in this dispatch).
  *
  * ## `tickets_dir` containment (ADR 0002, docs/decisions/0002-ids-and-backlog-compat.md, 542-630)
- * Implements the ADR's staged check, steps (a) and (b):
+ * Implements the ADR's staged check, steps (a) and (b), both read-only:
  *
  *   (a) string-arithmetic containment of `path.resolve(root, tickets_dir)`
- *       inside `root`, and outside `<root>/.git` — asserted *before*
- *       creating anything, so a checked-in `tickets_dir: ../../../victim`
- *       cannot `mkdir` its way outside the board (or into `.git`) before
- *       the check meant to stop it ever runs.
- *   (b) once the (now-created) directory exists, the same containment
- *       check re-run against its `fs.realpath` — this is what catches a
- *       `tickets_dir` that is itself a symlink, which (a)'s string
- *       arithmetic cannot see.
+ *       inside `root`, and outside `<root>/.git` (`checkContainment`,
+ *       called on the raw resolved string).
+ *   (b) `realpathExistingPrefix` resolves whatever part of that path
+ *       already exists on disk (walking upward to the deepest existing
+ *       ancestor, `fs.realpath`-ing *that*, then re-appending the
+ *       remaining components verbatim — they cannot be symlinks if they
+ *       do not exist), and `checkContainment` runs again against the
+ *       result. This is what catches a `tickets_dir` reached through an
+ *       *existing* symlink — anywhere along the path, not only at the
+ *       final component — which (a)'s string arithmetic cannot see.
  *
  * "Lies beneath" is a path-*component* relationship (`path.relative`),
  * never a string prefix: `resolved.startsWith(boardRoot)` is the ADR's
  * named wrong implementation, defeated by `tickets_dir: ../repo-evil/x`
  * against a root of `/home/u/repo` (`/home/u/repo-evil/x` passes a naive
- * prefix test). `isContained` below compares by component instead.
+ * prefix test) — and, per F1 above, so is `rel.startsWith("..")` against
+ * a component literally named `..evil`. `isContained` compares by
+ * component (`rel.split(sep)[0] !== ".."`) everywhere in this file; there
+ * is no string-prefix test left anywhere in this module.
+ *
+ * The `.git` exclusion (`firstSegmentIsGitDir`) compares the first path
+ * component under `root` against `.git` **case-insensitively, with
+ * trailing dots/spaces stripped**, unconditionally rather than via
+ * `process.platform` (mirrors `config/schema.ts`'s `DRIVE_LETTER_PREFIX`
+ * precedent): NTFS silently strips a component's trailing dots/spaces (so
+ * `tickets_dir: .git./hooks` is `.git/hooks` on an actual Windows machine
+ * even though it is a distinct string here), and macOS's default
+ * filesystem is case-insensitive (so `.GIT` is `.git` there). PLAN.md
+ * ships a `win-x64` build target, so a checked-in `tickets_dir` must be
+ * judged the same way regardless of which platform later reads the repo.
  *
  * A containment failure throws a typed `CanKanError`
- * (`BoardErrorCodes.TICKETS_DIR_ESCAPES_BOARD`) and writes nothing — see
- * each call site below for exactly what has (and has not) been created by
- * the time it can fire.
+ * (`BoardErrorCodes.TICKETS_DIR_ESCAPES_BOARD`) and writes nothing — this
+ * function performs no filesystem writes at all, so that is automatic
+ * rather than something each call site has to preserve.
+ *
+ * `tickets_dir` is deliberately unvalidated by `config/schema.ts` (ADR
+ * 0002 assigns this check here), so a value the filesystem itself cannot
+ * represent — an embedded NUL byte, or a component long enough to trip
+ * `ENAMETOOLONG` — reaches `fs.lstat`/`fs.realpath` as a raw platform
+ * error (`TypeError`/`ERR_INVALID_ARG_VALUE` for NUL, a bare `Error` with
+ * `code: "ENAMETOOLONG"` for the latter), neither of which is a
+ * `CanKanError` and both of which would otherwise be invisible to
+ * `isCanKanError`/M3.10's exit-code map. Every filesystem call touching
+ * the resolved `tickets_dir` is wrapped and rethrown as
+ * `BoardErrorCodes.TICKETS_DIR_INVALID` when it is not already a
+ * `CanKanError`.
  *
  * **Gap, reported rather than improvised:** full step (c) — excluding a
  * *linked worktree's* real git directory via `git rev-parse --git-dir` /
@@ -47,9 +106,9 @@
  * (M2.6) can do, and M2.6 is not in M2.4's *Depends on* list; even with a
  * waiver, M2.6's `GitAdapter` exposes only `gitCommonDir()`, no `--git-dir`
  * equivalent. What ships instead is the reachable slice: rejecting a
- * `tickets_dir` resolving to or beneath `<root>/.git` (string form in (a),
- * realpath'd form in (b)) — which is exactly right for a main worktree and
- * is also *not wrong* for a linked worktree, since a linked worktree's real
+ * `tickets_dir` resolving to or beneath `<root>/.git` (by name, in both
+ * (a) and (b)) — which is exactly right for a main worktree and is also
+ * *not wrong* for a linked worktree, since a linked worktree's real
  * git-common-dir lives outside the board root entirely and is therefore
  * already excluded by "must lie beneath root." What's missing is narrower
  * than it sounds: a `.git` *file* (not directory) inside a linked
@@ -59,54 +118,12 @@
  * entry is, so this gap has no known unblocked exploit — it is reported as
  * incomplete coverage of the ADR's literal text, not as a live escape.
  * Step (d) (ticket *filename* validation) belongs to M2.5.
- *
- * **This function creates `tickets_dir` if it does not already exist**
- * (`mkdir(..., { recursive: true })`, run only *after* check (a) passes —
- * preserving the ADR's "before creating any directory" ordering). This is
- * a scope decision the M2.4 brief left open: git does not track empty
- * directories, so a freshly cloned repo board (or a brand-new personal
- * board) legitimately has a `.cankan/config.yml` naming a `tickets_dir`
- * that does not exist on disk yet — and the canonicalization ruling above
- * requires `ticketsDir` to be realpath'd, which is impossible for a path
- * that does not exist. Centralizing the `mkdir` here, gated by check (a),
- * also keeps every containment guard in exactly one place instead of
- * partially re-derived by every future caller that might need to
- * pre-create the directory.
- *
- * **Defense-in-depth beyond the ADR's literal two steps:** between check
- * (a) and the `mkdir` call, this function also refuses to walk through an
- * *already-existing* symlinked path component (see `assertNoSymlinkComponent`
- * below). Without it, a checked-in `tickets_dir: backlog/tasks` where
- * `backlog` is itself a committed symlink (git stores symlinks as
- * mode-120000 blobs) would have `mkdir(root/backlog/tasks, { recursive:
- * true })` silently follow that symlink and materialize `tasks` outside the
- * board *before* step (b)'s post-hoc `realpath` could ever detect it — (b)
- * only catches a symlink at the final component, not an intermediate one
- * introduced during the very `mkdir` this function performs. This check is
- * a mitigation, not an atomic guarantee (a TOCTOU window remains between
- * the `lstat` walk and the `mkdir`, same caveat `config/layers.ts`'s own
- * `assertNotSymlink` documents for the identical class of check).
- *
- * **Consequence for step (b) and its test coverage:** because
- * `assertNoSymlinkComponent` walks *every* existing path component
- * including the final one, it now catches "`tickets_dir` is itself a
- * symlink" (the case step (b) exists for) *before* `mkdir` even runs, for
- * any symlink that was already there when this function was called. Step
- * (b)'s post-`mkdir` `realpath` check therefore only fires today as a
- * backstop against a symlink that appears in the TOCTOU window between
- * the walk and the `mkdir` (or a `tickets_dir` value that resolves to
- * something other than a directory that (a)'s check would have to also
- * approve of, which is not currently a distinct case). No test in
- * `ref.test.ts` reaches step (b) through a path the symlink-component
- * guard does not already intercept -- flagged rather than left implicit,
- * since a reviewer looking for "(a) and (b), each tested" would otherwise
- * expect to find one.
  */
 
-import { lstat, mkdir, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
+import { lstat, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
 import { loadConfig } from "../config/index";
-import { CanKanError } from "../errors";
+import { CanKanError, isCanKanError } from "../errors";
 import type { BoardKind, BoardRef } from "../types";
 import { BoardErrorCodes } from "./errors";
 
@@ -119,12 +136,31 @@ export interface BuildBoardRefOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
 }
 
-/** `path.relative`-based containment: is `resolved` equal to, or beneath, `base`? */
+/** `path.relative`-based containment: is `resolved` equal to, or beneath, `base`? Never a string prefix (see file header, F1). */
 function isContained(base: string, resolved: string): boolean {
   const rel = relative(base, resolved);
   if (rel === "") return true;
   if (isAbsolute(rel)) return false;
   return rel.split(sep)[0] !== "..";
+}
+
+const TRAILING_DOTS_OR_SPACES = /[. ]+$/;
+
+/**
+ * Whether `segment` names the git directory under win32/macOS-equivalent
+ * semantics, not just byte-for-byte POSIX comparison (see file header).
+ * Checked unconditionally, never via `process.platform`.
+ */
+function isGitDirSegment(segment: string): boolean {
+  return segment.replace(TRAILING_DOTS_OR_SPACES, "").toLowerCase() === ".git";
+}
+
+/** Is the first path component of `target` relative to `root` a `.git`-shaped name? */
+function firstSegmentIsGitDir(root: string, target: string): boolean {
+  const rel = relative(root, target);
+  if (rel === "" || isAbsolute(rel)) return false;
+  const first = rel.split(sep)[0];
+  return first !== undefined && first !== ".." && isGitDirSegment(first);
 }
 
 function escapesBoardError(kind: string, root: string, configValue: string, resolved: string): CanKanError {
@@ -135,47 +171,59 @@ function escapesBoardError(kind: string, root: string, configValue: string, reso
   );
 }
 
+function invalidTicketsDirError(root: string, configValue: string, cause: unknown): CanKanError {
+  return new CanKanError(
+    BoardErrorCodes.TICKETS_DIR_INVALID,
+    `tickets_dir "${configValue}" is not usable on this filesystem (board root: ${root})`,
+    { cause, details: { root, ticketsDir: configValue } },
+  );
+}
+
+/** Throws `TICKETS_DIR_ESCAPES_BOARD` unless `resolved` lies beneath `root` and outside `<root>/.git`. */
+function checkContainment(root: string, resolved: string, configValue: string): void {
+  if (!isContained(root, resolved)) {
+    throw escapesBoardError("resolves outside the board root", root, configValue, resolved);
+  }
+  if (firstSegmentIsGitDir(root, resolved)) {
+    throw escapesBoardError("resolves inside the board's .git directory", root, configValue, resolved);
+  }
+}
+
 /**
- * Walks from `root` down to `target`'s parent chain, `lstat`-ing every
- * path component that already exists, and refuses to proceed through one
- * that is a symlink. See the file header's "Defense-in-depth" note. Only
- * inspects components that already exist on disk — anything below the
- * first missing component does not exist yet, so `mkdir(recursive: true)`
- * creates plain new directories from there down, which is exactly what
- * this check needs to allow.
+ * Finds the deepest already-existing ancestor of `target` (walking
+ * upward, `lstat`-ing each candidate purely to test existence), realpaths
+ * *just that existing prefix* (resolving any symlink within it, however
+ * deep), and re-appends the remaining, not-yet-existing components
+ * verbatim — a path component that does not exist cannot be a symlink.
+ * Never creates anything. See the file header's "Board resolution is
+ * read-only" note for why this replaces the old create-then-realpath
+ * approach.
  */
-async function assertNoSymlinkComponent(
-  kindLabel: string,
-  root: string,
-  target: string,
-  configValue: string,
-): Promise<void> {
-  const rel = relative(root, target);
-  if (rel === "" || rel.startsWith("..")) {
-    // Not actually beneath root -- the caller's containment check (a) will
-    // have already thrown for this case; nothing further to walk here.
-    return;
-  }
-  let current = root;
-  for (const segment of rel.split(sep)) {
-    current = join(current, segment);
-    let stats: Awaited<ReturnType<typeof lstat>>;
+async function realpathExistingPrefix(target: string): Promise<string> {
+  const suffix: string[] = [];
+  let current = target;
+  for (;;) {
     try {
-      stats = await lstat(current);
-    } catch {
-      // This component (and everything below it) does not exist yet --
-      // safe for `mkdir` to create plain directories from here down.
-      return;
-    }
-    if (stats.isSymbolicLink()) {
-      throw escapesBoardError(
-        `${kindLabel} — "${current}" is a symlinked path component`,
-        root,
-        configValue,
-        current,
-      );
+      await lstat(current);
+      break;
+    } catch (err) {
+      if (typeof err === "object" && err !== null && "code" in err && err.code !== "ENOENT") {
+        throw err;
+      }
+      const parent = dirname(current);
+      if (parent === current) {
+        // Reached the filesystem root without finding anything that
+        // exists -- cannot happen once `root` itself is guaranteed to
+        // exist (the caller only reaches this after `realpath(root)`
+        // succeeded), but stop rather than loop forever if it somehow did.
+        break;
+      }
+      suffix.unshift(basename(current));
+      current = parent;
     }
   }
+  const real = await realpath(current);
+  return suffix.length > 0 ? join(real, ...suffix) : real;
 }
 
 export async function buildBoardRef(options: BuildBoardRefOptions): Promise<BoardRef> {
@@ -184,41 +232,20 @@ export async function buildBoardRef(options: BuildBoardRefOptions): Promise<Boar
   const ticketsDirConfigValue = cfg.value.tickets_dir;
   const coordinationRef = cfg.value.coordination.ref;
 
-  const gitDir = join(root, ".git");
-  const resolvedTicketsDir = resolvePath(root, ticketsDirConfigValue);
+  let ticketsDir: string;
+  try {
+    // Step (a) -- string arithmetic, no filesystem writes anywhere in
+    // this function.
+    const target = resolvePath(root, ticketsDirConfigValue);
+    checkContainment(root, target, ticketsDirConfigValue);
 
-  // Step (a) -- string arithmetic, before creating anything.
-  if (!isContained(root, resolvedTicketsDir)) {
-    throw escapesBoardError("resolves outside the board root", root, ticketsDirConfigValue, resolvedTicketsDir);
-  }
-  if (isContained(gitDir, resolvedTicketsDir)) {
-    throw escapesBoardError(
-      "resolves inside the board's .git directory",
-      root,
-      ticketsDirConfigValue,
-      resolvedTicketsDir,
-    );
-  }
-
-  // Defense-in-depth: no existing path component between `root` and the
-  // tickets dir may be a symlink (see file header).
-  await assertNoSymlinkComponent("resolves through a symlinked path component", root, resolvedTicketsDir, ticketsDirConfigValue);
-
-  await mkdir(resolvedTicketsDir, { recursive: true });
-
-  // Step (b) -- catches a tickets_dir that is itself a symlink.
-  const ticketsDir = await realpath(resolvedTicketsDir);
-  if (!isContained(root, ticketsDir)) {
-    throw escapesBoardError("resolves outside the board root", root, ticketsDirConfigValue, ticketsDir);
-  }
-  const realGitDir = await realpath(gitDir).catch(() => undefined);
-  if (realGitDir !== undefined && isContained(realGitDir, ticketsDir)) {
-    throw escapesBoardError(
-      "resolves inside the board's .git directory",
-      root,
-      ticketsDirConfigValue,
-      ticketsDir,
-    );
+    // Step (b) -- realpath whatever part of `target` already exists,
+    // catching a symlink anywhere along that existing part.
+    ticketsDir = await realpathExistingPrefix(target);
+    checkContainment(root, ticketsDir, ticketsDirConfigValue);
+  } catch (err) {
+    if (isCanKanError(err)) throw err;
+    throw invalidTicketsDirError(root, ticketsDirConfigValue, err);
   }
 
   return {

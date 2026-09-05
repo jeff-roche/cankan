@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { withEnv } from "../../../test-utils/src/withEnv";
+import { ensurePersonalBoard } from "../../src/board/personal";
 import { buildBoardRef } from "../../src/board/ref";
 import {
   findRegisteredBoard,
@@ -348,8 +349,8 @@ describe("registry -- findRegisteredBoard", () => {
   });
 });
 
-describe("registry -- canonicalization (a registry entry whose stored path is a symlink)", () => {
-  test("buildBoardRef canonicalizes a board root even when the registry stored a symlink", async () => {
+describe("registry -- canonicalization (register() always stores a canonical path)", () => {
+  test("registering a symlinked path stores its realpath, not the symlink", async () => {
     await withEnv(undefined, async () => {
       const board = await makeBoardDir();
       const linkParent = await mkdtemp(join(tmpdir(), "cankan-registry-link-"));
@@ -357,12 +358,6 @@ describe("registry -- canonicalization (a registry entry whose stored path is a 
         const linkPath = join(linkParent, "board-link");
         await symlink(board.dir, linkPath);
 
-        // Simulate a hand-edited or otherwise-non-canonical registry row by
-        // registering the symlink path directly and asserting the stored
-        // path is already canonical (register() itself realpaths), then
-        // separately proving buildBoardRef canonicalizes regardless of
-        // what a caller hands it (e.g. a manually-constructed BoardRef
-        // source).
         const entry = await register("api", linkPath, hermeticEnv());
         expect(entry.path).toBe(await realpath(board.dir));
 
@@ -373,5 +368,120 @@ describe("registry -- canonicalization (a registry entry whose stored path is a 
         await rm(linkParent, { recursive: true, force: true });
       }
     });
+  });
+});
+
+describe("registry -- F11: a hand-edited entry whose stored path is itself a symlink", () => {
+  test("listRegisteredBoards returns the stored path verbatim -- canonicalization is register()'s job on write, not a read-time guarantee", async () => {
+    await withEnv(undefined, async () => {
+      const board = await makeBoardDir();
+      const linkParent = await mkdtemp(join(tmpdir(), "cankan-registry-link-"));
+      try {
+        const linkPath = join(linkParent, "board-link");
+        await symlink(board.dir, linkPath);
+
+        const registryPath = resolveRegistryPath(hermeticEnv());
+        if (!registryPath) throw new Error("test setup: registry path did not resolve");
+        await mkdir(join(registryPath, ".."), { recursive: true });
+        await writeFile(
+          registryPath,
+          `version: 1\nrepos:\n  - name: api\n    path: ${linkPath}\n    last_seen: 2026-09-05T08:00:00.000Z\n`,
+        );
+
+        // `stat` (used by listRegisteredBoards to confirm the directory is
+        // present) follows the symlink, so this entry is included -- but
+        // its `.path` is exactly what was on disk, unresolved.
+        const listing = await listRegisteredBoards(hermeticEnv());
+        expect(listing.boards).toHaveLength(1);
+        expect(listing.boards[0]?.path).toBe(linkPath);
+        expect(listing.boards[0]?.path).not.toBe(await realpath(board.dir));
+
+        // buildBoardRef is what actually canonicalizes it, downstream.
+        const built = await buildBoardRef({ kind: "repo", name: "api", root: listing.boards[0]?.path ?? "" });
+        expect(built.root).toBe(await realpath(board.dir));
+      } finally {
+        await board.cleanup();
+        await rm(linkParent, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+describe("registry -- F7: the personal board can never be registered as a repo board", () => {
+  test("register() refuses the personal board's own directory", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+
+      let thrown: unknown;
+      try {
+        await register("mine", personal.board.root, env);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("CANNOT_REGISTER_PERSONAL_BOARD");
+
+      const listing = await listRegisteredBoards(env);
+      expect(listing.boards).toHaveLength(0);
+    });
+  });
+
+  test("listRegisteredBoards skips a hand-edited entry pointing at the personal board", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+
+      const registryPath = resolveRegistryPath(env);
+      if (!registryPath) throw new Error("test setup: registry path did not resolve");
+      await mkdir(join(registryPath, ".."), { recursive: true });
+      await writeFile(
+        registryPath,
+        `version: 1\nrepos:\n  - name: sneaky\n    path: ${personal.board.root}\n    last_seen: 2026-09-05T08:00:00.000Z\n`,
+      );
+
+      const listing = await listRegisteredBoards(env);
+      expect(listing.boards).toHaveLength(0);
+      expect(listing.skipped).toHaveLength(1);
+      expect(listing.skipped[0]?.reason).toBe("is the personal board");
+    });
+  });
+});
+
+describe("registry -- F8: reserved-name matching folds case and rejects padding whitespace", () => {
+  const disguisedReserved: Array<[string, string]> = [
+    ["different case", "Personal"],
+    ["all caps", "PERSONAL"],
+    ["leading/trailing whitespace around a reserved name", "  personal  "],
+  ];
+
+  for (const [label, name] of disguisedReserved) {
+    test(`isValidBoardName rejects "${name}" (${label})`, () => {
+      expect(isValidBoardName(name)).toBe(false);
+    });
+
+    test(`register() refuses "${name}" (${label})`, async () => {
+      await withEnv(undefined, async () => {
+        const board = await makeBoardDir();
+        try {
+          let thrown: unknown;
+          try {
+            await register(name, board.dir, hermeticEnv());
+          } catch (err) {
+            thrown = err;
+          }
+          expect(isCanKanError(thrown)).toBe(true);
+          expect((thrown as { code: string }).code).toBe("INVALID_BOARD_NAME");
+        } finally {
+          await board.cleanup();
+        }
+      });
+    });
+  }
+
+  test("plain leading/trailing whitespace on an otherwise-fine name is rejected outright", () => {
+    expect(isValidBoardName("  api")).toBe(false);
+    expect(isValidBoardName("api  ")).toBe(false);
+    expect(isValidBoardName(" api ")).toBe(false);
   });
 });

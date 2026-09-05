@@ -13,6 +13,12 @@ import {
   validateCoordinationRef,
   withCasRetry,
 } from "../src/git/index";
+// Fix-round-1 F1 (final review): `updateRefCASCore` is a module-internal
+// export from `adapter.ts` (not re-exported from `index.ts` — see its own
+// doc comment) so the two `--no-deref` tests below can drive the shipped
+// function directly, rather than a hand-copied argv through `Bun.spawnSync`
+// that no code in this module actually runs.
+import { updateRefCASCore } from "../src/git/adapter";
 import type { Equal, Expect, IsAssignable } from "./typeLevel";
 
 /*
@@ -82,13 +88,18 @@ describe("validateCoordinationRef", () => {
 
   test("rejects refs/cankan/../heads/main — matches the regex but not check-ref-format", async () => {
     // This is also the regression guard for a real defect this task found:
-    // `check-ref-format` fails with a bare non-zero exit and empty stderr,
-    // and simple-git's error detection requires both exit code *and* stderr
-    // to be non-empty to treat a task as failed. Routing this call through
-    // the shared simple-git chokepoint (rather than the direct spawn in
-    // `refValidation.ts`) makes this exact test fail — see that file's doc
-    // comment. If this test ever goes green for the wrong reason, it will
-    // be because someone "simplified" that call site back onto simple-git.
+    // `check-ref-format` fails with a bare non-zero exit and empty stderr —
+    // a failure shape a transport whose error detection requires both exit
+    // code *and* non-empty stderr (as `simple-git`'s did, pre-fix-round-1)
+    // silently resolves through instead of throwing, which would have made
+    // this exact ref pass validation. Fix-round-1 Ruling 11 removed that
+    // transport entirely: `check-ref-format` now runs through this module's
+    // one `Bun.spawn` chokepoint (`transport.ts`'s `runGitRaw`), which
+    // exposes the exit code directly and cannot repeat this defect. The
+    // test still guards the underlying defect class, not a specific
+    // library's bug — if `check-ref-format`'s call site is ever routed
+    // through anything that treats "non-zero exit, empty stderr" as
+    // success, this is the test that catches it.
     await expectCode(
       validateCoordinationRef("refs/cankan/../heads/main"),
       GitErrorCodes.GIT_REF_INVALID,
@@ -428,18 +439,20 @@ describe("F1 — a coordination ref that is itself a symbolic ref", () => {
     expect(git(repo.dir, ["rev-parse", "main"]).trim()).toBe(mainTipBefore);
   });
 
-  test("--no-deref backstop: even if a write reaches update-ref against a symref, main is never moved", async () => {
+  test("--no-deref backstop: a stale compare against a symref-swapped ref is rejected, and main is never moved", async () => {
     // The validation test above proves the *easy* half; it never exercises
     // `--no-deref` at all, since validation throws before `update-ref` is
-    // ever invoked. This test exercises `--no-deref` in isolation, as a
-    // deterministic proof that the mechanism itself holds if it were ever
-    // the only thing standing between a symref and `main` — a genuine
-    // concurrent TOCTOU race (the ref becoming a symref in the gap between
-    // this module's own validation call and its own update-ref call) would
-    // require inter-process timing this suite does not rely on to prove the
-    // point; the backstop's soundness does not depend on winning that race,
-    // only on `--no-deref` behaving as observed below regardless of when it
-    // is invoked.
+    // ever invoked. `ensureValidRef` unconditionally rejects a ref that is
+    // *currently* a symref, so the only way production code can ever reach
+    // `updateRefCASCore` with a symref `ref` is the TOCTOU gap between that
+    // check and this write — a gap that cannot be constructed through the
+    // public `GitAdapter` without racing two real processes. This test
+    // drives `updateRefCASCore` directly (the module-internal export, not
+    // re-exported from `index.ts`) to exercise exactly the code path that
+    // gap would reach, without needing to win a race to prove it: the
+    // backstop's soundness does not depend on timing, only on `--no-deref`
+    // behaving as asserted below whenever this function is called against a
+    // ref that happens to be a symref.
     const repo = await tempRepo();
     const mainTipAtSymrefTime = git(repo.dir, ["rev-parse", "main"]).trim();
 
@@ -455,15 +468,12 @@ describe("F1 — a coordination ref that is itself a symbolic ref", () => {
     const newSha = git(
       repo.dir,
       ["commit-tree", "-p", mainTipAtSymrefTime, "-m", "hijack attempt", git(repo.dir, ["write-tree"]).trim()],
-    ).trim();
+    ).trim() as ObjectSha;
 
-    // The exact argv `updateRefCASCore` issues, invoked directly to isolate
-    // `--no-deref`'s own behavior from `ensureValidRef`'s (separately
-    // tested) symref check.
-    const result = Bun.spawnSync(
-      ["git", "update-ref", "--no-deref", "--end-of-options", COORD_REF, newSha, mainTipAtSymrefTime],
-      { cwd: repo.dir, stdout: "pipe", stderr: "pipe" },
-    );
+    // The shipped function itself, not a hand-copied argv: this is what
+    // makes `--no-deref` a regression-guarded property of `adapter.ts`
+    // rather than a fact about git's own behavior in isolation.
+    const result = await updateRefCASCore(repo.dir, COORD_REF, newSha, mainTipAtSymrefTime as RefSha);
 
     // Observed for this task: with a *stale* compare value (main has since
     // advanced), the write is rejected — `--no-deref` still compares against
@@ -472,8 +482,10 @@ describe("F1 — a coordination ref that is itself a symbolic ref", () => {
     // below this one exercises the other half — a *matching* compare value
     // succeeds by converting the coordination ref back into a direct ref,
     // never by advancing whatever the symref pointed to.
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr.toString()).toContain("cannot lock ref");
+    expect(result.outcome).toBe("rejected");
+    if (result.outcome === "rejected") {
+      expect(result.stderr).toContain("cannot lock ref");
+    }
 
     expect(git(repo.dir, ["rev-parse", "main"]).trim()).toBe(mainTipAfterAdvance);
   });
@@ -483,7 +495,8 @@ describe("F1 — a coordination ref that is itself a symbolic ref", () => {
     // instead succeed by converting the coordination ref back into a direct
     // ref") is the other half of the same mechanism and is just as
     // deterministic to set up — no race needed, since a matching compare
-    // means the write happens on the first attempt.
+    // means the write happens on the first attempt. Same rationale as above
+    // for calling `updateRefCASCore` directly rather than a hand-copied argv.
     const repo = await tempRepo();
     const mainTipAtSymrefTime = git(repo.dir, ["rev-parse", "main"]).trim();
 
@@ -494,21 +507,25 @@ describe("F1 — a coordination ref that is itself a symbolic ref", () => {
     const newSha = git(
       repo.dir,
       ["commit-tree", "-p", mainTipAtSymrefTime, "-m", "converts the symref", git(repo.dir, ["write-tree"]).trim()],
-    ).trim();
+    ).trim() as ObjectSha;
 
-    const result = Bun.spawnSync(
-      ["git", "update-ref", "--no-deref", "--end-of-options", COORD_REF, newSha, mainTipAtSymrefTime],
-      { cwd: repo.dir, stdout: "pipe", stderr: "pipe" },
-    );
+    const result = await updateRefCASCore(repo.dir, COORD_REF, newSha, mainTipAtSymrefTime as RefSha);
 
-    expect(result.exitCode).toBe(0);
+    expect(result.outcome).toBe("applied");
+    if (result.outcome === "applied") {
+      expect(result.sha).toBe(newSha as unknown as RefSha);
+    }
 
     // COORD_REF is no longer a symref — `--no-deref` wrote directly to its
-    // own path, converting it to a normal ref pointing at newSha.
+    // own path, converting it to a normal ref pointing at newSha. Checked
+    // with `LC_ALL=C` pinned, matching every other stderr-shaped assertion
+    // in this module (git()'s own helper calls do not assert on stderr
+    // text, so they were never subject to this).
     const symrefCheck = Bun.spawnSync(["git", "symbolic-ref", "-q", "--end-of-options", COORD_REF], {
       cwd: repo.dir,
       stdout: "pipe",
       stderr: "pipe",
+      env: { ...process.env, LC_ALL: "C" },
     });
     expect(symrefCheck.exitCode).not.toBe(0);
     expect(git(repo.dir, ["rev-parse", "--verify", "--end-of-options", COORD_REF]).trim()).toBe(newSha);

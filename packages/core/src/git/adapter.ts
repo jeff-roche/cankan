@@ -320,8 +320,24 @@ async function readRefCore(root: string, validatedRef: string): Promise<RefSha |
   return revResult.stdout.trim() as RefSha;
 }
 
-/** `updateRefCAS`, assuming `ref` has already been validated. */
-async function updateRefCASCore(
+/**
+ * `updateRefCAS`, assuming `ref` has already been validated.
+ *
+ * Exported (module-internal only — deliberately **not** re-exported from
+ * `index.ts`, whose surface `test/index.test.ts` asserts exactly and which
+ * M2.7 already consumes) so `git.test.ts` can drive this function directly
+ * against a `ref` planted as a symref, bypassing `ensureValidRef`'s own
+ * symref rejection the way the *real* TOCTOU gap would: `ensureValidRef`
+ * unconditionally rejects a ref that is currently a symref, so the only
+ * way production code can ever reach this function with a symref `ref` is
+ * the gap between that check and this call — a gap no caller-facing test
+ * can construct without either raising a race or calling this function
+ * directly. Calling it directly is what makes `--no-deref`
+ * (fix-round-1 F1) a regression-guarded property of the shipped code,
+ * rather than a fact about git's behavior for a hand-copied argv that
+ * nothing in this module actually runs.
+ */
+export async function updateRefCASCore(
   root: string,
   validatedRef: string,
   newSha: ObjectSha,

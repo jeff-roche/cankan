@@ -185,7 +185,11 @@ $ git -C <linked-worktree> rev-parse --git-common-dir
 A lock path built the spike's way (`join(worktreeDir, ".git", ...)`) from
 a linked worktree would attempt to create a file inside what is actually a
 plain text file, not a directory — it would need `git rev-parse
---git-common-dir` to find the genuinely shared location instead. **The
+--git-common-dir` to find the genuinely shared location instead (and,
+per the observation-store obligation in failure mode 7, would need
+`--path-format=absolute` alongside it: the bare flag returns a path
+relative to the current directory and so does not by itself yield a
+stable shared location). **The
 spike never exercises this**: scenario 2's lock race runs only against
 `casRepo.dir`/`lockRepo.dir`, the main worktree in each temp repo, never
 against a linked worktree directory. This is a real extra correctness
@@ -399,12 +403,17 @@ for no additional correctness benefit.
   an invalid ref name before this would matter), so this is hygiene, not
   a live gap — but it is mechanical, costs nothing, and belongs in the
   spec now, before config-fed values are wired through it. Every command
-  template in the bullets below carries the marker, the push and fetch
-  templates included — `git fetch --end-of-options origin <refspec>` and
-  `git push --end-of-options origin <refspec>` are both confirmed working
-  on git 2.55, and a refspec is built from the same config-derived ref the
-  validation bullet above governs. Templates are what an implementer
-  copies, so the rule is not left standing in prose alone.
+  template below that this ADR directs M2.6 to *use*, and that takes such
+  an argument, carries the marker — the steady-state and reconciliation
+  push/fetch templates included, since a refspec is built from the same
+  config-derived ref the validation bullet above governs, and `git fetch
+  --end-of-options origin <refspec>` and `git push --end-of-options origin
+  <refspec>` are both confirmed working on git 2.55. (`git hash-object -w
+  --stdin` is outside the rule: its content arrives on stdin and it takes
+  no ref, path, or commit argument at all. The bare `git cat-file -p
+  <commit>:<path>` quoted in the `readBlobFromRef` bullet is a citation of
+  what the spike does wrong, not a template to copy.) Templates are what
+  an implementer copies, so the rule is not left standing in prose alone.
 
   **The rule is scoped to positionals because `--end-of-options` cannot
   protect an option's own argument.** `git commit-tree` passes the parent
@@ -491,9 +500,9 @@ for no additional correctness benefit.
   link target, respectively — confirmed directly — which then reaches
   the unguarded `JSON.parse` at `coordination.ts:56` (see failure mode 8,
   widened below). Implement a checked resolution instead, on `git ls-tree
-  --full-tree --end-of-options <commit> -- <path>` (confirmed: this exits
-  0 whether or not the path exists — check the *output*, not the exit
-  code):
+  --full-tree -z --end-of-options <commit> -- <path>` (confirmed: this
+  exits 0 whether or not the path exists — check the *output*, not the
+  exit code):
 
   - **Empty output**: no entry. Return `null`.
   - **Exactly one entry, whose mode is `100644` and whose path field is
@@ -561,7 +570,30 @@ for no additional correctness benefit.
   `ev/2026-09.jsonl` is not the requested `ev/sub/../2026-09.jsonl`.
   Comparing the emitted path against the requested one is what forces the
   two commands to agree on which object is under discussion; a mode check
-  alone leaves them free to disagree. **This is inherited by every
+  alone leaves them free to disagree.
+
+  **`-z` is what makes that byte-identical comparison mean what it says.**
+  Without it, `ls-tree` C-quotes the path field: a non-ASCII path is
+  emitted wrapped in double quotes with each byte octal-escaped, and a
+  `"` inside a name is backslash-escaped. Confirmed on git 2.55:
+
+  ```
+  $ git ls-tree --full-tree $C -- 'ev2/café.jsonl'
+  100644 blob 0187f3b…  "ev2/caf\303\251.jsonl"
+  $ git ls-tree --full-tree $C -- 'ev2/qu"ote.jsonl'
+  100644 blob 8d21d7b…  "ev2/qu\"ote.jsonl"
+  $ git ls-tree --full-tree -z $C -- 'ev2/café.jsonl'
+  100644 blob 0187f3b…  ev2/café.jsonl<NUL>
+  ```
+
+  With `-z` the path is emitted raw and each record is NUL-terminated, so
+  no unquoting step stands between the output and the comparison. Nothing
+  is exposed by the quoted form — the comparison fails, and failing the
+  comparison is the hard error, so it fails *closed* — and the monthly
+  event paths this ADR specifies are ASCII. But `readBlobFromRef` is
+  specified as a general primitive over a caller-supplied path, and a
+  guard that silently rejects every valid non-ASCII path is a guard whose
+  stated rule and actual behavior differ. **This is inherited by every
   consumer of
   `readBlobFromRef`**: M2.6 (the primitive itself), M2.7 (every
   claim/event read), and M2.8 (fold reads via M2.7) must all propagate
@@ -600,7 +632,11 @@ for no additional correctness benefit.
   coordination`, applied directly to the local working ref. Confirmed
   (see Evidence): default push/fetch/clone never touch this ref, not even
   to advance an already-existing local copy. Use this exact refspec
-  string as an explicit argument on every push/fetch call — do **not**
+  string as an explicit argument on every push/fetch call — `git fetch
+  --end-of-options origin <refspec>` and `git push --end-of-options
+  origin <refspec>`, carrying the marker for the reason given in the
+  `--end-of-options` bullet above, since the refspec is built from the
+  same config-derived ref that bullet governs — and do **not**
   rely on a persistent `remote.origin.fetch` config entry as an
   alternative; that was not tested here, and a `+` (force) prefix on such
   a config entry would be actively dangerous given the reconciliation
@@ -737,7 +773,14 @@ for no additional correctness benefit.
   the current one.
 - **ULID ids**, not the spike's `randomEventId()` (a UUID stand-in
   explicitly marked "not a real ULID... for a throwaway spike" in
-  `git-plumbing.ts:138`) — do not carry that stand-in forward.
+  `git-plumbing.ts:138`) — do not carry that stand-in forward. **This is
+  a validation rule as well as a minting rule**: an event id read back
+  off the ref must itself be checked against the ULID grammar (Crockford
+  base32, the fixed length that encoding implies), and an id that fails
+  is a schema failure with the usual fail-closed disposition. Read as a
+  minting rule alone it governs only ids CanKan wrote, leaving every id
+  arriving from a peer an arbitrary string — see failure mode 7, where
+  that is what an event id is used as.
 - **Test obligation beyond what the spike measured**: M2.7's own
   done-when criterion is "appends from two worktrees interleave without
   loss." The spike's scenario 2 only raced three workers claiming the
@@ -765,8 +808,11 @@ for no additional correctness benefit.
   place that silently resolves the conflict by dropping data, and that
   whatever M2.8 does design must not be `ts`-based.
 
-  **The property that tie-break must have is determinism, not fairness**,
-  and M2.8 should not spend design effort on the latter. What is needed
+  **The property that tie-break must have is determinism, not fairness**
+  — **reasoned, not tested**, like the reconciliation design it qualifies;
+  it is an argument about what is achievable among mutually-distrusting
+  peers, not an empirical result. M2.8 should not spend design effort on
+  fairness. What is needed
   is that both peers, independently reconciling the same union of events,
   compute the same winner — so that the board does not disagree with
   itself about who holds a ticket. No *fair* tie-break exists among
@@ -873,6 +919,20 @@ Alternatives considered); M2.7 may defer `branch-scan` entirely until a
 concrete blocker to `shared-ref` actually appears, rather than building
 a mode switch for a path with no current evidence behind it.
 
+`PLAN.md:248` (M2.7's *Creates* line) also does not mention the
+lease-observation store that failure mode 7 requires, and no other M2.x
+task names it either. It is persistent on-disk state under
+`$XDG_STATE_HOME/cankan/` that M2.7 must create, write on every read of a
+previously unseen lease-bearing event, and prune. Pruning is the part
+most easily missed: the store grows by one record per lease-bearing event
+id, discard-on-`release` is mandatory but reaches only released claims,
+and the poisoned-ref recovery this ADR requires of M2.7 — rewind to a
+known-good ancestor, or quarantine — removes events from the ref without
+removing the observation records those events caused, so a recovered
+board keeps them. `PLAN.md:248` should be revised to name the store as
+M2.7's deliverable, so that ownership of creating, bounding, and pruning
+it is assigned rather than assumed.
+
 ## Known failure modes
 
 Distinguishing observed (reproduced by the spike, or by direct
@@ -971,14 +1031,55 @@ inferred from the mechanism):
      chain, never by `ts`**, per the ordering rule in M2.7's Consequences
      — exceeds the configured lease (`claims.lease`,
      `CONCEPT.md:296`). A `release` event ends the lease outright, and the
-     observation records for that claim may then be discarded. The reader
-     trusts exactly one clock — its own host's — and no peer's.
-   - **Where the record lives.** `$XDG_STATE_HOME/cankan/`
-     (`CONCEPT.md:270`, already reserved for "lease heartbeats,
-     last-sync timestamps per board"), keyed by board and by event id. It
+     observation records for that claim **must** then be discarded — not
+     "may": the store is otherwise unbounded, growing by one record per
+     lease-bearing event id, and a peer with push access drives that
+     growth. The reader trusts exactly one clock — its own host's — and no
+     peer's.
+   - **Where the record lives.** `$XDG_STATE_HOME/cankan/` (`CONCEPT.md:270`,
+     already reserved for "lease heartbeats, last-sync timestamps per
+     board"), defaulting to `~/.local/state/cankan/` when the variable is
+     unset or empty, as XDG specifies. That default is not optional: the
+     variable is unset on many systems, and combined with the
+     "unwritable store is a typed hard error" rule below, an implementer
+     who reads it empty and stops would hard-error where the default
+     would have worked. The store is keyed by board and by event id, and
      must persist across invocations: a per-process record would
      re-observe every event on every command, and no lease would ever
-     expire. The board key must be the repository's common git directory,
+     expire.
+
+     **Neither key is used as a filesystem path component in raw form;
+     the path component is a hash of the key.** Both halves of that
+     sentence are load-bearing. An event id is read back off the ref and
+     is therefore a peer-supplied string: the ULID requirement in M2.7's
+     Consequences reads as a minting rule, the schema requirement's "type
+     and shape" is satisfied by any `string`, and M2.7's canonicalization
+     covers the `ticket` field only — so an id of
+     `../../../../home/victim/.gitconfig`
+     reaches an unguarded `join(stateDir, boardKey, eventId)` intact, and
+     every collaborator who reads the ref writes a file at the composed
+     path, as their own user, outside the state directory, for one push
+     by one peer with push access. The board key is a realpath'd
+     *absolute* path, so composing it with `path.resolve` rather than
+     `path.join` discards the state directory entirely —
+     `path.resolve("/state/cankan", "/home/u/repo/.git")` returns
+     `/home/u/repo/.git`, confirmed — siting the store inside the
+     repository's own git directory. Hashing both keys removes the
+     question rather than answering it twice: a hash of any input is a
+     single path component containing no separator and no `..`.
+
+     **Independently, the ULID grammar binds on read, not only on
+     minting.** An event id read from the ref must be validated as a
+     ULID — Crockford base32, the fixed length that encoding implies —
+     and an id that fails that check makes the event schema-invalid, with
+     the same fail-closed disposition as any other schema failure. This
+     is stated because the ULID requirement in M2.7's Consequences reads
+     as a rule about generating ids, and an implementer applying it only
+     at mint time leaves every id arriving from a peer ungoverned.
+     Validating the grammar and hashing before use are both required;
+     neither alone closes the other's half.
+
+     The board key must be the repository's common git directory,
      not the current worktree's path — every worktree of one clone shares
      one coordination ref, so they must share one observation record or
      two worktrees will compute different expiries for the same claim.
@@ -986,11 +1087,18 @@ inferred from the mechanism):
      --git-common-dir`, then `fs.realpath` the result. **The
      `--path-format=absolute` is load-bearing, not decoration**: plain
      `git rev-parse --git-common-dir` returns a path relative to the
-     current directory, so it prints `.git` from a main worktree and an
-     absolute path from a linked one — confirmed on git 2.55 — and an
-     implementer keying on the raw output would produce two different
-     keys for two worktrees of one clone, which is the exact divergence
-     this obligation exists to prevent. The record is per clone by
+     *current directory*, and so varies with where the command runs —
+     confirmed on git 2.55, it prints `.git` from a main worktree's root,
+     `../../.git` from a subdirectory two levels down, and an absolute
+     path from a linked worktree. An implementer keying on the raw output
+     would produce several different keys for one clone, which is the
+     exact divergence this obligation exists to prevent. Note also that
+     `--git-dir` and `--git-common-dir` diverge here: from that same
+     subdirectory, `--git-dir` returns an absolute path while
+     `--git-common-dir` returns `../../.git` (confirmed), so an
+     implementer who checks one flag's behavior and generalizes gets the
+     other wrong. `--path-format=absolute` returns the same absolute path
+     for both flags from every location tested. The record is per clone by
      construction. It is never pushed, fetched, or otherwise shared, and
      no peer can write to it; that is the entire point of siting it
      there.
@@ -1010,11 +1118,38 @@ inferred from the mechanism):
    whose state directory is ephemeral (CI, a throwaway container) does
    this for every lease it sees. Both cost liveness — a ticket stays
    unclaimable somewhat longer than it strictly should — and neither
-   costs mutual exclusion, which is the trade a coordination primitive
-   should make in that direction. One residual is not closed by this and
-   is not meant to be: a peer with push access can hold a ticket for as
-   long as it keeps appending `renew` events. That is what `renew` is
-   for, and it is bounded by who has push access, not by any timestamp.
+   costs mutual exclusion. **The reason mutual exclusion survives two
+   clones disagreeing about expiry is that no clock holds it**: taking
+   over an expired claim appends a *new* event, so the `update-ref` CAS
+   plus the mandated re-read-and-re-check on rejection serializes
+   concurrent takeovers exactly as it serializes concurrent first
+   claims. Clock disagreement changes only *when* a reader is willing to
+   attempt a takeover, never whether two takeovers can both succeed.
+   M2.7 should not go looking for a stronger guarantee from clock
+   agreement than the design needs from it.
+
+   There is one further consequence, in availability rather than
+   liveness: recording happens on every read that encounters a new event,
+   so a reader with a read-only or full state directory hard-errors by
+   the rule above and the board stops answering for that reader until the
+   directory is writable again. That is the fail-closed choice made
+   deliberately in the same rule, stated here so it is not discovered as
+   a surprise.
+
+   Two residuals are not closed by this design and are not meant to be.
+   First, a peer with push access can hold a ticket for as long as it
+   keeps appending `renew` events; that is what `renew` is for, and it is
+   bounded by who has push access, not by any timestamp. Second, and
+   symmetrically, a forged `release` frees a ticket with no clock
+   consulted at all — `actor` is not an authenticated identity (see M2.7's
+   Consequences), so nothing distinguishes a genuine `release` from a
+   peer's. This grants a push-access peer no capability it lacks, since
+   the same peer can append a competing `claim` directly, so it is not a
+   hole this design opens. It is recorded because the `release` rule above
+   sits inside an argument that no peer-supplied value decides expiry, and
+   an implementer could otherwise read that as a promise that `release` is
+   authorized. It is not, and M2.7 must not build release authorization on
+   `actor`.
 8. **Malformed or non-blob event-log content — partly observed, partly
    reasoned.** Two distinct issues reach the same unguarded `JSON.parse`
    (`coordination.ts:56`): (a) a corrupted or partially-written *line*

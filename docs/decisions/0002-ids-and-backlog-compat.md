@@ -560,10 +560,19 @@ output.
 
      a. Resolve the board root with `fs.realpath` (it exists) and assert
         that `path.resolve(boardRoot, tickets_dir)` is the board root or
-        lies beneath it - **before creating any directory**. Creating
-        `tickets_dir` first and realpathing it afterwards would let a
+        lies beneath it, **and** that it is not inside either git
+        directory per (c) - **before creating any directory**. Creating
+        `tickets_dir` first and checking it afterwards would let a
         checked-in `tickets_dir: ../../../victim` cause `mkdir` to
-        materialize directories outside the board before any check ran.
+        materialize directories outside the board before any check ran -
+        and, by the identical reasoning, would let `tickets_dir:
+        .git/refs/cankan-evil` cause `mkdir -p` to run *inside* the git
+        directory before the check that exists to prevent exactly that
+        ever fired. The `.git` comparison therefore runs twice: here
+        against the string-resolved path, and again in (c) against the
+        realpath'd one once the directory exists. Neither placement is
+        redundant - the first is what stops the `mkdir`, the second is
+        what catches a symlink.
      b. Once `tickets_dir` exists, `fs.realpath` it and assert the
         resolved result is still inside the realpath'd board root. This
         is the step that catches a `tickets_dir` that is a symlink, which
@@ -584,13 +593,20 @@ output.
         --path-format=absolute --git-common-dir` - both, because a linked
         worktree has two and only the common one is shared, and
         `--path-format=absolute` on both because plain `git rev-parse
-        --git-common-dir` returns a path relative to the current
-        directory: it prints `.git` from a main worktree and an absolute
-        path from a linked one (confirmed on git 2.55). Compared against a
-        realpath'd `tickets_dir`, the bare `.git` never matches, so this
-        check would be silently inert from a main worktree - the ordinary
-        case - exactly where it is meant to fire. Realpath both git
-        directories before comparing, and compare by components as in (b).
+        --git-common-dir` returns a path relative to the *current
+        directory* and so varies with where the command runs: confirmed
+        on git 2.55, it prints `.git` from a main worktree's root,
+        `../../.git` from a subdirectory two levels down, and an absolute
+        path from a linked worktree. Compared against a realpath'd
+        `tickets_dir`, none of the relative forms ever match, so the check
+        would be silently inert from a main worktree - the ordinary case -
+        exactly where it is meant to fire. The two flags also diverge:
+        from that same subdirectory `--git-dir` returns an absolute path
+        while `--git-common-dir` returns `../../.git` (confirmed), so
+        checking one flag's behavior and generalizing gets the other
+        wrong. `--path-format=absolute` returns the same absolute path for
+        both from every location tested. Realpath both git directories
+        before comparing, and compare by components as in (b).
      d. Assert the constructed **basename** contains no path separator
         (`/` or `\`) and is neither `.` nor `..`, so a sanitizer bug
         cannot reintroduce a directory component after containment was

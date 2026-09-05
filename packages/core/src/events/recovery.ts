@@ -1215,6 +1215,20 @@ const FIXABLE_REASONS: ReadonlySet<DiagnosticFailureReason> = new Set(["invalid-
  * `lineSha256` — both computed from the *untruncated* line — so an operator
  * can always tell a record is a prefix and by how much, even though the
  * full bytes are not repeated here.
+ *
+ * **`possiblyLossy` and `rawTruncated` name two different, independent loss
+ * mechanisms — check both, not just one.** `possiblyLossy` is computed from
+ * the *original*, untruncated line (adapter-induced loss only: U+FFFD from
+ * the git transport's own lossy UTF-8 decoding, present before this module
+ * ever sees the content — see `hasReplacementCharacter`'s doc comment).
+ * `truncateRawForQuarantine`'s own byte cut can *separately* introduce a
+ * trailing U+FFFD at the truncation boundary when it lands mid-multibyte-
+ * sequence — a record can therefore have `rawTruncated: true` and
+ * `possiblyLossy: false` while still containing a truncation-boundary
+ * U+FFFD that `possiblyLossy` was never asked about. This is consistent
+ * with, not worse than, `possiblyLossy`'s already-disclosed imprecision;
+ * `rawTruncated` alone is the correct signal for "this record's `raw` may
+ * end mid-character," independent of `possiblyLossy`.
  */
 export interface QuarantineRecord {
   /** ISO-8601 UTC instant of the `recover()` call that removed this line — this module's own clock, per the same "never trust a peer-supplied clock" discipline as `ts`/`lease_until` (`schema.ts`). */
@@ -1541,13 +1555,20 @@ export async function recoverCore(
   options: RecoveryOptions,
   hooks: RecoveryHooks,
 ): Promise<RecoveryResult> {
+  // Fix round 2, Low: `recover()` (the public surface) already normalizes
+  // an explicit `null` before calling here, but this is still exported
+  // (module-internal, test-only — see `RecoveryHooks`'s doc comment) and
+  // TypeScript's `RecoveryOptions` param type is not itself enforced at
+  // runtime — one line closes the same "explicit null bypasses a default
+  // parameter" gap NEW-5 fixed at the public surface, for this surface too.
+  const opts = options ?? {};
   const validatedRef = await validateCoordinationRef(ref);
-  const now = options.now ?? Date.now();
+  const now = opts.now ?? Date.now();
   validateNowIsNumber(now);
   validateNowForDateFormatting(now);
-  const trailingMonths = options.trailingMonths ?? DEFAULT_TRAILING_MONTHS;
+  const trailingMonths = opts.trailingMonths ?? DEFAULT_TRAILING_MONTHS;
   validateTrailingMonths(trailingMonths);
-  validateCasRetryOption(options.casRetry);
+  validateCasRetryOption(opts.casRetry);
   const quarantinedAt = new Date(now).toISOString();
 
   return withCasRetry<RecoveryResult>(async (attemptNumber) => {
@@ -1733,7 +1754,7 @@ export async function recoverCore(
     if (totalQuarantineBytes > absoluteQuarantineCeiling) {
       throw new CanKanError(
         EventErrorCodes.EVENT_RECOVERY_QUARANTINE_TOO_LARGE,
-        `this recovery call's quarantine audit content (${totalQuarantineBytes} bytes) exceeds its own resource bound (${absoluteQuarantineCeiling} bytes); refusing to write it into the coordination ref. This should not happen given this module's own diagnosis-time budgeting — if it does, it indicates a mismatch between this module's size-estimation constants and reality, not a permanently unrecoverable ref (each call's quarantine content is its own new file, never combined with an earlier call's — narrowing trailingMonths, which reduces how many months a single run touches, may avoid the condition in the meantime)`,
+        `this recovery call's quarantine audit content (${totalQuarantineBytes} bytes) exceeds its own resource bound (${absoluteQuarantineCeiling} bytes); refusing to write it into the coordination ref. This should not happen given this module's own diagnosis-time budgeting — if it does, it indicates a mismatch between this module's own size-estimation constants and reality (not a permanently unrecoverable ref: each call's quarantine content is its own new file, never combined with an earlier call's). Report this as a bug rather than retrying with different options — no documented option is known to avoid it`,
         { details: { ref: validatedRef, totalBytes: totalQuarantineBytes, maxBytes: absoluteQuarantineCeiling } },
       );
     }
@@ -1776,5 +1797,5 @@ export async function recoverCore(
     // again, which re-reads and re-diagnoses from the new tip, exactly like
     // `append`'s own retry loop.
     return { done: false };
-  }, withValidatedBackoff(options.casRetry));
+  }, withValidatedBackoff(opts.casRetry));
 }

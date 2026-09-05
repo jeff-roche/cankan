@@ -462,6 +462,26 @@ const releaseEventSchema = z.object({ ...envelopeShape, event: z.literal("releas
 
 const expireEventSchema = z.object({ ...envelopeShape, event: z.literal("expire") }).strict();
 
+// ============================================================================
+// Length bounds on free-text fields — fix round 1, finding M3
+// ============================================================================
+//
+// Confirmed before this fix: `comment.text` at 64MB parsed in 32ms and was
+// accepted; `hook.output`, `close.reason`, `move.from`/`to` accepted the
+// same. `.max()` here bounds **retention into board state** — it does not
+// prevent the allocation, since `JSON.parse` has already materialized the
+// full string before zod ever sees it. The actual DoS guard is a byte cap
+// on the raw line *before* `parseEvent` is called, which is dispatch 2's
+// obligation (`events/log.ts`'s `read()`), not rebuilt here. These bounds
+// are retention/board-state hygiene: generous enough for any legitimate
+// value, small enough that the append-only log can't be turned into
+// unbounded storage through a single field.
+const MAX_COLUMN_NAME_CHARS = 200; // move's from/to — a status/column name, same order as a ticket id
+const MAX_CLOSE_REASON_CHARS = 1_000; // a one-line explanation, not a document — CONCEPT.md's `--reason "…"` is a CLI flag value
+const MAX_HOOK_TITLE_CHARS = 500; // a ticket title, conventionally short
+const MAX_HOOK_OUTPUT_CHARS = 100_000; // generous for captured hook stdout/stderr while still bounding retention into the append-only log
+const MAX_COMMENT_TEXT_CHARS = 10_000; // generous for a human/agent-authored comment; anything longer belongs in the ticket body, not a log-level comment event
+
 /**
  * `move`'s `from`/`to` are column/status names (CONCEPT.md's worked
  * example: `"from":"In Progress","to":"In Review"`) — plain, uncanonicalized
@@ -471,7 +491,12 @@ const expireEventSchema = z.object({ ...envelopeShape, event: z.literal("expire"
  * shape check or vice versa.
  */
 const moveEventSchema = z
-  .object({ ...envelopeShape, event: z.literal("move"), from: z.string().min(1), to: z.string().min(1) })
+  .object({
+    ...envelopeShape,
+    event: z.literal("move"),
+    from: z.string().min(1).max(MAX_COLUMN_NAME_CHARS),
+    to: z.string().min(1).max(MAX_COLUMN_NAME_CHARS),
+  })
   .strict();
 
 /**
@@ -480,7 +505,7 @@ const moveEventSchema = z
  * optional.
  */
 const closeEventSchema = z
-  .object({ ...envelopeShape, event: z.literal("close"), reason: z.string().optional() })
+  .object({ ...envelopeShape, event: z.literal("close"), reason: z.string().max(MAX_CLOSE_REASON_CHARS).optional() })
   .strict();
 
 /**
@@ -545,16 +570,16 @@ const hookEventSchema = z
   .object({
     ...envelopeShape,
     event: z.literal("hook"),
-    from: z.string().optional(),
-    to: z.string().optional(),
-    title: z.string().min(1),
-    output: z.string(),
+    from: z.string().max(MAX_COLUMN_NAME_CHARS).optional(),
+    to: z.string().max(MAX_COLUMN_NAME_CHARS).optional(),
+    title: z.string().min(1).max(MAX_HOOK_TITLE_CHARS),
+    output: z.string().max(MAX_HOOK_OUTPUT_CHARS),
   })
   .strict();
 
 /** `text` sourced from CONCEPT.md's CLI reference: `cankan comment <id> <text>` (~line 532). */
 const commentEventSchema = z
-  .object({ ...envelopeShape, event: z.literal("comment"), text: z.string().min(1) })
+  .object({ ...envelopeShape, event: z.literal("comment"), text: z.string().min(1).max(MAX_COMMENT_TEXT_CHARS) })
   .strict();
 
 /**

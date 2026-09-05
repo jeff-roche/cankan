@@ -568,6 +568,42 @@ describe("fix round 1 H1 — rejection messages do not republish untrusted bytes
 });
 
 // ============================================================================
+// Fix round 1, finding M3 — length bounds on free-text fields.
+// ============================================================================
+
+describe("fix round 1 M3 — free-text fields are bounded", () => {
+  test("a 64MB comment.text is rejected — previously accepted in 32ms", () => {
+    const huge = "a".repeat(64 * 1024 * 1024);
+    const result = parse(envelope({ event: "comment", text: huge }));
+    expect(result.ok).toBe(false);
+  });
+
+  test("a comment.text at the 10,000-character bound is accepted, one over is rejected", () => {
+    expect(parse(envelope({ event: "comment", text: "a".repeat(10_000) })).ok).toBe(true);
+    expect(parse(envelope({ event: "comment", text: "a".repeat(10_001) })).ok).toBe(false);
+  });
+
+  test("a 32MB close.reason is rejected", () => {
+    const huge = "a".repeat(32 * 1024 * 1024);
+    expect(parse(envelope({ event: "close", reason: huge })).ok).toBe(false);
+  });
+
+  test("a 32MB hook.output is rejected", () => {
+    const huge = "a".repeat(32 * 1024 * 1024);
+    expect(parse(envelope({ event: "hook", title: "x", output: huge })).ok).toBe(false);
+  });
+
+  test("hook.output at the 100,000-character bound is accepted, one over is rejected", () => {
+    expect(parse(envelope({ event: "hook", title: "x", output: "a".repeat(100_000) })).ok).toBe(true);
+    expect(parse(envelope({ event: "hook", title: "x", output: "a".repeat(100_001) })).ok).toBe(false);
+  });
+
+  test("an oversized move column name is rejected", () => {
+    expect(parse(envelope({ event: "move", from: "a".repeat(201), to: "In Review" })).ok).toBe(false);
+  });
+});
+
+// ============================================================================
 // Obligation 9 — unknown event kinds are rejected (fail-closed)
 // ============================================================================
 

@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { CanKanError, ErrorCodes, isCanKanError } from "../src/errors";
+import {
+  CanKanError,
+  ErrorCodes,
+  isCanKanError,
+  type SerializedCanKanError,
+} from "../src/errors";
 import type { Equal, Expect, IsAssignable } from "./typeLevel";
 
 type SeededCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -29,6 +34,12 @@ export type ErrorTypeAssertions = [
       | "POLICY_VIOLATION"
       | "BACKER_UNAVAILABLE"
     >
+  >,
+  // `toJSON` returns exactly the four documented fields — `cause` and `stack`
+  // are excluded by construction, not by convention.
+  Expect<Equal<ReturnType<CanKanError["toJSON"]>, SerializedCanKanError>>,
+  Expect<
+    Equal<keyof SerializedCanKanError, "name" | "code" | "message" | "details">
   >,
 ];
 
@@ -105,6 +116,90 @@ describe("CanKanError", () => {
 
     expect(error.details).toBeUndefined();
   });
+
+  test("copies and freezes details, so mutating the caller's object cannot reach a thrown error", () => {
+    const details: Record<string, unknown> = { key: "wip" };
+    const error = new CanKanError(
+      ErrorCodes.POLICY_VIOLATION,
+      "wip is pinned",
+      { details },
+    );
+
+    details.key = "mutated";
+    details.token = "ghp_secret";
+
+    expect(error.details).toEqual({ key: "wip" });
+    expect(Object.isFrozen(error.details)).toBe(true);
+  });
+
+  test("takes its name from the constructor, so a subclass reports its own", () => {
+    class ClaimRejectedError extends CanKanError {}
+
+    expect(new CanKanError(ErrorCodes.USAGE, "bad flag").name).toBe(
+      "CanKanError",
+    );
+    expect(new ClaimRejectedError(ErrorCodes.CLAIM_REJECTED, "held").name).toBe(
+      "ClaimRejectedError",
+    );
+  });
+});
+
+describe("CanKanError.toJSON", () => {
+  test("serializes exactly name, code, message and details", () => {
+    const error = new CanKanError(
+      ErrorCodes.POLICY_VIOLATION,
+      "wip is pinned",
+      {
+        details: { pinnedBy: "/srv/api/.cankan/config.yml" },
+      },
+    );
+
+    expect(error.toJSON()).toEqual({
+      name: "CanKanError",
+      code: "POLICY_VIOLATION",
+      message: "wip is pinned",
+      details: { pinnedBy: "/srv/api/.cankan/config.yml" },
+    });
+  });
+
+  test("omits details entirely when there are none", () => {
+    const error = new CanKanError(ErrorCodes.USAGE, "unknown flag --wat");
+
+    expect(error.toJSON()).toEqual({
+      name: "CanKanError",
+      code: "USAGE",
+      message: "unknown flag --wat",
+    });
+    expect("details" in error.toJSON()).toBe(false);
+  });
+
+  test("keeps message in JSON.stringify and keeps cause and stack out", () => {
+    // Without toJSON, JSON.stringify drops `message` (non-enumerable on
+    // Error) while still publishing `details` — the exact shape M3.10's
+    // `--json` renderer would otherwise inherit.
+    const error = new CanKanError(
+      ErrorCodes.BACKER_UNAVAILABLE,
+      "github rejected the token",
+      {
+        cause: new Error("401 Unauthorized: ghp_secret is expired"),
+        details: { host: "api.github.com" },
+      },
+    );
+
+    const serialized = JSON.parse(JSON.stringify(error)) as Record<
+      string,
+      unknown
+    >;
+
+    expect(serialized).toEqual({
+      name: "CanKanError",
+      code: "BACKER_UNAVAILABLE",
+      message: "github rejected the token",
+      details: { host: "api.github.com" },
+    });
+    expect(JSON.stringify(error)).not.toContain("ghp_secret");
+    expect(JSON.stringify(error)).not.toContain("stack");
+  });
 });
 
 describe("isCanKanError", () => {
@@ -130,6 +225,16 @@ describe("isCanKanError", () => {
     expect(isCanKanError(undefined)).toBe(false);
     expect(isCanKanError({ code: "USAGE", message: "lookalike" })).toBe(false);
     expect(isCanKanError("USAGE")).toBe(false);
+  });
+
+  test("rejects a prototype-only instance that never ran the constructor", () => {
+    // `instanceof` alone accepts this, leaving `code` undefined — a caller
+    // that narrowed with the guard would then index an exit-code map with
+    // `undefined`.
+    const uninitialized: unknown = Object.create(CanKanError.prototype);
+
+    expect(uninitialized).toBeInstanceOf(CanKanError);
+    expect(isCanKanError(uninitialized)).toBe(false);
   });
 
   test("accepts a subclass of CanKanError", () => {

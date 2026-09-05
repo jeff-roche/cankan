@@ -202,4 +202,38 @@ export const EventErrorCodes = {
    * the M2.6 addition (an object-type query) that would close it.
    */
   EVENT_REF_UNUSABLE: "EVENT_REF_UNUSABLE",
+  /**
+   * `observations.ts`'s `observe`/`firstSeen`/`discard` were given an
+   * `eventId` that fails `events/schema.ts`'s `isValidEventId` ULID-grammar
+   * check. Raised before the id is ever hashed into a path component
+   * (obligation 2 of task-3-brief.md) — the ULID check and the hash are
+   * independent guards, and this is the one that runs first.
+   */
+  EVENT_OBSERVATION_INVALID_EVENT_ID: "EVENT_OBSERVATION_INVALID_EVENT_ID",
+  /**
+   * `observations.ts` was given a `boardKey` that is not a non-empty
+   * string. `boardKey` is never peer-supplied (it comes from this
+   * process's own `git rev-parse` via `boardKeyFor`, not from anything
+   * read off a coordination ref), so this guards a programming mistake,
+   * not a security boundary — hashing the key is what closes the security
+   * half, unconditionally, regardless of this check.
+   */
+  EVENT_OBSERVATION_INVALID_BOARD_KEY: "EVENT_OBSERVATION_INVALID_BOARD_KEY",
+  /**
+   * The lease-observation store's `$XDG_STATE_HOME/cankan/observations/`
+   * directory (or a file within it) could not be created, written, read,
+   * or removed for a reason other than plain absence — Ruling R7
+   * (orchestrator, binding): an absent store or a missing record degrades
+   * gracefully (create it and proceed / report "not yet observed"), but an
+   * **unwritable or unreadable** store is a typed hard error, never a
+   * warning or a silent skip. The ADR's stated reason (0001:1120-1123):
+   * proceeding without recording would silently re-observe the same event
+   * on the next invocation, so no lease would ever expire — a failure
+   * invisible from the outside. `details.operation` names which operation
+   * failed (`"create state directory"`, `"write observation record"`,
+   * etc.) — never a filesystem path, per `../errors.ts`'s `details`
+   * discipline: the path is built from `$XDG_STATE_HOME`/`$HOME`, values
+   * this module does not control and must not publish.
+   */
+  EVENT_OBSERVATION_STORE_UNAVAILABLE: "EVENT_OBSERVATION_STORE_UNAVAILABLE",
 } as const;

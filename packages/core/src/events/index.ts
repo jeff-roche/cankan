@@ -1,7 +1,7 @@
 /**
- * Public surface of the event log (M2.7 dispatches 1-2: schema, append/read,
- * ref init). The lease-observation store and the poisoned-ref recovery path
- * (dispatches 3-4) append their own exports here later.
+ * Public surface of the event log (M2.7 dispatches 1-3: schema, append/read,
+ * ref init, the lease-observation store). The poisoned-ref recovery path
+ * (dispatch 4) appends its own exports here later.
  *
  * **Deliberately not re-exported here**: `appendCore` (`log.ts`) and
  * `initRefCore` (`ref.ts`) — the test-only seams behind `append`/`initRef`.
@@ -51,3 +51,10 @@ export type { AppendedEvent, AppendOptions, EventCandidate, EventRecord, ReadOpt
 
 export { initRef } from "./ref";
 export type { InitRefOptions } from "./ref";
+
+// The lease-observation store (M2.7 dispatch 3, ADR 0001 failure mode 7).
+// **Standalone API, not wired into `read()` — Ruling R6.** M2.10 calls
+// `observe()`/`discard()` itself, on its own read/fold paths; see
+// `observations.ts`'s doc comment for exactly when.
+export { boardKeyFor, discard, firstSeen, observe } from "./observations";
+export type { ObserveOptions } from "./observations";

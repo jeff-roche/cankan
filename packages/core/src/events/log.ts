@@ -453,8 +453,15 @@ function countJsonlLines(content: string): number {
  * headroom for the rest of the envelope and every other field, while still
  * bounding a single push far below "every peer that fetches the ref pays a
  * 500MB allocation on every read" (the attack obligation A names).
+ *
+ * **Exported (Ruling R42, dispatch 4 fix round 1): `recovery.ts`'s
+ * `diagnose()` must report line-too-large in `read()`'s own vocabulary, at
+ * `read()`'s own exact bound, rather than a separately-copied constant that
+ * could silently drift looser than this one and reintroduce the gap R42
+ * closed. This is the only behavior change this export authorizes —
+ * `read()`/`append()` are otherwise untouched.**
  */
-const MAX_LINE_BYTES = 1_048_576;
+export const MAX_LINE_BYTES = 1_048_576;
 
 /**
  * A month blob's own overall size bound. **Honesty about what this bound
@@ -490,8 +497,13 @@ const MAX_LINE_BYTES = 1_048_576;
  * the escape hatch a caller with a legitimate reason to write past this
  * bound (dispatch 4's poisoned-ref recovery/quarantine write) can use —
  * see that option's own doc comment.
+ *
+ * **Exported (Ruling R42, dispatch 4 fix round 1) for the same reason as
+ * `MAX_LINE_BYTES` above** — `recovery.ts` reports an unresolved,
+ * un-repairable-by-line-removal `"blob-too-large"` finding at this exact
+ * bound, not a separately-copied one.
  */
-const MAX_MONTH_BLOB_BYTES = 64 * 1024 * 1024;
+export const MAX_MONTH_BLOB_BYTES = 64 * 1024 * 1024;
 
 /**
  * `read`'s aggregate cap across its whole `trailingMonths` window (fix
@@ -505,8 +517,11 @@ const MAX_MONTH_BLOB_BYTES = 64 * 1024 * 1024;
  * comment describes, spread across up to `MAX_TRAILING_MONTHS` files
  * instead of one) while giving `read()` a resource ceiling independent of
  * how large a window a caller asks for.
+ *
+ * **Exported (Ruling R42, dispatch 4 fix round 1) for the same reason as
+ * `MAX_LINE_BYTES`/`MAX_MONTH_BLOB_BYTES` above.**
  */
-const MAX_AGGREGATE_READ_BYTES = 256 * 1024 * 1024;
+export const MAX_AGGREGATE_READ_BYTES = 256 * 1024 * 1024;
 
 /** Flattens `EventValidationIssue[]` into plain strings (fix round 1, S5) — see the call sites' comments for why. */
 function renderIssues(issues: readonly EventValidationIssue[]): string[] {

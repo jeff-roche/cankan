@@ -5,10 +5,11 @@ import type { Equal, Expect, IsAssignable } from "./typeLevel";
 
 /*
  * The import above is relative rather than `@jeff-roche/cankan-core` because
- * this monorepo does not link its workspace packages into `node_modules`
- * (see the M2.1 report). `../src/index` is the exact module `package.json`'s
- * `main` and `types` point at, so this exercises the same export map a
- * consumer of the package name resolves to.
+ * `packages/core` has no symlink to itself — a package is not its own
+ * dependency. Consumers such as `packages/cli` resolve the package specifier
+ * normally. `../src/index` is the exact module `package.json`'s `main` and
+ * `types` point at, so this exercises the same export map a consumer of the
+ * package name resolves to.
  */
 
 /**
@@ -34,7 +35,14 @@ const MODULE_NAMESPACES = {
 
 type ModuleFolder = keyof typeof MODULE_NAMESPACES;
 
-/** The flat (non-namespaced) value exports, from `errors.ts`. */
+/**
+ * The flat (non-namespaced) value exports, from `errors.ts`.
+ *
+ * MAINTENANCE: a later lane appending a *value* export to `errors.ts` or
+ * `types.ts` must add its name in two places — here, and the `expected` list
+ * in "exposes nothing beyond the thirteen namespaces and the flat errors
+ * surface" below. Type-only exports need neither. Both failures are loud.
+ */
 type FlatValueExport = "CanKanError" | "ErrorCodes" | "isCanKanError";
 
 /** Every namespace on the public entry, i.e. its keys minus the flat ones. */
@@ -138,14 +146,15 @@ describe("BoardRef", () => {
       kind: "repo",
       name: "api",
       root: "/srv/api",
-      ticketsDir: "/srv/api/.cankan/tickets",
+      // CONCEPT.md's default `tickets_dir` — the Backlog.md-compatible layout.
+      ticketsDir: "/srv/api/backlog/tasks",
       coordinationRef: "refs/cankan/coordination",
     };
     const personalBoard: BoardRef = {
       kind: "personal",
       name: "personal",
       root: "/home/u/.local/share/cankan/personal",
-      ticketsDir: "/home/u/.local/share/cankan/personal/.cankan/tickets",
+      ticketsDir: "/home/u/.local/share/cankan/personal/backlog/tasks",
       coordinationRef: "refs/cankan/coordination",
     };
 

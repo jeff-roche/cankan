@@ -55,7 +55,7 @@ describe("ErrorCodes", () => {
     ]);
   });
 
-  test("records no exit-code numbers — M3.10 owns that mapping", () => {
+  test("names every code after itself, with no digit anywhere in ErrorCodes", () => {
     for (const [key, value] of Object.entries(ErrorCodes)) {
       expect<string>(value).toBe(key);
     }

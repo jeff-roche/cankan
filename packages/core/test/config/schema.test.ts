@@ -457,6 +457,15 @@ describe("agents.instructions_file is a constrained relative path (found in revi
     "../.git/hooks/post-checkout",
     "docs/../../escape.md",
     "",
+    // Windows write-target escapes (found in a later review round; PLAN.md
+    // 442 ships a win-x64 build target) — rejected unconditionally, not by
+    // `process.platform`, since a checked-in .cankan/config.yml must
+    // validate the same way on every contributor's machine.
+    "C:\\Users\\victim\\.ssh\\authorized_keys",
+    "..\\..\\secret",
+    "\\\\server\\share\\file",
+    "C:relative.md",
+    "docs\\..\\..\\etc\\passwd",
     "AGENTS.md .sh",
     "AGENTS.md",
   ])("rejects %j", (value) => {

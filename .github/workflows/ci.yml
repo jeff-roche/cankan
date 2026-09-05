@@ -8,6 +8,14 @@ on:
 jobs:
   test:
     strategy:
+      # Let each OS leg finish on its own. With the default (fail-fast: true),
+      # one leg failing cancels the other mid-run -- and `gh pr checks` renders
+      # a cancelled job as `fail`, so a single flake on one platform makes a PR
+      # look red on both. That cost a real investigation on #92, where the
+      # macOS leg had already run 621 tests clean before ubuntu's flake
+      # (#93) cancelled it. Platform-specific defects are the ones this matrix
+      # exists to catch, so losing the other leg's result is exactly backwards.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}

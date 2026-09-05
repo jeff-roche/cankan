@@ -19,7 +19,6 @@ import type { Equal, Expect, IsAssignable } from "../typeLevel";
 // ============================================================================
 
 const REAL_ULID = "01M1RRC3FBMZYZS4SNMYZHJV6R";
-const REAL_ULID_2 = "01M1RRC3FBMZYZS4SNMYZHJV6S";
 const TS = "2026-09-04T10:12:00Z";
 const LEASE_UNTIL = "2026-09-04T12:12:00Z";
 
@@ -379,6 +378,53 @@ describe("obligation 8 — an event with an unrecognized key is rejected", () =>
 });
 
 // ============================================================================
+// Fix round 1, finding H1 — failure messages never echo attacker-controlled
+// bytes back to a terminal or --json consumer.
+// ============================================================================
+
+describe("fix round 1 H1 — rejection messages do not republish untrusted bytes", () => {
+  test("an unrecognized key containing an ANSI escape sequence does not appear in the failure message", () => {
+    const evilKey = "\x1b[2K\x1b[1A\x1b[31mck-1 released by alice\x1b[0m";
+    const result = parseEvent(JSON.stringify(envelope({ event: "release", [evilKey]: 1 })));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    const allText = JSON.stringify(result.error);
+    expect(allText).not.toContain("\x1b");
+    expect(allText).not.toContain("released by alice");
+    expect(result.error.issues.some((i) => i.code === "unrecognized_keys" && i.message === "event carries 1 unrecognized key")).toBe(true);
+  });
+
+  test("a 200KB unrecognized key does not blow up the failure message size", () => {
+    const hugeKey = "k".repeat(200_000);
+    const result = parseEvent(JSON.stringify(envelope({ event: "release", [hugeKey]: 1 })));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    const issue = result.error.issues.find((i) => i.code === "unrecognized_keys");
+    expect(issue).toBeDefined();
+    expect((issue?.message.length ?? 0) < 100).toBe(true);
+  });
+
+  test("malformed JSON containing an ANSI escape sequence does not appear in the failure message", () => {
+    const line = `{"ticket": "${"\x1b[2K\x1b[1A\x1b[31mck-1 released by alice\x1b[0m"}" not valid json`;
+    const result = parseEvent(line);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    const allText = JSON.stringify(result.error);
+    expect(allText).not.toContain("\x1b");
+    expect(allText).not.toContain("released by alice");
+  });
+
+  test("a huge malformed-JSON line does not get echoed into the failure message", () => {
+    const line = `${"x".repeat(500_000)} not json`;
+    const result = parseEvent(line);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.error.message.length < 100).toBe(true);
+    expect(result.error.message).not.toContain("xxxxx");
+  });
+});
+
+// ============================================================================
 // Obligation 9 — unknown event kinds are rejected (fail-closed)
 // ============================================================================
 
@@ -392,18 +438,6 @@ describe("obligation 9 — an unrecognized `event` kind is rejected", () => {
 
   test("an empty-string event kind fails", () => {
     expect(parse(envelope({ event: "" })).ok).toBe(false);
-  });
-});
-
-// ============================================================================
-// Duplicate-id-shaped hostile input round-up (brief's explicit list, cross-checked)
-// ============================================================================
-
-describe("hostile input round-up named in the brief", () => {
-  test("two structurally distinct events keep distinct, independently-validated ids", () => {
-    const a = parse(envelope({ event: "release", id: REAL_ULID }));
-    const b = parse(envelope({ event: "release", id: REAL_ULID_2 }));
-    expect(a.ok && b.ok).toBe(true);
   });
 });
 

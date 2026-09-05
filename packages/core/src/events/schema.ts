@@ -483,12 +483,49 @@ export type ParseEventResult =
   | { readonly ok: true; readonly event: Event }
   | { readonly ok: false; readonly error: EventValidationFailure };
 
+/**
+ * Projects one zod issue into this module's own, safe-to-publish shape.
+ *
+ * **Fix round 1, finding H1 (security review).** The naive version of this
+ * function (`issue.message` copied verbatim) republishes attacker-controlled
+ * bytes: zod's `unrecognized_keys` issue embeds the raw offending key name
+ * in its message, confirmed directly —
+ *
+ * ```
+ * const evilKey = "\x1b[2K\x1b[1A\x1b[31mck-1 released by alice\x1b[0m";
+ * A.safeParse({ x: "hi", [evilKey]: 1 }).error.issues[0].message
+ * // → 'Unrecognized key: "␛[2K␛[1A␛[31mck-1 released by alice␛[0m"'
+ * ```
+ *
+ * That string reaches a terminal (dispatch 2's `read()` must surface *why* a
+ * line failed) and `--json` output (dispatch 4's quarantine audit record) —
+ * exactly the "published by default" surfaces `../errors.ts:44-52` already
+ * warns about, and exactly what `ticket/filename.ts`'s `assertSafeId`
+ * already declines to do ("Report which rule failed, never the id itself").
+ * A 200KB unrecognized key name also turns a few-line rejection into a
+ * 200,000-character message — a size amplifier, not just a rendering one.
+ *
+ * Every other zod issue code used by this schema (`invalid_type`,
+ * `invalid_union`, `too_small`, `too_big`, and this module's own
+ * `.refine`/`.superRefine` messages) is author-written text, not a copy of
+ * attacker input, so those pass through unchanged.
+ */
 function projectIssues(issues: z.ZodError["issues"]): EventValidationIssue[] {
-  return issues.map((issue) => ({
-    path: issue.path.map(String).join("."),
-    message: issue.message,
-    code: issue.code,
-  }));
+  return issues.map((issue) => {
+    if (issue.code === "unrecognized_keys") {
+      const count = issue.keys.length;
+      return {
+        path: issue.path.map(String).join("."),
+        message: `event carries ${count} unrecognized key${count === 1 ? "" : "s"}`,
+        code: issue.code,
+      };
+    }
+    return {
+      path: issue.path.map(String).join("."),
+      message: issue.message,
+      code: issue.code,
+    };
+  });
 }
 
 /**
@@ -513,14 +550,26 @@ export function parseEvent(line: string, options: ParseEventOptions = {}): Parse
   let raw: unknown;
   try {
     raw = JSON.parse(line);
-  } catch (cause) {
-    const message = cause instanceof Error ? cause.message : String(cause);
+  } catch {
+    // Fix round 1, finding H1: do NOT use the caught SyntaxError's own
+    // `.message` — confirmed directly that JSC (Bun's engine) echoes the
+    // offending token into it, truncated around 245 characters:
+    // `JSON.parse("x".repeat(500) + " not json")` throws a message
+    // containing ~200 raw "x" characters, and a hostile line can put
+    // arbitrary bytes (including ANSI escapes) in that position instead.
+    // This message reaches a terminal (dispatch 2's `read()`) and `--json`
+    // output (dispatch 4's quarantine record) — the same "never publish an
+    // untrusted value" rule `../errors.ts:44-52` and
+    // `ticket/filename.ts`'s `assertSafeId` already follow. A fixed message
+    // plus the line's own (already-known, not attacker-chosen) length is
+    // reported instead; there is no portable byte-offset API across
+    // `JSON.parse` implementations to report more precisely.
     return {
       ok: false,
       error: {
         reason: "invalid-json",
-        message: `line is not valid JSON: ${message}`,
-        issues: [{ path: "", message, code: "invalid_json" }],
+        message: `line is not valid JSON (${line.length} characters)`,
+        issues: [{ path: "", message: "line is not valid JSON", code: "invalid_json" }],
       },
     };
   }
@@ -539,6 +588,14 @@ export function parseEvent(line: string, options: ParseEventOptions = {}): Parse
 
   const event = parsed.data;
   if (!isTsWithinBounds(event.ts, now)) {
+    // Interpolating `event.ts` here is safe, unlike H1's two fixed cases
+    // above: by this point `event.ts` has already passed `tsSchema` — the
+    // `ISO_8601_UTC_PATTERN` regex constrains every character to
+    // `[0-9:.TZ-]`, and `isRealCalendarInstant` has confirmed it round-trips
+    // to a real instant. There is no byte in that alphabet capable of an
+    // ANSI escape, a control character, or a size-amplification payload, so
+    // this is not a case of republishing an untrusted value the way the
+    // `unrecognized_keys` message or a raw `JSON.parse` error message would.
     return {
       ok: false,
       error: {

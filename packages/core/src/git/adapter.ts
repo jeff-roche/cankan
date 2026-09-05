@@ -7,15 +7,20 @@
  *
  * See `types.ts` for the public shapes and `refValidation.ts` for the
  * mandatory ref check every method below runs before touching git.
+ *
+ * Every invocation here goes through `transport.ts`'s `runGit` chokepoint,
+ * with one documented exception below (`hashObjectStdin`) — see that
+ * function's doc comment, and `refValidation.ts`'s for a second, unrelated
+ * exception in that file.
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import simpleGit from "simple-git";
 import { CanKanError } from "../errors";
 import { GitErrorCodes } from "./errors";
 import { validateCoordinationRef } from "./refValidation";
+import { messageOf, runGit } from "./transport";
 import type {
   CasOutcome,
   CommitTreeParams,
@@ -31,96 +36,40 @@ import type {
 const ZERO_SHA = "0".repeat(40);
 
 /**
- * Gap found during verification, reported per the task brief. R7 rules that
- * every invocation spreads the real `process.env` (never a bare object) so
- * `PATH` and everything else a git child process needs survives. `simple-git`
- * ships a default plugin that scans the env object handed to it for a fixed,
- * short list of variable names (`EDITOR`, `GIT_SSH_COMMAND`, `GIT_PAGER`,
- * and similar) and throws before running *any* command if one is present —
- * regardless of whether the command about to run would ever consult it.
- *
- * Confirmed directly for this task: this repository's own dev shell exports
- * `GIT_EDITOR=true` (evidently to suppress interactive editors), and with it
- * present, spreading `process.env` per R7 made every invocation in this
- * module fail on first run, in its own development environment.
- *
- * None of these variables affects any command this module runs — every
- * invocation here is a fixed plumbing command with array-form argv this
- * module built itself; there is no editor, pager, external diff tool, or
- * custom SSH/proxy command anywhere in this module's command set. Rather
- * than reconfigure `simple-git`'s plugin, the fix is narrower: strip exactly
- * this fixed set of key names (case-insensitively) from the copy of
- * `process.env` this module spreads, so the ambient variable never reaches
- * `simple-git` at all. Everything else `process.env` carries — `PATH`,
- * `HOME`, and anything else a git child process needs, per R7's own
- * rationale — passes through unchanged. The list below is exactly the set
- * `@simple-git/argv-parser`'s vulnerability check inspects (confirmed by
- * reading its installed source for this task, `dist/index.mjs`, since it
- * ships no changelog entry documented against a version range) — it is not
- * open-ended, so widen it here if a future `simple-git` upgrade adds a
- * variable to that list and the same false positive resurfaces.
- */
-const ENV_KEYS_SIMPLE_GIT_TREATS_AS_SENSITIVE = new Set([
-  "editor",
-  "git_askpass",
-  "git_config_global",
-  "git_config_system",
-  "git_config_count",
-  "git_config",
-  "git_editor",
-  "git_exec_path",
-  "git_external_diff",
-  "git_pager",
-  "git_proxy_command",
-  "git_template_dir",
-  "git_sequence_editor",
-  "git_ssh",
-  "git_ssh_command",
-  "pager",
-  "prefix",
-  "ssh_askpass",
-]);
-
-/**
- * `process.env`, minus the fixed set of names above. The base every
- * invocation's env is built from — see the constant's doc comment.
- */
-function baseEnv(): Record<string, string | undefined> {
-  const filtered: Record<string, string | undefined> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (!ENV_KEYS_SIMPLE_GIT_TREATS_AS_SENSITIVE.has(key.toLowerCase())) {
-      filtered[key] = value;
-    }
-  }
-  return filtered;
-}
-
-/**
  * The CAS-rejection signature. ADR 0001:471-473 states one form: `cannot
  * lock ref '...': is at X but expected Y`. Direct verification for this task
- * (git 2.55.0, 15 repeated two-process races) found two further branches of
- * `update_ref`'s compare check that are the same kind of thing — the ref's
+ * (git 2.55.0, 15 repeated two-process races) found one further branch of
+ * `update_ref`'s compare check that is the same kind of thing — the ref's
  * actual state disagreeing with the caller's compare value — and not "some
- * other git failure":
- *
- * - `cannot lock ref '...': reference already exists` — the loser of a race
- *   to *create* a ref, i.e. both racers pass `oldSha: null` (compared
- *   against the 40-zero sha) against a ref that does not exist yet. This is
- *   not a corner case: it is exactly PLAN.md's "two processes calling
- *   updateRefCAS with the same expected old value" floor test, run against a
- *   board's very first claim.
- * - `cannot lock ref '...': unable to resolve reference '...'` — the caller
- *   expected the ref to exist at some sha (a non-null `oldSha`), but it does
- *   not exist at all.
+ * other git failure": `cannot lock ref '...': reference already exists`, the
+ * loser of a race to *create* a ref, i.e. both racers pass `oldSha: null`
+ * (compared against the 40-zero sha) against a ref that does not exist yet.
+ * This is not a corner case: it is exactly PLAN.md's "two processes calling
+ * updateRefCAS with the same expected old value" floor test, run against a
+ * board's very first claim.
  *
  * This is a gap in the ADR's stated signature, reported in the task report
- * rather than silently worked around: all three are treated as CAS
+ * rather than silently worked around: both forms are treated as CAS
  * rejections (a typed `outcome`, for the caller/retry-driver to react to),
  * and anything else matching `cannot lock ref` differently, or not matching
  * at all, is a hard failure.
+ *
+ * **Deliberately excluded: `cannot lock ref '...': unable to resolve
+ * reference '...'`.** This is the message when a non-null `oldSha` was
+ * given but the ref cannot be resolved — and probing that condition
+ * directly for this task found it is not specific to "the ref was deleted
+ * out from under a legitimate compare" (an operation this design doesn't
+ * perform anywhere): the *identical* message, sometimes with a `: reference
+ * broken` suffix and sometimes without, is also what a genuinely corrupted
+ * ref file or a D/F conflict on the ref's path produces. Matching this form
+ * as a retryable rejection would reintroduce exactly the failure the ADR
+ * condemns for `claimViaCAS` (0001:469-475: "a corrupted ref or a
+ * permissions failure would silently loop up to 50 times") — a retry driver
+ * fed this outcome would spend its whole attempt budget against a ref that
+ * will never resolve. It is left to fall through to the hard-failure branch.
  */
 const CAS_REJECTION_PATTERN =
-  /cannot lock ref '[^']*': (is at [0-9a-f]+ but expected [0-9a-f]+|reference already exists|unable to resolve reference '[^']*')/;
+  /cannot lock ref '[^']*': (is at [0-9a-f]+ but expected [0-9a-f]+|reference already exists)/;
 
 /**
  * Confirmed stderr for a push rejected as non-fast-forward (ADR 0001:647-649
@@ -140,54 +89,19 @@ const PUSH_REJECTED_PATTERN = /! \[rejected\][^\n]*\((fetch first|non-fast-forwa
 /** Confirmed stderr for a fetch of the working ref rejected once diverged (ADR 0001:655-662). */
 const FETCH_REJECTED_PATTERN = /! \[rejected\][^\n]*\(non-fast-forward\)/;
 
-function messageOf(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
-}
-
 /**
- * The single internal chokepoint every git invocation in this module goes
- * through, with one documented exception (`hashObjectStdin`, below).
+ * **R1's named direct-spawn exception.** `git hash-object -w --stdin` needs
+ * a stdin channel to hand it the blob's content; `simple-git` exposes none —
+ * confirmed for this task: `spawn.options` carries no `stdio` or `input`
+ * field. ADR 0001:411-413 explicitly exempts `hash-object` from the
+ * `--end-of-options` rule for the same reason from the other direction: its
+ * content arrives on stdin, and the command takes no ref, path, or commit
+ * argument at all, so there is no positional for the marker to protect.
  *
- * **R1 — why a chokepoint, not `simpleGit().raw()` at each call site.** A
- * lone function is what makes "every invocation gets `LC_ALL=C` and a fresh
- * instance" a structural guarantee rather than a convention every call site
- * has to remember.
- *
- * **R7 — locale and instance freshness.** `simple-git` surfaces no exit
- * code (`GitError`'s own-enumerable keys are exactly `["task"]" — confirmed
- * for this task), so every discrimination this module makes (CAS rejection,
- * non-fast-forward push/fetch rejection, "ref does not exist") is a stderr
- * *string* match, and git localizes those strings through gettext unless the
- * locale is pinned. `LC_ALL: "C"` is spread on top of the *real*
- * `process.env`, never a bare `{ LC_ALL: "C" }` object, because replacing
- * the environment outright would drop `PATH` and everything else a git
- * child process needs. A **fresh** `simpleGit` instance is constructed on
- * every call because `.env()` mutates the instance it's called on and
- * *replaces* rather than merges the environment on the next call through
- * that same instance — reusing one instance risks a `GIT_INDEX_FILE` set for
- * one `commitTreeToRef` build leaking into an unrelated sibling command,
- * which would be a correctness bug in exactly the class this module exists
- * to prevent.
- */
-async function runGit(
-  root: string,
-  argv: readonly string[],
-  extraEnv?: Readonly<Record<string, string>>,
-): Promise<string> {
-  const git = simpleGit({ baseDir: root });
-  git.env({ ...baseEnv(), LC_ALL: "C", ...extraEnv });
-  return git.raw([...argv]);
-}
-
-/**
- * **R1's one documented direct-spawn exception.** `git hash-object -w
- * --stdin` needs a stdin channel to hand it the blob's content;
- * `simple-git` exposes none — confirmed for this task: `spawn.options`
- * carries no `stdio` or `input` field. ADR 0001:411-413 explicitly exempts
- * `hash-object` from the `--end-of-options` rule for the same reason from
- * the other direction: its content arrives on stdin, and the command takes
- * no ref, path, or commit argument at all, so there is no positional for the
- * marker to protect.
+ * (`refValidation.ts`'s `check-ref-format` call is a second, independent
+ * direct spawn, for an unrelated reason — see that file's doc comment. R1
+ * names `hash-object` as "the one permitted exception"; the second was
+ * forced by a `simple-git` defect this task found empirically, not chosen.)
  */
 async function hashObjectStdin(root: string, content: string): Promise<ObjectSha> {
   const proc = Bun.spawn(["git", "hash-object", "-w", "--stdin"], {
@@ -620,9 +534,7 @@ export async function createGitAdapter(cwd: string, options: GitAdapterOptions =
 
   let root: string;
   try {
-    const bootstrap = simpleGit({ baseDir: cwd });
-    bootstrap.env({ ...baseEnv(), LC_ALL: "C" });
-    root = (await bootstrap.raw(["rev-parse", "--show-toplevel"])).trim();
+    root = (await runGit(cwd, ["rev-parse", "--show-toplevel"])).trim();
   } catch (cause) {
     throw new CanKanError(
       GitErrorCodes.GIT_BOOTSTRAP_FAILED,

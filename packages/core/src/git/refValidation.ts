@@ -37,14 +37,35 @@ function rejectRef(ref: string, reason: string): never {
  * it passes. Throws a typed `GIT_REF_INVALID` error otherwise. Every
  * ref-taking operation in this module calls this first, unconditionally —
  * a caller cannot opt out by claiming a value was validated elsewhere,
- * because a compile-time brand carries no runtime guarantee (see `Sha`'s
- * doc comment in `adapter.ts` for the same point applied to CAS values).
+ * because a compile-time brand carries no runtime guarantee (see
+ * `ObjectSha`'s doc comment in `types.ts` for the same point applied to CAS
+ * values).
  *
  * Exported standalone (rather than only as an adapter method) because
  * `git check-ref-format` needs no repository and no pinned root — confirmed:
  * it runs identically from any directory, including one with no `.git` at
  * all — so a config loader (M2.3) can reuse this exact check at load time
  * without needing a `GitAdapter` instance.
+ *
+ * **A second, necessary exception to R1's "one chokepoint" framing — not a
+ * style preference, a correctness requirement, confirmed directly for this
+ * task.** `check-ref-format` prints *nothing* to stderr when it rejects a
+ * ref; it only sets a non-zero exit code (confirmed: redirecting stdout and
+ * stderr separately on a rejected ref, both are empty, exit code 1).
+ * `simple-git`'s own `raw()` decides whether a task failed with `exitCode &&
+ * stdErr.length` (confirmed by reading its installed
+ * `error-detection.plugin` source for this task) — both must be truthy, so a
+ * non-zero exit with empty stderr is **silently treated as success**,
+ * `raw()` resolves instead of rejecting, and the specific abuse case the ADR
+ * spends the most space on (`refs/cankan/../heads/main`, which passes the
+ * regex above) would pass validation. This was caught by this task's own
+ * test suite, not by inspection: routing this call through the same
+ * `simple-git`-based chokepoint every other command in this module uses
+ * made the `refs/cankan/../heads/main` rejection test fail. `hash-object`'s
+ * exception exists because `simple-git` cannot reach a stdin channel;
+ * this one exists because `simple-git`'s error detection cannot see this
+ * command's failure at all. Exit code is checked directly, exactly as
+ * `hashObjectStdin` does in `adapter.ts`.
  */
 export async function validateCoordinationRef(ref: string): Promise<string> {
   if (ref.length === 0) {
@@ -56,21 +77,22 @@ export async function validateCoordinationRef(ref: string): Promise<string> {
 
   // The regex above already guarantees `ref` cannot begin with `-` (it must
   // begin with the literal `refs/cankan/`), so `check-ref-format` is run
-  // directly, without `--end-of-options`. Direct verification for this task
-  // found `check-ref-format` does not use `parse-options` the way most git
-  // plumbing does: even `-- <refname>` is rejected as a usage error, so
-  // `--end-of-options` is not merely unnecessary here, it is not accepted.
+  // without `--end-of-options`. Direct verification for this task found
+  // `check-ref-format` does not use `parse-options` the way most git
+  // plumbing does: even `-- <refname>` is rejected as a usage error (exit
+  // 129), so `--end-of-options` is not merely unnecessary here, it is not
+  // accepted.
   const proc = Bun.spawn(["git", "check-ref-format", ref], {
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, LC_ALL: "C" },
   });
-  const [stderr, exitCode] = await Promise.all([
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
+  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
   if (exitCode !== 0) {
-    rejectRef(ref, `git check-ref-format rejected it: ${stderr.trim()}`);
+    // `stderr` is expected to be empty here (see this function's doc
+    // comment) — included anyway in case a future git version starts
+    // reporting a reason, rather than assuming it stays silent forever.
+    rejectRef(ref, `git check-ref-format rejected it (exit ${exitCode}): ${stderr.trim()}`);
   }
 
   return ref;

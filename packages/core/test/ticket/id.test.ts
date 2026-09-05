@@ -37,7 +37,14 @@ describe("generateTicketId", () => {
     for (let i = 0; i < SAMPLE; i++) {
       seen.add(generateTicketId() as string);
     }
-    expect(seen.size).toBe(SAMPLE);
+    // Not exact uniqueness: the suffix space is 6 hex characters minus the
+    // all-digit ones (~15.8M values), so 2000 draws carries a real,
+    // non-negligible birthday-paradox chance of one incidental collision —
+    // asserting zero collisions here made this test intermittently flaky
+    // for a reason that has nothing to do with generator correctness.
+    // Near-uniqueness still catches a badly broken generator (e.g. a fixed
+    // or low-entropy seed) while tolerating the rare true coincidence.
+    expect(seen.size).toBeGreaterThanOrEqual(SAMPLE - 2);
   });
 });
 

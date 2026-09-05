@@ -10,7 +10,7 @@ import {
   type ResolvedActor,
   resolveActor,
 } from "../../src/actor/index";
-import type { ConfigResult } from "../../src/config/index";
+import type { ConfigResult, ResolvedEntry } from "../../src/config/index";
 import { loadConfig } from "../../src/config/index";
 import { isCanKanError } from "../../src/errors";
 import {
@@ -195,6 +195,23 @@ describe("parseActor — malformed inputs, probed against the real parser (brief
     ["claude code:alice", "tool segment"],
     ["claude-code:alice/wt auth", "context segment"],
     ["claude-code: alice", "name segment"], // leading space on `name` alone
+    // R-15 additions (fix round 2) -- characters that are visually blank
+    // or invisible but not `\p{Cc}`/`\p{Cf}`, each probed against the real
+    // parser before being asserted here (see the implementer report):
+    // Hangul/halfwidth-Hangul fillers, a variation selector, the combining
+    // grapheme joiner, Khmer inherent vowels, BRAILLE PATTERN BLANK
+    // (explicitly listed -- not itself Default_Ignorable), and a lone
+    // (unpaired) UTF-16 surrogate.
+    ["a️b", "name segment"], // VARIATION SELECTOR-16
+    ["aㅤb", "name segment"], // HANGUL FILLER
+    ["aᅟb", "name segment"], // HANGUL CHOSEONG FILLER
+    ["aᅠb", "name segment"], // HANGUL JUNGSEONG FILLER
+    ["a͏b", "name segment"], // COMBINING GRAPHEME JOINER
+    ["a឴b", "name segment"], // KHMER VOWEL INHERENT AQ
+    ["a឵b", "name segment"], // KHMER VOWEL INHERENT AA
+    ["aﾠb", "name segment"], // HALFWIDTH HANGUL FILLER
+    ["a⠀b", "name segment"], // BRAILLE PATTERN BLANK
+    ["a\ud800b", "name segment"], // lone (unpaired) high surrogate
   ])("parseActor(%j) throws ACTOR_INVALID: %s", (raw, reasonSubstring) => {
     expect(() => parseActor(raw)).toThrow();
     try {
@@ -207,6 +224,139 @@ describe("parseActor — malformed inputs, probed against the real parser (brief
       expect(e.code).toBe(ActorErrorCodes.ACTOR_INVALID);
       expect(String(e.details?.reason)).toContain(reasonSubstring);
     }
+  });
+});
+
+describe("parseActor — R-18: the whole-value length cap", () => {
+  test("257 characters is rejected", () => {
+    const raw = "a".repeat(257);
+    try {
+      parseActor(raw);
+      throw new Error("expected parseActor to throw");
+    } catch (e) {
+      if (!isCanKanError(e)) {
+        throw e;
+      }
+      expect(e.code).toBe(ActorErrorCodes.ACTOR_INVALID);
+      expect(String(e.details?.reason)).toContain("must be at most 256 characters");
+    }
+  });
+
+  test("256 characters is accepted (the boundary itself is valid)", () => {
+    const raw = "a".repeat(256);
+    expect(parseActor(raw)).toEqual({ tool: null, name: raw, context: null });
+  });
+});
+
+describe("parseActor / formatActor — R-15: NFC normalization", () => {
+  test("an NFD-spelled name parses, and format -> parse -> format is stable from the first parse onward", () => {
+    // "e" + COMBINING ACUTE ACCENT (U+0301) -- NFD spelling of "é". Real
+    // `git user.name` values can legitimately arrive this way (macOS
+    // normalizes some inputs to NFD); rejecting it would hand such a user
+    // an error they can't read or act on, so R-15 normalizes instead.
+    const nfd = `alic${"é"}`;
+    const nfc = "alicé"; // the composed form of the same text
+    expect(nfd).not.toBe(nfc); // sanity: genuinely different byte sequences
+    expect(nfd.normalize("NFC")).toBe(nfc);
+
+    const parsedFromNfd = parseActor(nfd);
+    expect(parsedFromNfd).toEqual({ tool: null, name: nfc, context: null });
+
+    const formattedOnce = formatActor(parsedFromNfd);
+    // NOT byte-identical to the raw NFD input -- normalization happened
+    // before parsing, so the canonical (NFC) spelling is what comes back.
+    expect(formattedOnce as string).not.toBe(nfd);
+    expect(formattedOnce as string).toBe(nfc);
+
+    // Stability is guaranteed from here on: parsing the already-normalized
+    // output and formatting it again reproduces the same string.
+    const parsedAgain = parseActor(formattedOnce);
+    const formattedTwice = formatActor(parsedAgain);
+    expect(formattedTwice as string).toBe(formattedOnce as string);
+  });
+
+  test("NFC- and NFD-spelled input for the same visible text parse to the same Actor and mint the same ActorId", () => {
+    const nfc = parseActor("alicé");
+    const nfd = parseActor(`alic${"é"}`);
+    expect(nfd).toEqual(nfc);
+    expect(formatActor(nfd) as string).toBe(formatActor(nfc) as string);
+  });
+});
+
+describe("parseActor — R-11/R-18: any number of internal spaces is legal in `name`, not just one", () => {
+  // R-18: NAME_SEGMENT_REASON used to say "a single internal space",
+  // which was false -- these two both parse. Locking that in here so the
+  // message and the behavior can't drift apart again unnoticed.
+  test.each([
+    ["a  b", { tool: null, name: "a  b", context: null }],
+    ["a b c", { tool: null, name: "a b c", context: null }],
+  ] satisfies [string, Actor][])("parseActor(%j)", (raw, expected) => {
+    expect(parseActor(raw)).toEqual(expected);
+  });
+});
+
+describe("formatActor — R-16: validates before minting an ActorId", () => {
+  test("rejects a hand-built Actor whose name carries a newline (log-injection shape)", () => {
+    const malicious: Actor = { tool: null, name: 'alice"}\n{"actor":"bob', context: null };
+    try {
+      formatActor(malicious);
+      throw new Error("expected formatActor to throw");
+    } catch (e) {
+      if (!isCanKanError(e)) {
+        throw e;
+      }
+      expect(e.code).toBe(ActorErrorCodes.ACTOR_INVALID);
+    }
+  });
+
+  test("rejects a hand-built Actor whose name secretly contains \"/\" (only reachable by direct construction)", () => {
+    // `parseActor` itself never produces a `name` containing "/" -- this
+    // state is only reachable by building an `Actor` object directly.
+    const malformed: Actor = { tool: null, name: "a/b", context: null };
+    try {
+      formatActor(malformed);
+      throw new Error("expected formatActor to throw");
+    } catch (e) {
+      if (!isCanKanError(e)) {
+        throw e;
+      }
+      expect(e.code).toBe(ActorErrorCodes.ACTOR_INVALID);
+    }
+  });
+
+  test("rejects a hand-built Actor whose tool secretly contains \":\"", () => {
+    const malformed: Actor = { tool: "a:b", name: "c", context: null };
+    try {
+      formatActor(malformed);
+      throw new Error("expected formatActor to throw");
+    } catch (e) {
+      if (!isCanKanError(e)) {
+        throw e;
+      }
+      expect(e.code).toBe(ActorErrorCodes.ACTOR_INVALID);
+    }
+  });
+
+  test("still succeeds for an ordinary, validly-constructed Actor", () => {
+    expect(formatActor({ tool: "codex", name: "ci", context: null }) as string).toBe("codex:ci");
+  });
+});
+
+describe("parseActor — documented, not defects (file comment above the grammar section)", () => {
+  test("case is preserved exactly -- 'Alice' and 'alice' are two different actors", () => {
+    expect(parseActor("Alice")).toEqual({ tool: null, name: "Alice", context: null });
+    expect(parseActor("Alice")).not.toEqual(parseActor("alice"));
+    expect(formatActor(parseActor("Alice")) as string).not.toBe(
+      formatActor(parseActor("alice")) as string,
+    );
+  });
+
+  test("script-mixing homoglyphs are left alone -- Cyrillic and Latin 'a' parse as different, both-valid names", () => {
+    const cyrillic = "аlice"; // Cyrillic а (U+0430) + "lice"
+    const latin = "alice";
+    expect(cyrillic).not.toBe(latin);
+    expect(parseActor(cyrillic)).toEqual({ tool: null, name: cyrillic, context: null });
+    expect(parseActor(cyrillic)).not.toEqual(parseActor(latin));
   });
 });
 
@@ -727,6 +877,167 @@ describe("ResolvedActor.id", () => {
         const result: ResolvedActor = await resolveActor({ config });
         expect(result.id).toBe(formatActor(result.actor));
         expect(result.id as string).toBe("claude-code:alice/wt-auth");
+      } finally {
+        await cleanup();
+      }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R-17 (fix round 2): the layer guard mirrored onto `parent` and
+// `identity.name`. Every other `describe` in this file builds its
+// `ConfigResult` from a real `loadConfig()` call, deliberately -- this is
+// the one exception, and it has to be: M2.3's real schema always closes
+// this path (that's the whole point of R-17 being "defence in depth,
+// nothing reachable today"), so a hand-built `ConfigResult` stub, clearly
+// contrived to violate the invariant, is the only way to exercise the
+// guard code itself rather than merely trust it.
+// ---------------------------------------------------------------------------
+
+/** A minimal `ConfigResult` stub whose `resolved()` reports whatever layer
+ *  the test wants, regardless of what `loadConfig` could ever really
+ *  produce -- used only to prove the R-17 guards throw, not to model real
+ *  config behavior. */
+function fakeConfigResult(
+  value: Record<string, unknown>,
+  layers: Readonly<Record<string, string>>,
+): ConfigResult {
+  return {
+    value: value as ConfigResult["value"],
+    layers: [],
+    resolved: (key: string | readonly string[]): ResolvedEntry | undefined => {
+      const k = Array.isArray(key) ? (key as readonly string[]).join(".") : (key as string);
+      const layer = layers[k];
+      if (layer === undefined) {
+        return undefined;
+      }
+      const path = Array.isArray(key) ? (key as readonly string[]) : [key as string];
+      return {
+        path,
+        key: k,
+        value: undefined,
+        layer: layer as ResolvedEntry["layer"],
+      };
+    },
+    entries: () => [],
+  };
+}
+
+describe("resolveActor — R-17: the layer guard also covers `parent` and `identity.name`", () => {
+  test("actor resolved from an impossible layer ('repo') -> ACTOR_UNRESOLVED naming 'actor'", async () => {
+    const config = fakeConfigResult({ actor: "alice" }, { actor: "repo" });
+    try {
+      await resolveActor({ config });
+      throw new Error("expected resolveActor to throw");
+    } catch (e) {
+      if (!isCanKanError(e)) {
+        throw e;
+      }
+      expect(e.code).toBe(ActorErrorCodes.ACTOR_UNRESOLVED);
+      expect(e.details?.field).toBe("actor");
+      expect(e.details?.layer).toBe("repo");
+    }
+  });
+
+  test("parent resolved from an impossible layer ('global') -> ACTOR_UNRESOLVED naming 'parent'", async () => {
+    const config = fakeConfigResult({ parent: "alice" }, { parent: "global" });
+    try {
+      await resolveActor({ config, flag: "codex:ci" });
+      throw new Error("expected resolveActor to throw");
+    } catch (e) {
+      if (!isCanKanError(e)) {
+        throw e;
+      }
+      expect(e.code).toBe(ActorErrorCodes.ACTOR_UNRESOLVED);
+      expect(e.details?.field).toBe("parent");
+      expect(e.details?.layer).toBe("global");
+    }
+  });
+
+  test("identity.name resolved from an impossible layer ('repo-local'), used as actor -> ACTOR_UNRESOLVED naming 'identity.name'", async () => {
+    const config = fakeConfigResult(
+      { identity: { name: "alice" } },
+      { "identity.name": "repo-local" },
+    );
+    try {
+      await resolveActor({ config });
+      throw new Error("expected resolveActor to throw");
+    } catch (e) {
+      if (!isCanKanError(e)) {
+        throw e;
+      }
+      expect(e.code).toBe(ActorErrorCodes.ACTOR_UNRESOLVED);
+      expect(e.details?.field).toBe("identity.name");
+      expect(e.details?.layer).toBe("repo-local");
+    }
+  });
+
+  test("identity.name resolved from an impossible layer ('repo'), used as parent -> ACTOR_UNRESOLVED naming 'identity.name'", async () => {
+    const config = fakeConfigResult({ identity: { name: "alice" } }, { "identity.name": "repo" });
+    try {
+      await resolveActor({ config, flag: "codex:ci" });
+      throw new Error("expected resolveActor to throw");
+    } catch (e) {
+      if (!isCanKanError(e)) {
+        throw e;
+      }
+      expect(e.code).toBe(ActorErrorCodes.ACTOR_UNRESOLVED);
+      expect(e.details?.field).toBe("identity.name");
+      expect(e.details?.layer).toBe("repo");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R-18 (fix round 2, bundled small items).
+// ---------------------------------------------------------------------------
+
+describe("resolveActor — R-18: gitUserName() misbehavior and memoization", () => {
+  test("a thunk that resolves undefined is treated as null, not a raw TypeError", async () => {
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      try {
+        const config = await buildConfig({ root });
+        const badThunk = async () => undefined as unknown as string | null;
+        try {
+          await resolveActor({ config, gitUserName: badThunk });
+          throw new Error("expected resolveActor to throw");
+        } catch (e) {
+          if (!isCanKanError(e)) {
+            throw e;
+          }
+          expect(e.code).toBe(ActorErrorCodes.ACTOR_UNRESOLVED);
+        }
+      } finally {
+        await cleanup();
+      }
+    });
+  });
+
+  test("a tool-shaped git user.name is fetched once, even though both the actor rung and the parent rung need it", async () => {
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      try {
+        // No --actor, no CANKAN_ACTOR, no local `actor:`, no global
+        // identity.name -- the actor rung falls through to git. The
+        // returned value is tool-shaped ("team:alice"), so the parent
+        // rung *also* falls through to git (parent then rejects it as
+        // not-a-bare-name -- that's expected and irrelevant here; what
+        // this test proves is the underlying thunk still runs only once).
+        const config = await buildConfig({ root });
+        const stub = gitStub("team:alice");
+        try {
+          await resolveActor({ config, gitUserName: stub.fn });
+          throw new Error("expected resolveActor to throw");
+        } catch (e) {
+          if (!isCanKanError(e)) {
+            throw e;
+          }
+          expect(e.code).toBe(ActorErrorCodes.ACTOR_INVALID);
+          expect(e.details?.field).toBe("parent");
+        }
+        expect(stub.state.callCount).toBe(1);
       } finally {
         await cleanup();
       }

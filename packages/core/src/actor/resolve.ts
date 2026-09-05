@@ -25,9 +25,27 @@
  * default") and what M2.6/M3.1 actually wire up. Fixing either half is an
  * edit to another task's module or to PLAN.md, forbidden in this lane; the
  * thunk shape here is what M3.1 (or a later PLAN amendment) must satisfy.
+ *
+ * **Deliberately NOT normalized or restricted (documented, not defects):**
+ * case is preserved exactly (`"Alice"` and `"alice"` are two different
+ * actors) -- folding case would itself be a spoofing vector (an attacker
+ * picks the casing that collides with a target) and would silently
+ * reattribute a user's own history the moment they fix their local git
+ * casing. Script-mixing homoglyphs (Cyrillic `а` vs Latin `a`) are also
+ * left alone -- `а` is a legitimately different character in a legitimately
+ * different name, and UTS #39-style confusable restrictions are out of
+ * proportion for a local, single-tenant CLI's attribution key.
+ *
+ * **`source: "global-identity"` names the rung, not the layer**: a
+ * `CANKAN_IDENTITY__NAME` env override still reports `"global-identity"`
+ * (never `"env"`), because the *rung* being consulted is "the global
+ * identity value, however it was set" -- unlike the `actor` rung, which
+ * has its own dedicated `"env"` source precisely because `CANKAN_ACTOR` is
+ * a distinct rung in PLAN.md's chain. Worth remembering when this reads,
+ * to a user, as "your global config file" in a future `config show`.
  */
 
-import type { ConfigResult } from "../config/index";
+import type { ConfigResult, ResolvedEntry } from "../config/index";
 import { CanKanError } from "../errors";
 import type { ActorId } from "../types";
 import { ActorErrorCodes } from "./errors";
@@ -116,16 +134,66 @@ export interface ResolveActorOptions {
 //      distinct actor string -- attribution spoofing in a record that is
 //      never rewritten.
 //
+// **R-15 (fix round 2 -- R-11's own point 4 didn't close the hole it
+// claimed to)**: probed against the real parser, `\p{Cc}`/`\p{Cf}` alone
+// let through several characters that are visually blank or invisible but
+// not classified as control/format -- Hangul/halfwidth-Hangul fillers,
+// variation selectors, the combining grapheme joiner, Khmer inherent
+// vowels, and lone (unpaired) UTF-16 surrogates -- plus two spellings of
+// the same visible text (`"aliíce"` composed vs. decomposed) minting two
+// distinct `ActorId`s for what a human reads as one name. Both are the
+// same underlying problem: an append-only log where nothing is ever
+// rewritten must not let two different byte sequences render identically.
+// The fix, probed and confirmed against every character above before
+// being asserted in tests:
+//
+//   - The forbidden set is now `\p{Cc} | \p{Cf} | \p{Cs} |
+//     \p{Default_Ignorable_Code_Point}`, plus `U+2800` BRAILLE PATTERN
+//     BLANK explicitly (it renders blank but is not `Default_Ignorable`,
+//     confirmed by testing the property escape against it directly).
+//   - The raw value is NFC-normalized *before* parsing, not rejected when
+//     it isn't already NFC -- Unicode defines canonically-equivalent
+//     sequences as the same text, so normalizing collapses two spellings
+//     of one identity rather than inventing one. Rejecting instead would
+//     hand a user whose real `git user.name` happens to be stored in NFD
+//     (ordinary on macOS; "José" is not exotic) an error they have no way
+//     to read or act on. One consequence: `formatActor(parseActor(x))` may
+//     differ from `x` byte-for-byte for NFD input -- round-trip stability
+//     is guaranteed from the *first* parse onward
+//     (`parse -> format -> parse -> format` is fixed), not against the
+//     original raw bytes.
+//
+// This is not merely cosmetic: `tool`/`context` feed queue glob patterns
+// (`queues.*.actors`, e.g. `["codex:*"]`), so an invisible character
+// smuggled into `codex` would display as `codex` but silently never match
+// its own queue; and `claims.max_per_actor` gives each look-alike its own
+// budget against a policy whose entire point is capping *one* actor.
+//
 // R-8 ("empty is malformed, not absent") still falls out for free: `""`
 // and `"   "` still fail the empty/leading-trailing-whitespace checks
 // below, unchanged by any of this.
 // ---------------------------------------------------------------------------
 
-/** Any Unicode control (`\p{Cc}`) or format (`\p{Cf}`) character -- R-11
- *  point 4. A property-escape regex, not a literal control-character
- *  range, so biome's `noControlCharactersInRegex` does not flag it. */
-function isControlOrFormatChar(ch: string): boolean {
-  return /\p{Cc}|\p{Cf}/u.test(ch);
+/** The whole actor value's length cap (R-18) -- an attribution key with no
+ *  bound would let an arbitrarily large string (a full file, say) become a
+ *  permanent key in the append-only event log. 256 is generous for every
+ *  real example CONCEPT.md shows, with room to spare for a long
+ *  `tool:name/context`. */
+const MAX_ACTOR_LENGTH = 256;
+
+/**
+ * Every character R-15 forbids everywhere: Unicode control (`\p{Cc}`),
+ * format (`\p{Cf}` -- bidi overrides, zero-width joiners), surrogate
+ * (`\p{Cs}` -- a lone, unpaired UTF-16 half), or default-ignorable
+ * (`\p{Default_Ignorable_Code_Point}` -- Hangul/halfwidth-Hangul fillers,
+ * variation selectors, the combining grapheme joiner, Khmer inherent
+ * vowels), plus `U+2800` BRAILLE PATTERN BLANK explicitly (visually blank,
+ * but not itself Default_Ignorable). Property-escape regexes, not a
+ * literal control-character range, so biome's `noControlCharactersInRegex`
+ * does not flag this.
+ */
+function isProblematicChar(ch: string): boolean {
+  return /\p{Cc}|\p{Cf}|\p{Cs}|\p{Default_Ignorable_Code_Point}/u.test(ch) || ch === "\u2800";
 }
 
 /** Any whitespace character (JS's `\s`, which already covers NBSP and the
@@ -143,7 +211,7 @@ function isForbiddenSegmentChar(ch: string, allowInternalSpace: boolean): boolea
   if (ch === ":" || ch === "/") {
     return true;
   }
-  if (isControlOrFormatChar(ch)) {
+  if (isProblematicChar(ch)) {
     return true;
   }
   if (isNonSpaceWhitespace(ch)) {
@@ -191,13 +259,20 @@ interface ParseSuccess {
  *  point 2: no whitespace allowed at all). */
 const MACHINE_SEGMENT_REASON =
   'must be non-empty, must not have leading or trailing whitespace, and must contain no ' +
-  'whitespace, control/format characters, ":", or "/"';
+  'whitespace, control/format/surrogate/default-ignorable characters, ":", or "/"';
 
-/** The reason reported for an invalid `name` segment (R-11 point 1: an
- *  internal `U+0020` space is the one whitespace character it may carry). */
+/**
+ * The reason reported for an invalid `name` segment. R-18 (fix round 2):
+ * this used to say "a single internal space", which was false -- `"a  b"`
+ * and `"a b c"` both parse (R-11 places no cap on *how many* plain spaces
+ * `name` carries, only on which other characters are forbidden), so the
+ * old wording told a user something untrue about the rule that rejected
+ * their input.
+ */
 const NAME_SEGMENT_REASON =
   'must be non-empty, must not have leading or trailing whitespace, and must contain no ":", ' +
-  '"/", control/format characters, or whitespace other than a single internal space (U+0020)';
+  '"/", control/format/surrogate/default-ignorable characters, or whitespace other than plain ' +
+  "space characters (U+0020)";
 
 /**
  * The grammar walk, returning a reason string on failure rather than
@@ -206,7 +281,9 @@ const NAME_SEGMENT_REASON =
  * failed, R-5, not just the parse failure itself).
  *
  * Checked in this order (probed against the brief §5 malformed-input
- * table, not merely reasoned about): whole-string emptiness, whole-string
+ * table, not merely reasoned about): NFC normalization (R-15 -- happens
+ * before any other check, so every check below sees canonical text),
+ * whole-string emptiness, the length cap (R-18), whole-string
  * leading/trailing whitespace, at most one `:`, at most one `/` within
  * what follows it, each present segment's own validity, and finally "a
  * context without a tool is rejected" (R-9's second bullet) -- which fires
@@ -216,9 +293,19 @@ const NAME_SEGMENT_REASON =
  * function reports whichever check the walk reaches first rather than
  * every possible reason.
  */
-function tryParseActor(raw: string): ParseSuccess | ParseFailure {
+function tryParseActor(rawInput: string): ParseSuccess | ParseFailure {
+  // R-15: normalize before anything else, so two canonically-equivalent
+  // spellings of the same text (composed vs. decomposed) parse to the
+  // same `Actor` and format back to the same `ActorId` -- never rejected
+  // for merely being NFD, since a real `git user.name` can legitimately
+  // arrive that way (macOS normalizes filenames/some inputs to NFD).
+  const raw = rawInput.normalize("NFC");
+
   if (raw.length === 0) {
     return { reason: "actor value must not be empty" };
+  }
+  if (raw.length > MAX_ACTOR_LENGTH) {
+    return { reason: `actor value must be at most ${MAX_ACTOR_LENGTH} characters` };
   }
   if (hasLeadingOrTrailingWhitespace(raw)) {
     return { reason: "actor value must not have leading or trailing whitespace" };
@@ -266,9 +353,12 @@ function tryParseActor(raw: string): ParseSuccess | ParseFailure {
 }
 
 /**
- * Parses a raw actor string per R-9's grammar. Throws `CanKanError`
- * (`ACTOR_INVALID`) on any malformed input -- never trims, never guesses;
- * see `tryParseActor`'s comment for the exact check order.
+ * Parses a raw actor string per R-9's grammar (as amended by R-11/R-15).
+ * Throws `CanKanError` (`ACTOR_INVALID`) on any malformed input -- never
+ * trims, never guesses; see `tryParseActor`'s comment for the exact check
+ * order. The input is NFC-normalized before parsing (R-15), so the
+ * returned `Actor`'s segments are always canonical text, not necessarily
+ * byte-identical to `raw`.
  *
  * The message and `details.reason` deliberately never echo `raw` itself:
  * this function is also used internally on a value that may have come
@@ -286,16 +376,49 @@ export function parseActor(raw: string): Actor {
   return outcome.actor;
 }
 
+/** Concatenates `actor`'s segments with no validation -- `formatActor`'s
+ *  only caller, kept separate so `formatActor` can re-run the *parsed*
+ *  result back through this same function after validating (see below)
+ *  without recursing into validation a second time. */
+function joinActorSegments(actor: Actor): string {
+  const tool = actor.tool !== null ? `${actor.tool}:` : "";
+  const context = actor.context !== null ? `/${actor.context}` : "";
+  return `${tool}${actor.name}${context}`;
+}
+
 /**
  * The inverse of `parseActor` -- `tool:name/context`, `tool:name`, or
  * `name`, whichever segments `actor` carries. Branded `ActorId` on the way
  * out (see `ResolvedActor.id`'s comment): this is the one place that mints
  * one from a decomposed `Actor`.
+ *
+ * **R-16 (fix round 2)**: `Actor` is a plain, caller-constructible
+ * interface -- nothing stops a downstream module from building one by hand
+ * (`{ tool: null, name: 'alice"}\\n{"actor":"bob', context: null }`) and
+ * handing it to this, the one function trusted to mint an `ActorId`
+ * without a cast. Concatenation alone would brand a newline straight into
+ * the boundary type the rest of the codebase relies on never needing
+ * revalidation, and from there into M2.7's append-only JSONL log. This
+ * function closes that by joining the segments and then running the
+ * result back through the *real* grammar (`tryParseActor`, the same
+ * function `parseActor` uses) rather than a second, parallel validator --
+ * a naive `"a/b"` name (illegal on its own, but only reachable by hand
+ * construction, since `parseActor` never produces one) round-trips into
+ * `context: "b"` with no tool and is correctly rejected as "a context
+ * requires a tool", exactly as if a human had typed `"a/b"` at the flag.
+ * The value returned is built from the *reparsed* segments, not the
+ * original candidate string, so a caller-constructed `Actor` whose text
+ * was not already NFC-normalized still mints a canonical `ActorId`.
  */
 export function formatActor(actor: Actor): ActorId {
-  const tool = actor.tool !== null ? `${actor.tool}:` : "";
-  const context = actor.context !== null ? `/${actor.context}` : "";
-  return `${tool}${actor.name}${context}` as ActorId;
+  const candidate = joinActorSegments(actor);
+  const outcome = tryParseActor(candidate);
+  if ("reason" in outcome) {
+    throw new CanKanError(ActorErrorCodes.ACTOR_INVALID, `invalid actor value: ${outcome.reason}`, {
+      details: { reason: outcome.reason },
+    });
+  }
+  return joinActorSegments(outcome.actor) as ActorId;
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +486,61 @@ function rungDetailsFrom(entry: { file?: string; envVar?: string } | undefined):
   };
 }
 
+/** The layers `cfg.value.actor` and `cfg.value.parent` can legally resolve
+ *  from -- both are kept out of `repoConfigSchema`/`globalConfigSchema`
+ *  (`config/schema.ts`'s file-level comment), so only `CANKAN_*` (`"env"`)
+ *  or `.cankan/local.yml` (`"repo-local"`) can ever produce one. */
+const LOCAL_ONLY_LAYERS = ["env", "repo-local"];
+
+/** The layers `cfg.value.identity?.name` can legally resolve from --
+ *  `identity` lives only in `globalConfigSchema`/`effectiveConfigSchema`,
+ *  reachable either from the global file (`"global"`) or a
+ *  `CANKAN_IDENTITY__NAME` override (`"env"`, per `config/resolve.ts`'s S5
+ *  comment on `effectiveConfigSchema` including global-only sections). */
+const IDENTITY_LAYERS = ["env", "global"];
+
+/**
+ * R-17 (fix round 2, defence in depth): the same "M2.3's own schema
+ * guarantee broke" guard R-1 already applied to `cfg.value.actor`, mirrored
+ * onto `cfg.value.parent` and `cfg.value.identity?.name` -- all three were
+ * excluded from the repo/global (or repo/repo-local) schemas for the same
+ * stated security reason (`config/schema.ts`'s file-level comment), so
+ * guarding only one of the three was the inconsistency, not a difference
+ * in risk. Nothing reaches this path today (M2.3 closes it), but a typed
+ * error here costs nothing and catches a future schema regression instead
+ * of silently misattributing.
+ */
+function requireExpectedLayer(
+  entry: ResolvedEntry | undefined,
+  allowedLayers: readonly string[],
+  field: string,
+): asserts entry is ResolvedEntry {
+  if (entry === undefined || !allowedLayers.includes(entry.layer)) {
+    throw new CanKanError(
+      ActorErrorCodes.ACTOR_UNRESOLVED,
+      `${field} is set but resolved from an unexpected config layer ("${String(entry?.layer)}")`,
+      { details: { field, layer: String(entry?.layer) } },
+    );
+  }
+}
+
+/**
+ * R-18 (fix round 2): a thunk that returns `undefined` instead of `null`
+ * (a caller bug, since the declared return type is `Promise<string |
+ * null>`) must not crash `tryParseActor` with a raw `TypeError` from
+ * `undefined.length` -- coerced to `null`, the same as "no git identity",
+ * here at the one call site both rungs share.
+ */
+async function callGitUserName(
+  gitUserName: (() => Promise<string | null>) | undefined,
+): Promise<string | null> {
+  if (!gitUserName) {
+    return null;
+  }
+  const raw = await gitUserName();
+  return raw ?? null;
+}
+
 /**
  * The precedence chain `--actor flag > CANKAN_ACTOR > local config > global
  * identity > git user.name` (PLAN.md M2.18), plus R-10's `parent`
@@ -370,6 +548,17 @@ function rungDetailsFrom(entry: { file?: string; envVar?: string } | undefined):
  */
 export async function resolveActor(options: ResolveActorOptions): Promise<ResolvedActor> {
   const { config, flag, gitUserName } = options;
+
+  // R-18 (fix round 2): memoized *within this one call* -- not a
+  // persistent cache (the brief forbids one) -- so a tool-shaped git
+  // `user.name` (e.g. `"team:alice"`) that wins both the actor rung and
+  // the parent rung spawns git once, not twice. Still lazy: unset until
+  // the first rung that actually needs it calls `getGitUserName()`.
+  let gitUserNamePromise: Promise<string | null> | undefined;
+  function getGitUserName(): Promise<string | null> {
+    gitUserNamePromise ??= callGitUserName(gitUserName);
+    return gitUserNamePromise;
+  }
 
   let actor: Actor;
   let source: ActorSource;
@@ -381,28 +570,16 @@ export async function resolveActor(options: ResolveActorOptions): Promise<Resolv
     actor = requireParsedActor(flag, source);
   } else if (config.value.actor !== undefined) {
     const entry = config.resolved(["actor"]);
-    if (entry?.layer === "env") {
-      source = "env";
-    } else if (entry?.layer === "repo-local") {
-      source = "local-config";
-    } else {
-      // R-1: M2.3's schema keeps `actor` out of the repo and global files,
-      // so `cfg.value.actor` can only legally come from CANKAN_ACTOR or
-      // .cankan/local.yml. Anything else means that guarantee broke --
-      // surfaced as a typed error (R-4's philosophy), never guessed at.
-      throw new CanKanError(
-        ActorErrorCodes.ACTOR_UNRESOLVED,
-        `actor is set but resolved from an unexpected config layer ("${String(entry?.layer)}")`,
-        { details: { rung: "actor", layer: String(entry?.layer) } },
-      );
-    }
+    requireExpectedLayer(entry, LOCAL_ONLY_LAYERS, "actor");
+    source = entry.layer === "env" ? "env" : "local-config";
     actor = requireParsedActor(config.value.actor, source, rungDetailsFrom(entry));
   } else if (config.value.identity?.name !== undefined) {
-    source = "global-identity";
     const entry = config.resolved(["identity", "name"]);
+    requireExpectedLayer(entry, IDENTITY_LAYERS, "identity.name");
+    source = "global-identity";
     actor = requireParsedActor(config.value.identity.name, source, rungDetailsFrom(entry));
   } else {
-    const raw = gitUserName ? await gitUserName() : null;
+    const raw = await getGitUserName();
     if (raw === null) {
       // R-4: no default, ever -- a typed error naming every rung checked.
       throw new CanKanError(
@@ -421,18 +598,20 @@ export async function resolveActor(options: ResolveActorOptions): Promise<Resolv
   // R-10: only a tool actor gets a parent; a bare human's parent is always
   // `null`, and this block is skipped entirely for one -- so a bare-human
   // actor resolved from the git rung never calls `gitUserName()` a second
-  // time here.
+  // time here (and even when it would, `getGitUserName()` is memoized).
   if (actor.tool !== null) {
     if (config.value.parent !== undefined) {
-      parentSource = "config";
       const entry = config.resolved(["parent"]);
+      requireExpectedLayer(entry, LOCAL_ONLY_LAYERS, "parent");
+      parentSource = "config";
       parent = requireBareName(config.value.parent, parentSource, rungDetailsFrom(entry));
     } else if (config.value.identity?.name !== undefined) {
-      parentSource = "global-identity";
       const entry = config.resolved(["identity", "name"]);
+      requireExpectedLayer(entry, IDENTITY_LAYERS, "identity.name");
+      parentSource = "global-identity";
       parent = requireBareName(config.value.identity.name, parentSource, rungDetailsFrom(entry));
     } else {
-      const raw = gitUserName ? await gitUserName() : null;
+      const raw = await getGitUserName();
       if (raw !== null) {
         parentSource = "git";
         parent = requireBareName(raw, parentSource);

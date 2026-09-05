@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { isCanKanError } from "../../src/errors";
-import { createGitAdapter, type GitAdapter } from "../../src/git/index";
+import { createGitAdapter, GitErrorCodes, type GitAdapter } from "../../src/git/index";
 import { EventErrorCodes } from "../../src/events/errors";
 import {
   append,
@@ -574,5 +574,217 @@ describe("append — validation and ref lifecycle", () => {
     expect(await adapter.readRef(COORD_REF)).not.toBeNull();
     const records = await read(adapter, COORD_REF, { now: SEPT_15_MS });
     expect(records).toHaveLength(1);
+  });
+});
+
+// ============================================================================
+// Fix round 1, S1 — trailingMonths validation (degenerate and hostile values)
+// ============================================================================
+
+describe("read — fix round 1, S1: trailingMonths must be a bounded integer", () => {
+  // Every degenerate/hostile-value test below seeds a **real** claim first.
+  // The bug this fix closes is specifically that a degenerate value made
+  // `read()` silently report "no events" *even though a real event exists*
+  // (fm9's double-claim, arriving through a parameter) — a test against an
+  // empty board would pass either way and prove nothing about that failure
+  // mode. Seeding first is what makes each assertion meaningful.
+  async function seededRepoAndAdapter(): Promise<{ adapter: GitAdapter }> {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    return { adapter };
+  }
+
+  test("rejects trailingMonths: 0 rather than silently hiding the real event in the log", async () => {
+    const { adapter } = await seededRepoAndAdapter();
+    await expectCode(read(adapter, COORD_REF, { now: SEPT_15_MS, trailingMonths: 0 }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+  });
+
+  test("rejects a negative trailingMonths", async () => {
+    const { adapter } = await seededRepoAndAdapter();
+    await expectCode(read(adapter, COORD_REF, { now: SEPT_15_MS, trailingMonths: -1 }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+  });
+
+  test("rejects NaN", async () => {
+    const { adapter } = await seededRepoAndAdapter();
+    await expectCode(
+      read(adapter, COORD_REF, { now: SEPT_15_MS, trailingMonths: Number.NaN }),
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+    );
+  });
+
+  test("rejects Infinity without hanging (the hostile config-derived case)", async () => {
+    const { adapter } = await seededRepoAndAdapter();
+    const start = Date.now();
+    await expectCode(
+      read(adapter, COORD_REF, { now: SEPT_15_MS, trailingMonths: Number.POSITIVE_INFINITY }),
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+    );
+    // Before the fix, this drove a synchronous, unbounded loop that starved
+    // the event loop — a passing assertion alone would not distinguish
+    // "rejected quickly" from "would have hung forever, but we got lucky."
+    // Asserting a tight wall-clock bound is what actually proves the guard
+    // ran instead of the loop. Seeding a real ref first (see
+    // `seededRepoAndAdapter`) is required for this to actually exercise the
+    // loop at all: on a *fresh, ref-absent* repo, `read()` short-circuits at
+    // its `readRef` null-check before ever reaching `trailingMonths`-driven
+    // code, so a test against an empty board would pass even with the guard
+    // fully removed — confirmed directly (see task-2-report.md's addendum).
+    expect(Date.now() - start).toBeLessThan(500);
+  }, 5_000);
+
+  test("rejects a merely-huge finite value that would otherwise hang", async () => {
+    const { adapter } = await seededRepoAndAdapter();
+    const start = Date.now();
+    await expectCode(
+      read(adapter, COORD_REF, { now: SEPT_15_MS, trailingMonths: 1_000_000_000 }),
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+    );
+    expect(Date.now() - start).toBeLessThan(500);
+  }, 5_000);
+
+  test("a non-integer (fractional) trailingMonths is rejected", async () => {
+    const { adapter } = await seededRepoAndAdapter();
+    await expectCode(read(adapter, COORD_REF, { now: SEPT_15_MS, trailingMonths: 1.5 }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+  });
+
+  test("the default (no trailingMonths given) and the maximum accepted value both still work", async () => {
+    const { adapter } = await seededRepoAndAdapter();
+    await expect(read(adapter, COORD_REF, { now: SEPT_15_MS })).resolves.toHaveLength(1);
+    await expect(read(adapter, COORD_REF, { now: SEPT_15_MS, trailingMonths: 120 })).resolves.toHaveLength(1);
+  });
+});
+
+// ============================================================================
+// Fix round 1, S2 — append's own blob-size bound, and read's aggregate cap
+// ============================================================================
+
+describe("append — fix round 1, S2: the existing-blob-size bound", () => {
+  test("refuses to extend a month blob that already exceeds the size cap", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    // Deliberately not valid JSONL — the size check runs before any parsing
+    // is attempted, so garbage content is sufficient and far cheaper to
+    // construct than a genuinely valid 65MB log.
+    const oversized = "x".repeat(65 * 1024 * 1024);
+    await seedMonthFile(adapter, oversized);
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY }),
+      EventErrorCodes.EVENT_LOG_BLOB_TOO_LARGE,
+    );
+
+    // Confirmed unchanged — the write path did not silently grow what it
+    // refused to extend.
+    const stillOversized = await adapter.readBlobFromRef(COORD_REF, "events/2026-09.jsonl");
+    expect(stillOversized).toBe(oversized);
+  }, 20_000);
+
+  test("maxExistingBlobBytes is a reachable escape hatch for a deliberate recovery write", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    // Well-formed (trailing newline) so the size bypass is what's actually
+    // under test, not an unrelated malformed-tail rejection.
+    const oversized = `${"x".repeat(65 * 1024 * 1024)}\n`;
+    await seedMonthFile(adapter, oversized);
+
+    // A caller (dispatch 4's quarantine/recovery path, per the brief) that
+    // deliberately disables the guard can still write into the oversized
+    // month — the cap is not absolute.
+    const appended = await append(adapter, COORD_REF, claim("ck-recovery"), {
+      now: SEPT_15_MS,
+      casRetry: FAST_RETRY,
+      maxExistingBlobBytes: Number.POSITIVE_INFINITY,
+    });
+    expect(appended.event.ticket as string).toBe("ck-recovery");
+  }, 20_000);
+});
+
+describe("read — fix round 1, S2/S4: the per-month and aggregate size bounds", () => {
+  test("a single oversized month blob is rejected (kills the 'delete MAX_MONTH_BLOB_BYTES' mutant)", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const oversized = "x".repeat(65 * 1024 * 1024);
+    await seedMonthFile(adapter, oversized);
+
+    await expectCode(read(adapter, COORD_REF, { now: SEPT_15_MS }), EventErrorCodes.EVENT_LOG_BLOB_TOO_LARGE);
+  }, 20_000);
+
+  test("the aggregate cap fires across a multi-month window even though no single month exceeds the per-month cap", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // A single, large, valid `hook` event line — reused byte-for-byte so
+    // repeating it (within a month, and across months) is folded by the
+    // duplicate-id dedupe rather than raising a duplicate-content error.
+    const bigOutput = "y".repeat(90_000); // under MAX_HOOK_OUTPUT_CHARS and MAX_LINE_BYTES
+    const oneLine = `${JSON.stringify({
+      ts: "2026-01-01T00:00:00Z",
+      id: REAL_ULID,
+      actor: "alice",
+      ticket: "ck-1",
+      event: "hook",
+      title: "t",
+      output: bigOutput,
+    })}\n`;
+    const linesPerMonth = Math.ceil((55 * 1024 * 1024) / Buffer.byteLength(oneLine, "utf8"));
+    const monthContent = oneLine.repeat(linesPerMonth);
+    // Each month's blob (~55MB) stays under MAX_MONTH_BLOB_BYTES (64MB);
+    // five of them (~275MB) exceed MAX_AGGREGATE_READ_BYTES (256MB).
+    expect(Buffer.byteLength(monthContent, "utf8")).toBeLessThan(64 * 1024 * 1024);
+
+    const months = ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05"];
+    let parent: Awaited<ReturnType<GitAdapter["readRef"]>> = null;
+    for (const month of months) {
+      const outcome = await adapter.commitTreeToRef(COORD_REF, {
+        parent,
+        message: `seed ${month}`,
+        files: [{ path: `events/${month}.jsonl`, content: monthContent }],
+      });
+      if (outcome.outcome !== "applied") throw new Error(`setup failed for ${month}`);
+      parent = outcome.sha;
+    }
+
+    const now = Date.parse("2026-05-15T00:00:00Z");
+    await expectCode(read(adapter, COORD_REF, { now, trailingMonths: 5 }), EventErrorCodes.EVENT_LOG_AGGREGATE_TOO_LARGE);
+  }, 60_000);
+});
+
+// ============================================================================
+// Fix round 1, S4/Ruling R20 — the fm10 ref gate, tested at every entry point
+// ============================================================================
+
+/** Raw plumbing for test setup only — never the adapter under test. Mirrors `git.test.ts`'s own helper. */
+function rawGit(cwd: string, args: string[]): string {
+  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} (cwd=${cwd}) failed:\n${result.stderr.toString()}`);
+  }
+  return result.stdout.toString();
+}
+
+describe("the fm10 ref gate — append/read/initRef all reject a ref outside refs/cankan/", () => {
+  test("append rejects refs/heads/main", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await expectCode(append(adapter, "refs/heads/main", claim("ck-1"), { now: SEPT_15_MS }), GitErrorCodes.GIT_REF_INVALID);
+  });
+
+  test("read rejects refs/heads/main", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await expectCode(read(adapter, "refs/heads/main", { now: SEPT_15_MS }), GitErrorCodes.GIT_REF_INVALID);
+  });
+
+  test("append rejects a coordination ref that is itself a symbolic ref, and refs/heads/main is left unmoved", async () => {
+    const repo = await tempRepo();
+    const mainShaBefore = rawGit(repo.dir, ["rev-parse", "refs/heads/main"]).trim();
+    rawGit(repo.dir, ["symbolic-ref", COORD_REF, "refs/heads/main"]);
+    const adapter = await createGitAdapter(repo.dir);
+
+    await expectCode(append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY }), GitErrorCodes.GIT_REF_INVALID);
+
+    const mainShaAfter = rawGit(repo.dir, ["rev-parse", "refs/heads/main"]).trim();
+    expect(mainShaAfter).toBe(mainShaBefore);
   });
 });

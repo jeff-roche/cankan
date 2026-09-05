@@ -44,15 +44,43 @@ export const EventErrorCodes = {
    */
   EVENT_LOG_LINE_TOO_LARGE: "EVENT_LOG_LINE_TOO_LARGE",
   /**
-   * `read()` found a month blob whose total byte length exceeds
-   * `MAX_MONTH_BLOB_BYTES`. Unlike the line-level cap above, this check runs
-   * *after* `readBlobFromRef` has already returned the whole string —
-   * `GitAdapter` gives no way to size-check before materializing it — so
-   * this is a sanity/resource bound on already-allocated content, not a
-   * pre-allocation DoS guard the way the line cap is. See `log.ts`'s doc
-   * comment on `MAX_MONTH_BLOB_BYTES` for the full reasoning.
+   * A single month blob's total byte length exceeds `MAX_MONTH_BLOB_BYTES`.
+   * Raised in two places, sharing one code because they are the same bound
+   * enforced at the two points that can observe it: `read()`, checking a
+   * blob it just fetched via `readBlobFromRef` (necessarily *after* the
+   * whole string is already materialized — `GitAdapter` gives no way to
+   * size-check first, so this is a sanity/resource bound on already-
+   * allocated content, not a pre-allocation DoS guard the way the line cap
+   * is), and `append()` (fix round 1, S2), checking the *existing* blob
+   * it is about to extend, before building the new commit — closing the gap
+   * where a write could grow a month past what a read would ever accept.
+   * See `log.ts`'s doc comment on `MAX_MONTH_BLOB_BYTES` for the full
+   * reasoning.
    */
   EVENT_LOG_BLOB_TOO_LARGE: "EVENT_LOG_BLOB_TOO_LARGE",
+  /**
+   * `read()`'s aggregate cap (fix round 1, S2): the *sum* of every trailing
+   * month's blob size in one `read()` call's window exceeds
+   * `MAX_AGGREGATE_READ_BYTES`. The per-month cap above bounds one file;
+   * without a separate aggregate bound, a caller passing a large
+   * `trailingMonths` (M2.10's own documented contract on that parameter)
+   * could still be asked to hold `trailingMonths × MAX_MONTH_BLOB_BYTES` in
+   * memory at once — e.g. 1.5 GiB for a 24-month window at 64 MiB/month —
+   * which is a resource bound the per-month cap alone does not express.
+   */
+  EVENT_LOG_AGGREGATE_TOO_LARGE: "EVENT_LOG_AGGREGATE_TOO_LARGE",
+  /**
+   * `read()`'s or `append()`'s `trailingMonths`/window parameter was not a
+   * finite integer in the accepted range (fix round 1, S1). Degenerate
+   * values (`0`, a negative number, `NaN`) previously produced an empty
+   * month-key list and made `read()` resolve `[]` with no error — a
+   * fail-open in the one module whose whole disposition is fail-closed. A
+   * pathologically large value (a hostile, unbounded-digit config-derived
+   * lease producing `Infinity`, say) previously drove a synchronous,
+   * unbounded loop. Both are rejected here, before either failure mode can
+   * occur.
+   */
+  EVENT_LOG_INVALID_WINDOW: "EVENT_LOG_INVALID_WINDOW",
   /**
    * `read()` found a line that is not valid JSON, or is valid JSON that
    * fails `events/schema.ts` (ADR 0001:716-723, fm8, fm11). Fail-closed: the

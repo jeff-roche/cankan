@@ -86,6 +86,21 @@
  * a mitigation, not an atomic guarantee (a TOCTOU window remains between
  * the `lstat` walk and the `mkdir`, same caveat `config/layers.ts`'s own
  * `assertNotSymlink` documents for the identical class of check).
+ *
+ * **Consequence for step (b) and its test coverage:** because
+ * `assertNoSymlinkComponent` walks *every* existing path component
+ * including the final one, it now catches "`tickets_dir` is itself a
+ * symlink" (the case step (b) exists for) *before* `mkdir` even runs, for
+ * any symlink that was already there when this function was called. Step
+ * (b)'s post-`mkdir` `realpath` check therefore only fires today as a
+ * backstop against a symlink that appears in the TOCTOU window between
+ * the walk and the `mkdir` (or a `tickets_dir` value that resolves to
+ * something other than a directory that (a)'s check would have to also
+ * approve of, which is not currently a distinct case). No test in
+ * `ref.test.ts` reaches step (b) through a path the symlink-component
+ * guard does not already intercept -- flagged rather than left implicit,
+ * since a reviewer looking for "(a) and (b), each tested" would otherwise
+ * expect to find one.
  */
 
 import { lstat, mkdir, realpath } from "node:fs/promises";

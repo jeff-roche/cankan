@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { withEnv } from "../../../test-utils/src/withEnv";
 import { ensurePersonalBoard, resolvePersonalBoardPath } from "../../src/board/personal";
@@ -111,8 +111,12 @@ describe("ensurePersonalBoard -- canonicalization ruling (mandatory macOS-shaped
         expect(result.board.root).toBe(join(await realpath(symlinkedDataHome), "cankan", "personal"));
         expect(result.board.root.startsWith(symlinkedDataHome)).toBe(false);
 
-        const rel = result.board.ticketsDir.slice(result.board.root.length);
-        expect(rel.includes("..")).toBe(false);
+        // Containment by path-component semantics (ADR 0002, 542-630), not
+        // a string-prefix check: `path.relative` must be neither absolute
+        // nor begin with a ".." segment.
+        const rel = relative(result.board.root, result.board.ticketsDir);
+        expect(isAbsolute(rel)).toBe(false);
+        expect(rel.split(sep)[0]).not.toBe("..");
       } finally {
         await rm(linkParent, { recursive: true, force: true });
       }

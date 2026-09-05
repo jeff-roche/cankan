@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -152,6 +152,37 @@ describe("registry -- concurrent register()", () => {
   });
 });
 
+describe("registry -- stale lock breaking", () => {
+  test("a lockfile older than the staleness window is broken, not waited out", async () => {
+    await withEnv(undefined, async () => {
+      const board = await makeBoardDir();
+      try {
+        const env = hermeticEnv();
+        const registryPath = resolveRegistryPath(env);
+        if (!registryPath) throw new Error("test setup: registry path did not resolve");
+        await mkdir(join(registryPath, ".."), { recursive: true });
+
+        const lockPath = `${registryPath}.lock`;
+        await writeFile(lockPath, "");
+        // Back-date the lock well past the staleness window (10s) but
+        // within register()'s own bounded-retry timeout (5s) -- without
+        // the stale-break, register() would time out with
+        // REGISTRY_LOCK_TIMEOUT instead of succeeding quickly.
+        const staleTime = new Date(Date.now() - 30_000);
+        await utimes(lockPath, staleTime, staleTime);
+
+        const entry = await register("api", board.dir, env);
+        expect(entry.name).toBe("api");
+
+        const listing = await listRegisteredBoards(env);
+        expect(listing.boards.map((b) => b.name)).toEqual(["api"]);
+      } finally {
+        await board.cleanup();
+      }
+    });
+  });
+});
+
 describe("registry -- upsert semantics", () => {
   test("re-registering the same canonical path updates the existing row rather than duplicating it", async () => {
     await withEnv(undefined, async () => {
@@ -292,6 +323,27 @@ describe("registry -- findRegisteredBoard", () => {
         await boardA.cleanup();
         await boardB.cleanup();
       }
+    });
+  });
+
+  test("a registered name whose directory vanished is a typed error, never silently 'not found'", async () => {
+    await withEnv(undefined, async () => {
+      const gone = await makeBoardDir();
+      const env = hermeticEnv();
+      await register("gone", gone.dir, env);
+      await gone.cleanup();
+
+      let thrown: unknown;
+      let result: unknown;
+      try {
+        result = await findRegisteredBoard("gone", env);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(result).toBeUndefined();
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("BOARD_DIRECTORY_MISSING");
+      expect((thrown as Error).message).toContain("gone");
     });
   });
 });

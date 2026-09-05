@@ -27,6 +27,13 @@ export const BoardErrorCodes = {
   /** Neither `XDG_DATA_HOME` nor `HOME` resolved to an absolute path. */
   DATA_HOME_UNRESOLVABLE: "DATA_HOME_UNRESOLVABLE",
   /**
+   * `findRegisteredBoard()` found the requested name in the registry, but
+   * its directory no longer exists (or is no longer a directory) --
+   * distinct from "not registered at all" (which resolves to
+   * `undefined`), so a caller can tell a stale registration from a typo.
+   */
+  BOARD_DIRECTORY_MISSING: "BOARD_DIRECTORY_MISSING",
+  /**
    * ADR 0002 (docs/decisions/0002-ids-and-backlog-compat.md, 542-630)
    * containment check (a)/(b): a board's effective `tickets_dir` escapes
    * the board root, resolves into `<root>/.git`, or is reached through a

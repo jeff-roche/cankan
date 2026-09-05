@@ -253,6 +253,15 @@ export async function listRegisteredBoards(
  * lookups reject them" -- rather than simply returning `undefined` for it,
  * so a caller resolving `--board personal` (say) never mistakes "not
  * found" for "not a legal board name to look up."
+ *
+ * A name that *is* registered but whose directory `listRegisteredBoards`
+ * had to skip (deleted, or no longer a directory) is **not** treated the
+ * same as "never registered": returning `undefined` for it would be
+ * exactly the silent-drop the brief's robustness requirements forbid, on
+ * the one read path `--board <name>` actually uses. Instead this throws a
+ * typed `BOARD_DIRECTORY_MISSING` error naming the path and the reason, so
+ * a caller can tell "api is registered but its directory vanished" apart
+ * from "api was never registered."
  */
 export async function findRegisteredBoard(
   name: string,
@@ -261,8 +270,20 @@ export async function findRegisteredBoard(
   if (!isValidBoardName(name)) {
     throw invalidNameError(name);
   }
-  const { boards } = await listRegisteredBoards(env);
-  return boards.find((board) => board.name === name);
+  const { boards, skipped } = await listRegisteredBoards(env);
+  const found = boards.find((board) => board.name === name);
+  if (found) {
+    return found;
+  }
+  const missing = skipped.find((entry) => entry.name === name);
+  if (missing) {
+    throw new CanKanError(
+      BoardErrorCodes.BOARD_DIRECTORY_MISSING,
+      `board "${name}" is registered at ${missing.path}, but ${missing.reason}`,
+      { details: { name, path: missing.path, reason: missing.reason } },
+    );
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------

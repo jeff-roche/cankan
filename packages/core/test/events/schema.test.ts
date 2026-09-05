@@ -598,6 +598,27 @@ describe("fix round 1 H1 — rejection messages do not republish untrusted bytes
 });
 
 // ============================================================================
+// Fix round 1, finding L5 / Ruling R14 — free-text fields deliberately
+// still accept control characters; this locks in that decision so a future
+// change doesn't silently narrow it (or silently narrow `actor`'s tighter
+// guard the other way).
+// ============================================================================
+
+describe("fix round 1 L5 — free-text fields remain terminal-hostile by design", () => {
+  test("comment.text, close.reason, hook.output/title, and move.from/to all still accept a raw ANSI escape", () => {
+    const esc = "\x1b[31mhi\x1b[0m";
+    expect(parse(envelope({ event: "comment", text: esc })).ok).toBe(true);
+    expect(parse(envelope({ event: "close", reason: esc })).ok).toBe(true);
+    expect(parse(envelope({ event: "hook", title: esc, output: esc })).ok).toBe(true);
+    expect(parse(envelope({ event: "move", from: esc, to: "In Review" })).ok).toBe(true);
+  });
+
+  test("actor does NOT get this treatment — the one field moved into the stricter id-shape guard (Ruling R14)", () => {
+    expect(parse(envelope({ event: "release", actor: "\x1b[31mhi\x1b[0m" })).ok).toBe(false);
+  });
+});
+
+// ============================================================================
 // Fix round 1, finding M3 — length bounds on free-text fields.
 // ============================================================================
 

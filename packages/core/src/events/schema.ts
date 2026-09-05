@@ -510,6 +510,36 @@ const releaseEventSchema = z.object({ ...envelopeShape, event: z.literal("releas
 const expireEventSchema = z.object({ ...envelopeShape, event: z.literal("expire") }).strict();
 
 // ============================================================================
+// Terminal-hostile free text — fix round 1, finding L5, Ruling R14
+// ============================================================================
+//
+// `comment.text`, `close.reason`, `hook.output`, `hook.title`, and `move`'s
+// `from`/`to` accept raw control characters (including ANSI escapes), CR,
+// NUL, bidi overrides, and lone surrogates, on purpose. This is a
+// documented decision, not a gap. `hook.output` in particular is captured
+// shell output; real hooks legitimately emit ANSI color codes, and
+// rejecting them here would break M2.16 (not yet built) before it exists.
+//
+// The obligation this creates: the renderer, not this schema, must
+// neutralize these bytes before they reach a terminal. This is the same
+// parallel obligation this file already documents for `actor` (see
+// `actorSchema`'s "not an authenticated identity" comment) and for `ts`
+// (see `PROJECT_EPOCH`'s comment) — a field this schema validates the type
+// and shape of, but does not and should not sanitize for display, since
+// sanitizing for display is a rendering decision (what a terminal or
+// `--json` consumer does with the bytes), not a data-shape one. Whoever
+// builds CanKan's CLI renderer (not scoped to M2.7) must treat every one of
+// these five fields as untrusted for terminal output — the same H1 finding
+// this dispatch fixed inside its own failure messages applies with equal
+// force to a peer-authored `comment.text` displayed by `cankan show
+// --events`.
+//
+// `actor` is NOT in this bucket (Ruling R14) — see `actorSchema`'s own
+// comment: no legitimate actor id contains a control character, so `actor`
+// gets the structural id-shape guard above instead of this "leave it,
+// document it" treatment.
+
+// ============================================================================
 // Length bounds on free-text fields — fix round 1, finding M3
 // ============================================================================
 //

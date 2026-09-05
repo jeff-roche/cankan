@@ -63,6 +63,32 @@ export function monthKeyUtc(nowMs: number): string {
 const MAX_TRAILING_MONTHS = 120;
 
 /**
+ * Upper bound on `AppendOptions.casRetry.maxAttempts` (fix round 3 sweep,
+ * Ruling R27). `git/retry.ts`'s `withCasRetry` loop
+ * (`for (let attemptNumber = 1; attemptNumber <= maxAttempts; ...)`) does
+ * not validate `maxAttempts` itself — confirmed directly: `maxAttempts:
+ * Infinity` makes the loop condition always true, so the loop never
+ * terminates (ADR failure mode 2's "bounded retry" obligation defeated by
+ * a caller-supplied option); `maxAttempts: NaN` makes the loop condition
+ * `1 <= NaN`, which is always **false**, so the loop body never runs even
+ * once and `append` fails immediately with a misleading
+ * `GIT_CAS_CONTENTION_EXCEEDED` on a completely uncontended repo.
+ *
+ * **The guard properly belongs in `git/retry.ts` (M2.6), which this phase
+ * does not edit (Orchestrator Ruling R19) — reported as a follow-up
+ * recommendation.** `events/` is the reachable surface here because
+ * `append` is the module that *forwards* a caller-supplied `casRetry`
+ * option into `withCasRetry` unchecked; validating what this module
+ * forwards is in scope even though the consumer that would ideally
+ * validate its own input lives elsewhere. 10,000 is generous headroom over
+ * `withCasRetry`'s own default (50, "reasoned, not measured" per ADR
+ * 0001:622-629) — enough for deliberate stress-testing, bounded against a
+ * hostile or mistaken value that would otherwise hang indefinitely
+ * (`Infinity`) or immediately (`NaN`/`<= 0`).
+ */
+const MAX_CAS_ATTEMPTS = 10_000;
+
+/**
  * Validates `trailingMonths` before it drives any loop (fix round 1, S1).
  * Must be a finite integer in `[1, MAX_TRAILING_MONTHS]` — `0`, a negative
  * number, `NaN`, and `Infinity` are all rejected by `Number.isInteger`
@@ -82,30 +108,76 @@ function validateTrailingMonths(trailingMonths: number): void {
 }
 
 /**
- * Validates the clock reading both `append` and `read` accept as `now`
- * (fix round 2, NEW-2). `options.now ?? Date.now()` was previously
- * unvalidated in `read` while its sibling parameter, `trailingMonths`, was
- * — on the very next line — the exact class of oversight fix round 1's own
- * house rule warns about ("check the siblings at the same call site").
- * `now: NaN` makes `monthKeyUtc` produce the literal string `"NaN-NaN"`, so
- * `read`'s month-key window becomes a list of months that cannot exist —
- * `read()` silently resolves `[]` on a board that has real events, S1's
- * exact fail-open shape, just reached through the sibling parameter rather
- * than `trailingMonths` itself. `now: Infinity`/`-Infinity` has the same
- * effect in `read`, and in `append` additionally mints a ULID whose seed
- * time can never be beaten by a later real-clock call, permanently
- * degrading the shared `injectedClockUlidFactory` lane (fix round 1, S6) —
- * see that constant's doc comment. Not peer-reachable (`now` is a
- * caller-supplied clock reading, never read from the log), but reachable
- * with no attacker at all from an upstream `Date.parse` that returned
- * `NaN`. Raised **before** any git invocation, alongside
- * `validateTrailingMonths`.
+ * `Date`'s own representable range (fix round 3, M1). ECMA-262 defines a
+ * `Date`'s time-value domain as ±100,000,000 days relative to the epoch —
+ * exactly ±8.64e15 milliseconds. `monthKeyUtc` (via `new Date(nowMs)`)
+ * silently produces the literal string `"NaN-NaN"` for any *finite* `nowMs`
+ * outside this range — confirmed by probe (see task-2-report.md's
+ * fix-round-3 addendum): `monthKeyUtc(8_640_000_000_000_001)` is already
+ * `"NaN-NaN"`, a single millisecond past the boundary, despite
+ * `Number.isFinite` returning `true` for that input. **Fix round 2's
+ * `Number.isFinite`-only check (the since-removed `validateNow`) was
+ * therefore the wrong bound**: it rejects `NaN`/`±Infinity` but admits
+ * every one of the merely-very-large finite values that break
+ * `monthKeyUtc` anyway — the exact class of oversight this dispatch has
+ * now been asked to close three times (S1, NEW-2, and this one), each time
+ * because the bound was checked against "is it a number" rather than
+ * against what the number's actual consumer can represent.
  */
-function validateNow(now: number): void {
-  if (!Number.isFinite(now)) {
-    throw new CanKanError(EventErrorCodes.EVENT_LOG_INVALID_WINDOW, `now must be a finite number, got ${now}`, {
-      details: { now },
-    });
+const MAX_DATE_MS = 8_640_000_000_000_000;
+
+/**
+ * `ulid`'s own encodable maximum (fix round 3, M1) — a 48-bit millisecond
+ * timestamp. Confirmed directly for this fix: `monotonicFactory()(281_474_976_710_655)`
+ * succeeds; `monotonicFactory()(281_474_976_710_656)` throws `ULIDError`
+ * (`ENC_TIME_SIZE_EXCEED`); `monotonicFactory()(-1)` throws a raw,
+ * *unwrapped* `TypeError` from inside the package's own encoder (not even
+ * a `ULIDError`). Also confirmed: one out-of-range call **permanently
+ * poisons that factory instance** — a second call with an ordinary, valid
+ * timestamp still throws, echoing the *original* out-of-range value. Since
+ * `append`'s injected-clock calls share one persistent
+ * `injectedClockUlidFactory` instance across the process (fix round 1, S6),
+ * a single bad `now` does not just fail its own call: it fails every
+ * subsequent injected-clock `append` for the remainder of the process, an
+ * availability loss no caller-side retry can recover from.
+ *
+ * Strictly tighter than `MAX_DATE_MS` above (and non-negative, unlike it),
+ * so satisfying this bound automatically satisfies `monthKeyUtc`'s too —
+ * `append` (which reaches both `monthKeyUtc` and the ULID factory) needs
+ * only this one check, not both.
+ */
+const MAX_ULID_TIME_MS = 281_474_976_710_655;
+
+/**
+ * Validates a `now` that reaches date formatting only — `monthKeyUtc`, via
+ * `read`'s and `initRef`'s month-key computation — never a ULID factory.
+ * Used by `read` (this file) and, via the module-internal export below, by
+ * `ref.ts`'s `initRef` (fix round 3 sweep: `initRef` previously validated
+ * no `now` at all — see task-2-report.md's fix-round-3 addendum).
+ */
+export function validateNowForDateFormatting(now: number): void {
+  if (!Number.isFinite(now) || now < -MAX_DATE_MS || now > MAX_DATE_MS) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+      `now must be within Date's representable range [-${MAX_DATE_MS}, ${MAX_DATE_MS}], got ${now}`,
+      { details: { now, minValue: -MAX_DATE_MS, maxValue: MAX_DATE_MS } },
+    );
+  }
+}
+
+/**
+ * Validates a `now` that ALSO reaches the ULID factory — `append` only.
+ * `[0, MAX_ULID_TIME_MS]` is strictly tighter than
+ * `validateNowForDateFormatting`'s range, so `append` needs only this one
+ * check to cover both of its consumers' domains.
+ */
+function validateNowForMinting(now: number): void {
+  if (!Number.isFinite(now) || now < 0 || now > MAX_ULID_TIME_MS) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+      `now must be within ulid's encodable range [0, ${MAX_ULID_TIME_MS}], got ${now}`,
+      { details: { now, minValue: 0, maxValue: MAX_ULID_TIME_MS } },
+    );
   }
 }
 
@@ -524,10 +596,12 @@ export async function appendCore(
   // a bad ref and a bad `now` reports the ref problem, not the clock one.
   const validatedRef = await validateCoordinationRef(ref);
   const now = options.now ?? Date.now();
-  // Fix round 2, NEW-2: `now` must be finite — see `validateNow`'s doc
-  // comment for why an unvalidated NaN/Infinity here is more than a read()
-  // problem (it also poisons the injected-clock ULID lane below).
-  validateNow(now);
+  // Fix round 3, M1: `append` reaches both `monthKeyUtc` and the ULID
+  // factory, so it validates against the *tighter* of the two domains —
+  // see `validateNowForMinting`'s doc comment for why `Number.isFinite`
+  // alone (fix round 2's bound) was not tight enough, and for the
+  // unwrapped `ULIDError`/permanent-poisoning consequence of skipping this.
+  validateNowForMinting(now);
   // Fix round 1, S6: an injected `now` uses the separate, equally
   // persistent `injectedClockUlidFactory` lane rather than the real-clock
   // `defaultUlidFactory` — see both constants' doc comments for why two
@@ -546,6 +620,19 @@ export async function appendCore(
       EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
       `maxExistingBlobBytes must be a non-negative number (or Infinity), got ${maxExistingBlobBytes}`,
       { details: { maxExistingBlobBytes } },
+    );
+  }
+  // Fix round 3 sweep, Ruling R27: `casRetry.maxAttempts` is forwarded
+  // as-is to `withCasRetry` (`git/retry.ts`), which does not validate it
+  // itself — see `MAX_CAS_ATTEMPTS`'s doc comment for the two distinct
+  // failure shapes (`Infinity` hangs forever; `NaN`/`<= 0` fails every
+  // attempt immediately) an unvalidated value produces.
+  const casMaxAttempts = options.casRetry?.maxAttempts;
+  if (casMaxAttempts !== undefined && (!Number.isInteger(casMaxAttempts) || casMaxAttempts < 1 || casMaxAttempts > MAX_CAS_ATTEMPTS)) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+      `casRetry.maxAttempts must be an integer in [1, ${MAX_CAS_ATTEMPTS}], got ${casMaxAttempts}`,
+      { details: { maxAttempts: casMaxAttempts, max: MAX_CAS_ATTEMPTS } },
     );
   }
 
@@ -809,12 +896,15 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
   const validatedRef = await validateCoordinationRef(ref);
   const now = options.now ?? Date.now();
   const trailingMonths = options.trailingMonths ?? DEFAULT_TRAILING_MONTHS;
-  // Fix round 1, S1 / fix round 2, NEW-2: validated before any further git
+  // Fix round 1, S1 / fix round 3, M1: validated before any further git
   // invocation and before the month-key loop — a degenerate `trailingMonths`
   // (0, negative, NaN) or a pathologically large one (a hostile
-  // config-derived Infinity), and a non-finite `now` (NaN/Infinity, e.g.
-  // from an upstream `Date.parse` failure), would otherwise reach unguarded.
-  validateNow(now);
+  // config-derived Infinity), and a `now` outside `Date`'s own
+  // representable range (not merely non-finite — see
+  // `validateNowForDateFormatting`'s doc comment), would otherwise reach
+  // `monthKeyUtc` unguarded and silently produce a month-key list of
+  // months that cannot exist.
+  validateNowForDateFormatting(now);
   validateTrailingMonths(trailingMonths);
 
   const head = await adapter.readRef(validatedRef);

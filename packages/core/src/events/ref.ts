@@ -22,22 +22,25 @@ import { CanKanError, isCanKanError } from "../errors";
 import type { GitAdapter } from "../git/index";
 import { GitErrorCodes, validateCoordinationRef } from "../git/index";
 import { EventErrorCodes } from "./errors";
-import { monthKeyUtc } from "./log";
+import { monthKeyUtc, validateNowForDateFormatting } from "./log";
 
 /**
  * A path used only to probe whether a ref's resolved target behaves like a
- * tree-ish object (fix round 1, S3) — see `assertRefIsUsable`. Not a real
+ * tree-ish object (fix round 1, S3) — see `checkRefUsability`. Not a real
  * month file name, so an *accidental* collision with a legitimate,
  * already-populated coordination ref is not a concern. **This does not mean
  * a hostile collision is impossible** (fix round 2, NEW-1) — this module's
  * own stated trust model is "whoever has push access," and a peer with push
  * access controls the *entire* tree, including whatever path is chosen
  * here. Choosing a different or less-guessable path would not close that;
- * see `assertRefIsUsable`'s doc comment for the actual fix (distinguishing
+ * see `checkRefUsability`'s doc comment for the actual fix (distinguishing
  * *which* failure a collision here produces, not hiding the collision
  * surface).
  */
 const USABILITY_PROBE_PATH = "events/.cankan-ref-usability-probe";
+
+/** `checkRefUsability`'s result — see that function's doc comment for what each value means and how `initRefCore` reacts to it. */
+type RefUsability = "usable" | "absent" | "unusable";
 
 /**
  * `readRef` returning non-null only proves *some* git object exists at
@@ -52,8 +55,8 @@ const USABILITY_PROBE_PATH = "events/.cankan-ref-usability-probe";
  * `USABILITY_PROBE_PATH`: `readBlobFromRef` resolves `ref` to a commit and
  * runs `ls-tree` against it, which requires its target to be tree-ish. A
  * blob target fails that call outright (`ls-tree` cannot list a blob) with
- * `GIT_COMMAND_FAILED` — the one failure this function converts into a
- * named, diagnosable `EVENT_REF_UNUSABLE`.
+ * `GIT_COMMAND_FAILED` — the one failure this function reports as
+ * `"unusable"`.
  *
  * **Fix round 2, NEW-1 — `GIT_BLOB_AMBIGUOUS` is not evidence of an
  * unusable ref; it is proof of the opposite, and the first version of this
@@ -70,11 +73,28 @@ const USABILITY_PROBE_PATH = "events/.cankan-ref-usability-probe";
  * `append`/`read` against that same ref continued to work fine. A fix for
  * a fail-open that creates a peer-triggerable fail-closed is strictly
  * worse than the fail-open it replaced. `GIT_BLOB_AMBIGUOUS` is therefore
- * treated as "usable" (this function returns normally); only
- * `GIT_COMMAND_FAILED` — a genuine "not tree-ish at all" failure, the blob
- * case this function exists to catch — is treated as unusable. Any other
- * error is also treated as unusable (fail closed on the unexpected), since
- * only `GIT_BLOB_AMBIGUOUS` has a proven benign explanation.
+ * reported as `"usable"`; only `GIT_COMMAND_FAILED` — a genuine "not
+ * tree-ish at all" failure, the blob case this function exists to catch —
+ * is reported as `"unusable"`.
+ *
+ * **Fix round 3, L2 — `GIT_REF_NOT_FOUND` is reported as `"absent"`, not
+ * `"unusable"`.** `readBlobFromRef` throws this when the ref itself
+ * doesn't exist at the moment the probe's own internal `readRef` resolves
+ * it — a TOCTOU window between `initRefCore`'s own `readRef` (which found
+ * the ref present) and this probe running a moment later, opened by a
+ * *concurrent local process* deleting or resetting the ref in between (not
+ * peer-triggerable: a remote peer's own ref state has no way to delete
+ * this clone's local `refs/cankan/*`). `initRef`'s entire job is "make the
+ * ref exist" — treating a ref that turns out to be absent as a hard
+ * failure, when the very next thing this function would otherwise do is
+ * create one, is the same fail-closed-on-a-benign-condition shape NEW-1
+ * fixed in this function's *other* branch. `initRefCore` reacts to
+ * `"absent"` by falling through to the same create-the-ref logic it uses
+ * when its own `readRef` found nothing in the first place.
+ *
+ * Any other error is reported as `"unusable"` (fail closed on the
+ * unexpected) — only `GIT_BLOB_AMBIGUOUS` and `GIT_REF_NOT_FOUND` have a
+ * proven benign explanation.
  *
  * **Known residual gap, out of this fix's reach (Orchestrator Ruling
  * R19).** A ref planted at a raw **tree**, or at **any annotated tag**
@@ -98,27 +118,37 @@ const USABILITY_PROBE_PATH = "events/.cankan-ref-usability-probe";
  * ref, which is worse than leaving this one case undetected until the
  * M2.6 addition lands.
  */
-async function assertRefIsUsable(adapter: GitAdapter, validatedRef: string, resolvedSha: string): Promise<void> {
+async function checkRefUsability(adapter: GitAdapter, validatedRef: string): Promise<RefUsability> {
   try {
     await adapter.readBlobFromRef(validatedRef, USABILITY_PROBE_PATH);
+    return "usable";
   } catch (cause) {
-    if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
-      return;
+    if (isCanKanError(cause)) {
+      if (cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
+        return "usable";
+      }
+      if (cause.code === GitErrorCodes.GIT_REF_NOT_FOUND) {
+        return "absent";
+      }
     }
-    throw new CanKanError(
-      EventErrorCodes.EVENT_REF_UNUSABLE,
-      `ref exists but does not resolve to a usable coordination ref: ${validatedRef}`,
-      // Fix round 2, NEW-3 (the spirit of it, not the letter): ADR
-      // 0001:1176-1178 asks for the offending object identified alongside
-      // the ref. There is no *commit* to name here — the whole defect is
-      // that `validatedRef` does not resolve to one — so `sha` (not
-      // `commit`) is the object it actually resolved to instead, already
-      // in the caller's hands from its own `readRef` call and safe to
-      // publish for the same module-derived reason `log.ts`'s `commit`
-      // fields are.
-      { cause, details: { ref: validatedRef, sha: resolvedSha } },
-    );
+    return "unusable";
   }
+}
+
+function refUnusableError(validatedRef: string, resolvedSha: string, cause: unknown): CanKanError {
+  return new CanKanError(
+    EventErrorCodes.EVENT_REF_UNUSABLE,
+    `ref exists but does not resolve to a usable coordination ref: ${validatedRef}`,
+    // Fix round 2, NEW-3 (the spirit of it, not the letter): ADR
+    // 0001:1176-1178 asks for the offending object identified alongside
+    // the ref. There is no *commit* to name here — the whole defect is
+    // that `validatedRef` does not resolve to one — so `sha` (not
+    // `commit`) is the object it actually resolved to instead, already
+    // in the caller's hands from its own `readRef` call and safe to
+    // publish for the same module-derived reason `log.ts`'s `commit`
+    // fields are.
+    { cause, details: { ref: validatedRef, sha: resolvedSha } },
+  );
 }
 
 export interface InitRefOptions {
@@ -127,18 +157,25 @@ export interface InitRefOptions {
    * content `""`) `commitTreeToRef` requires at least one file to write.
    * Defaults to `Date.now()`. Injectable for the same reason as `append`'s
    * `now` — a test can pin which month key gets created without waiting for
-   * real time.
+   * real time. Validated (fix round 3 sweep) via `log.ts`'s
+   * `validateNowForDateFormatting` — `initRef` only ever feeds `now` to
+   * `monthKeyUtc`, never a ULID factory, so it needs that (wider) bound,
+   * not `append`'s tighter one. Previously **not validated at all**: an
+   * unguarded `initRef({now: NaN})` committed a permanent
+   * `events/NaN-NaN.jsonl` onto the board's coordination root, a file
+   * `read()` can never see.
    */
   readonly now?: number;
 }
 
 /**
- * Test-only injection point for `initRefCore`'s single CAS attempt — the
- * same pattern as `log.ts`'s `AppendHooks`, and **not part of the public
- * surface**: `initRefCore` is not re-exported from `events/index.ts`, so no
- * normal caller (only a test importing it directly, the way `git.test.ts`
- * imports `updateRefCASCore`) can reach this hook. `initRef`, the public
- * function, calls `initRefCore` with no hooks.
+ * Test-only injection point for `initRefCore`'s single CAS attempt and its
+ * usability check — the same pattern as `log.ts`'s `AppendHooks`, and
+ * **not part of the public surface**: `initRefCore` is not re-exported
+ * from `events/index.ts`, so no normal caller (only a test importing it
+ * directly, the way `git.test.ts` imports `updateRefCASCore`) can reach
+ * either hook. `initRef`, the public function, calls `initRefCore` with no
+ * hooks.
  */
 export interface InitRefHooks {
   /**
@@ -150,6 +187,15 @@ export interface InitRefHooks {
    * real processes and hoping.
    */
   readonly beforeCas?: () => Promise<void>;
+  /**
+   * Invoked once, after `readRef` has found the ref **present**, and
+   * immediately before `checkRefUsability` probes it (fix round 3, L2). A
+   * test uses this to delete the ref via a real `git update-ref -d`
+   * between the two, reproducing the exact TOCTOU window
+   * `checkRefUsability`'s `"absent"` branch exists to handle — a
+   * concurrent local process racing `initRef`, not a peer.
+   */
+  readonly beforeUsabilityCheck?: () => Promise<void>;
 }
 
 /**
@@ -159,18 +205,21 @@ export interface InitRefHooks {
  *
  * **The algorithm** (verified against the real git adapter for this
  * dispatch, not assumed — see task-2-report.md's `parent: null` probe):
- * `readRef` → if non-`null`, the ref already exists, nothing to do. If
- * `null`, attempt `commitTreeToRef` with `parent: null` (M2.6's documented
- * meaning: "the ref must not exist yet") carrying a single placeholder
+ * `readRef` → if non-`null`, confirm the ref is usable (`checkRefUsability`)
+ * and, if so, nothing to do. If `null` (or found present but then
+ * confirmed `"absent"` by the usability check — fix round 3, L2), attempt
+ * `commitTreeToRef` with `parent: null` (M2.6's documented meaning: "the
+ * ref must not exist yet") carrying a single placeholder
  * `events/<yyyy-mm>.jsonl` file with empty content (`CommitTreeParams.files`
  * requires at least one file; an empty blob is a well-formed, zero-line
  * month file per `log.ts`'s `splitJsonlLines`). If that CAS applies, this
  * call created the ref. If it is rejected, a concurrent caller won the race
  * — confirmed directly that the loser's rejection is `"reference already
  * exists"` and the winner's content is left completely unchanged — so this
- * function re-reads once and accepts whatever now exists; there is no
- * write left for the loser to retry, because the goal ("the ref exists") is
- * already satisfied by the winner.
+ * function re-reads once and accepts whatever now exists (after confirming
+ * *that* ref is usable too); there is no write left for the loser to
+ * retry, because the goal ("the ref exists, usably") is already satisfied
+ * by the winner.
  *
  * Only **one** CAS attempt is made, not a bounded retry loop: after a
  * rejection, the only outcome this function is trying to reach (some valid
@@ -195,13 +244,28 @@ export async function initRefCore(
 
   const existing = await adapter.readRef(validatedRef);
   if (existing !== null) {
-    // Fix round 1, S3: confirm the ref is usable before reporting success —
-    // see `assertRefIsUsable`'s doc comment.
-    await assertRefIsUsable(adapter, validatedRef, existing);
-    return;
+    await hooks.beforeUsabilityCheck?.();
+    // Fix round 1, S3 / fix round 3, L2: confirm the ref is usable before
+    // reporting success — see `checkRefUsability`'s doc comment for what
+    // each outcome means.
+    const usability = await checkRefUsability(adapter, validatedRef);
+    if (usability === "usable") {
+      return;
+    }
+    if (usability === "unusable") {
+      throw refUnusableError(validatedRef, existing, undefined);
+    }
+    // usability === "absent": the ref existed a moment ago but is gone now
+    // (a concurrent local deletion/reset) — fall straight through to the
+    // same create-the-ref logic below used when `readRef` found nothing in
+    // the first place, exactly as if this whole branch had never run.
   }
 
   const now = options.now ?? Date.now();
+  // Fix round 3 sweep: `initRef` previously validated no `now` at all —
+  // see `InitRefOptions.now`'s doc comment for the permanent
+  // `events/NaN-NaN.jsonl` this let through.
+  validateNowForDateFormatting(now);
   const path = `events/${monthKeyUtc(now)}.jsonl`;
 
   await hooks.beforeCas?.();
@@ -219,15 +283,16 @@ export async function initRefCore(
   // Lost the race: a concurrent initializer's `parent: null` CAS applied
   // first. Re-read and accept the winner's ref — there is nothing to build
   // onto, because the only postcondition this function promises ("the ref
-  // exists") is already true once *some* writer's `parent: null` commit has
-  // applied.
+  // exists, usably") is already true once *some* writer's `parent: null`
+  // commit has applied.
   const winner = await adapter.readRef(validatedRef);
   if (winner === null) {
     // A CAS rejection here means "the ref already exists" (see the
     // `parent: null` probe in task-2-report.md) — a re-read finding nothing
     // immediately after would mean the ref was both created and removed
-    // between this function's own rejected write and its own next read, a
-    // sequence nothing in this design performs. Surfaced as a hard error
+    // again between this function's own rejected write and its own next
+    // read. This function's single-attempt design (documented above) does
+    // not loop to chase that a second time; surfaced as a hard error
     // rather than silently looping on an assumption that no longer holds.
     throw new CanKanError(
       EventErrorCodes.EVENT_REF_INIT_RACE_UNRESOLVED,
@@ -237,7 +302,22 @@ export async function initRefCore(
   }
 
   // Fix round 1, S3: the winner might not be a usable coordination ref
-  // either (see `assertRefIsUsable`) — confirm before reporting success
-  // here too, symmetrically with the `existing !== null` branch above.
-  await assertRefIsUsable(adapter, validatedRef, winner);
+  // either — confirm before reporting success here too, symmetrically with
+  // the branch above. A winner that itself reports `"absent"` here (the
+  // ref vanishing yet again, immediately after this function's own
+  // re-read just found it) is treated the same as `winner === null` above
+  // — the same single-attempt reasoning applies a second time rather than
+  // this function growing a retry loop to chase an increasingly
+  // pathological race.
+  const winnerUsability = await checkRefUsability(adapter, validatedRef);
+  if (winnerUsability === "unusable") {
+    throw refUnusableError(validatedRef, winner, undefined);
+  }
+  if (winnerUsability === "absent") {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_REF_INIT_RACE_UNRESOLVED,
+      "the ref existed immediately after this function's own write, but vanished again before it could be confirmed usable",
+      { details: { ref: validatedRef } },
+    );
+  }
 }

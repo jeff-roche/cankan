@@ -23,6 +23,7 @@
  */
 const COORDINATION_REF_PATTERN = /^refs\/cankan\/[A-Za-z0-9._/-]+$/;
 
+import { tmpdir } from "node:os";
 import { CanKanError } from "../errors";
 import { GitErrorCodes } from "./errors";
 
@@ -83,6 +84,12 @@ export async function validateCoordinationRef(ref: string): Promise<string> {
   // 129), so `--end-of-options` is not merely unnecessary here, it is not
   // accepted.
   const proc = Bun.spawn(["git", "check-ref-format", ref], {
+    // `check-ref-format` doesn't consult the working directory at all, but
+    // `cwd` is pinned to a directory this module doesn't otherwise touch
+    // rather than left to inherit `process.cwd()` — this module's own stated
+    // principle (never rely on the host process's current directory) holds
+    // without a "except here, harmlessly" footnote.
+    cwd: tmpdir(),
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, LC_ALL: "C" },

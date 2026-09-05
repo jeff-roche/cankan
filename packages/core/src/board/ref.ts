@@ -136,8 +136,18 @@ export interface BuildBoardRefOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
 }
 
-/** `path.relative`-based containment: is `resolved` equal to, or beneath, `base`? Never a string prefix (see file header, F1). */
-function isContained(base: string, resolved: string): boolean {
+/**
+ * `path.relative`-based containment: is `resolved` equal to, or beneath,
+ * `base`? Never a string prefix (see file header, F1).
+ *
+ * Exported (dispatch B, `resolve.ts`/`registry.ts` fix round 1, finding
+ * F1): the personal-board privacy checks in both of those files need the
+ * exact same "equal to or beneath" test this file already uses for ADR
+ * 0002's `tickets_dir` containment -- reusing it here rather than
+ * re-deriving a second copy that could drift from this one (or reopen the
+ * same string-prefix mistake F1 already fixed once in this file).
+ */
+export function isContained(base: string, resolved: string): boolean {
   const rel = relative(base, resolved);
   if (rel === "") return true;
   if (isAbsolute(rel)) return false;

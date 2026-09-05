@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -746,4 +746,75 @@ describe("the sink", () => {
     expect(outcomes).toHaveLength(1);
     expect(outcomes[0]?.exitCode).toBe(0);
   });
+});
+
+describe("fix round 2, finding 4: the deadline timer must not keep the process alive after the hook finishes", () => {
+  // No in-process test can observe this: `bun:test`'s runner does not wait
+  // on pending timers before a test/suite completes (that's exactly why a
+  // 400+-test suite full of 30s-default hooks finishes in under 2s), so an
+  // uncleared timer is invisible from inside the process that leaked it.
+  // This spawns a *real*, separate `bun` process that calls `runHooks`
+  // once and falls off the end with no explicit `process.exit()` -- if
+  // anything left a live timer behind, the child simply won't exit until
+  // that timer fires.
+  test("a fast hook does not keep a real child process alive for the rest of timeoutMs", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cankan-hooks-timer-leak-"));
+    try {
+      // Absolute path computed at test time (not hardcoded) so this works
+      // from any checkout -- `bun run` on the generated script below needs
+      // a real filesystem path to import, not a package specifier.
+      const runnerPath = join(import.meta.dir, "..", "..", "src", "hooks", "runner.ts");
+      const scriptPath = join(dir, "probe.ts");
+      // A fake ConfigResult inlined directly (not imported from this test
+      // file) -- this script runs as its own separate `bun` process with
+      // no access to this file's module scope. `runHooks` only ever reads
+      // `.layers`, so `.value`/`.resolved`/`.entries` need no real shape
+      // here (this file is transpiled and run, never type-checked, by
+      // `bun run`).
+      const script = `
+import { runHooks } from ${JSON.stringify(runnerPath)};
+
+const cfg = {
+  value: {},
+  layers: [{ layer: "repo", file: "/fake/.cankan/config.yml", data: { hooks: { close: "true" } } }],
+  resolved: () => undefined,
+  entries: () => [],
+};
+
+const startedAt = Date.now();
+await runHooks({ cfg, event: "close", repoRoot: ${JSON.stringify(dir)}, timeoutMs: 500 });
+console.log("runHooks resolved at +" + (Date.now() - startedAt) + "ms");
+`;
+      await writeFile(scriptPath, script);
+
+      const startedAt = Date.now();
+      const proc = Bun.spawn({
+        cmd: ["bun", "run", scriptPath],
+        cwd: dir,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      const exitCode = await proc.exited;
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(stderr).toBe("");
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain("runHooks resolved at +");
+      // Before the fix: the process stayed alive for essentially the
+      // whole 500ms `timeoutMs` (the leaked deadline timer) even though
+      // `runHooks` itself resolved in a few ms (findings file: a
+      // default-30s-timeout hook returning in ~3ms kept the real process
+      // alive for +30002ms). After the fix, the entire process -- bun
+      // startup, the hook, and exit -- should complete in a small
+      // fraction of that.
+      expect(elapsedMs).toBeLessThan(300);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
 });

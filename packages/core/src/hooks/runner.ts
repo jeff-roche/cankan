@@ -191,6 +191,14 @@ export interface HookOutcome {
   exitCode: number | null;
   /** The signal that ended the process, if any (e.g. after a timeout kill). */
   signal: string | null;
+  /**
+   * `true` together with `exitCode: 0` and `signal: null` is a reachable
+   * combination (fix round 2, finding 6): the hook's own direct child can
+   * exit cleanly while a backgrounded grandchild it never detached lingers
+   * past `timeoutMs` (see `runGroupToCompletion`'s doc comment) -- the
+   * group, not the exit code, is what timed out. Do not read `timedOut` as
+   * implied by, or implying, a non-zero `exitCode`.
+   */
   timedOut: boolean;
   /** Present only for a hook that failed in a way `HooksErrorCodes` names. */
   errorCode?: string;
@@ -276,15 +284,26 @@ type HookSubprocess = Subprocess<"ignore", "pipe", "pipe">;
  * failure here must not become an uncaught exception aborting every other
  * hook still queued to run.
  *
- * **Fix round 1, finding note on pid reuse (recorded, not fixed here):**
- * once every member of the original group has exited, the OS is free to
- * reuse that numeric id for an unrelated process's pid (which, if *that*
- * process happens to also be its own group leader, would make it an
- * unrelated victim of a stray signal here). This is a pre-existing,
- * accepted risk class, not something this round changes -- the fix below
- * calls this function exactly as many times as before (one `SIGTERM`, at
- * most one `SIGKILL`); it does not add repeated kill attempts, which would
- * widen this exposure window rather than merely inherit it.
+ * **Fix round 1, finding note on pid reuse (recorded, not fixed here;
+ * corrected in fix round 2, finding 5):** once every member of the
+ * original group has exited, the OS is free to reuse that numeric id for
+ * an unrelated process's pid (which, if *that* process happens to also be
+ * its own group leader, would make it an unrelated victim of a stray
+ * signal here). This is a pre-existing, accepted risk class.
+ *
+ * The *call count* is unchanged by fix round 1 -- verified both
+ * structurally and empirically (`runGroupToCompletion` sends at most one
+ * `SIGTERM` and at most one `SIGKILL`, each inside a block that executes
+ * once) -- but the *decision window* is not: the old timer could only ever
+ * fire while the leader was still alive (`killAfterTimeout` cleared it the
+ * instant the leader exited), whereas this function can now be reached up
+ * to `timeoutMs` after the leader's pid became reusable, gated on
+ * `isGroupAlive`'s `kill(-pgid, 0)` poll, which has no way to distinguish
+ * the original group from a coincidentally-reused pgid. That wider window
+ * needs pid wraparound within seconds *and* the recycled pid landing on
+ * another group leader to matter -- low likelihood, and inherent to
+ * killing a group correctly after its leader is gone, which is exactly
+ * what fix round 1 was required to do. Accepted, not fixed here.
  */
 function killGroupSafely(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
   try {
@@ -320,6 +339,25 @@ function isGroupAlive(pid: number): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Like `sleep`, but exposes a `cancel()` that clears the underlying timer.
+ * Used only for `runGroupToCompletion`'s single deadline race (fix round 2,
+ * finding 4) -- `sleep`'s ordinary uses (`waitForGroupEmpty`'s poll
+ * interval) are always awaited to completion one at a time, so they never
+ * outlive the function that started them; a `Promise.race` timer can, if
+ * the *other* side of the race wins, and a plain `setTimeout` handle keeps
+ * the event loop alive until it actually fires regardless of who's still
+ * listening. Deliberately not a change to `sleep` itself: `waitForGroupEmpty`
+ * must keep using real, un-unref'd timers to stay scheduled while polling.
+ */
+function cancellableSleep(ms: number): { promise: Promise<void>; cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout>;
+  const promise = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  return { promise, cancel: () => clearTimeout(timer) };
 }
 
 /**
@@ -371,7 +409,8 @@ async function waitForGroupEmpty(pid: number, boundMs: number): Promise<boolean>
  * comment; this is what avoids assuming Linux-only behaviour about
  * `kill(-pgid)` post-leader-exit). The escalation (`SIGTERM` -> grace ->
  * `SIGKILL`) is sent exactly once each, never repeated -- see
- * `killGroupSafely`'s note on not widening the pid-reuse window.
+ * `killGroupSafely`'s note on the pid-reuse window this widens (in timing,
+ * not in call count) as an accepted cost of killing a group correctly.
  */
 async function runGroupToCompletion(proc: HookSubprocess, timeoutMs: number): Promise<boolean> {
   const pid = proc.pid;
@@ -383,13 +422,23 @@ async function runGroupToCompletion(proc: HookSubprocess, timeoutMs: number): Pr
   // this settles via `proc.exited` or the deadline, the group might still
   // have members afterward (a lingering grandchild) -- that is checked
   // next, not assumed away by the direct child having exited.
+  //
+  // Fix round 2, finding 4: the deadline timer is explicitly cancelled the
+  // moment the race settles, regardless of which side won. Left uncleared,
+  // a `proc.exited` win (the overwhelmingly common, fully successful case)
+  // still left this timer pending for the rest of `timeoutMs`, keeping the
+  // event loop -- and so the whole CLI process -- alive that whole time
+  // after the hook had already finished (measured: a default-timeout hook
+  // returning in ~3ms kept the process alive for +30002ms).
   let deadlineHitBeforeExit = false;
+  const deadlineSleep = cancellableSleep(Math.max(0, deadline - performance.now()));
   await Promise.race([
     proc.exited,
-    sleep(Math.max(0, deadline - performance.now())).then(() => {
+    deadlineSleep.promise.then(() => {
       deadlineHitBeforeExit = true;
     }),
   ]);
+  deadlineSleep.cancel();
 
   let timedOut = deadlineHitBeforeExit;
   if (!deadlineHitBeforeExit) {
@@ -496,6 +545,14 @@ async function readCapped(
  * all three of which this function's parameter type already carries. Do
  * not add a gate, flag, prompt, or partial trust model here or anywhere
  * else in this file.
+ *
+ * **`request.env` is used exactly as given -- this function does not call
+ * `sanitizeEnvValue`.** That NUL-stripping/length-capping defense (fix
+ * round 2, finding 6) lives at `runHooks`'s boundary, since `runHooks` is
+ * where attacker-influenced ticket content (`$TITLE` above all) enters.
+ * `spawnHook` is exported for direct, low-level use (white-box tests, and
+ * any future caller that bypasses `runHooks`); such a caller is
+ * responsible for sanitizing its own `env` first.
  */
 export async function spawnHook(request: HookSpawnRequest): Promise<HookExecutionResult> {
   const startedAt = performance.now();

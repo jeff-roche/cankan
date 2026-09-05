@@ -68,6 +68,25 @@ function gh(args: string[]): string {
   return result.stdout.toString();
 }
 
+/**
+ * Assign a milestone by its numeric id via the REST API.
+ *
+ * `gh issue edit --milestone <title>` resolves the title against *open*
+ * milestones only, so it fails with "'M0' not found" once a milestone is
+ * completed. The number always resolves.
+ */
+function setMilestone(repo: string, issue: number, milestone: number): void {
+  gh([
+    "api",
+    "-X",
+    "PATCH",
+    `repos/${repo}/issues/${issue}`,
+    "-F",
+    `milestone=${milestone}`,
+    "--silent",
+  ]);
+}
+
 function repoNameWithOwner(): string {
   return gh([
     "repo",
@@ -332,10 +351,13 @@ function main() {
     gh(["label", "list", "--repo", repo, "--json", "name", "--limit", "200"]),
   ) as { name: string }[];
   const existingLabels = new Set(existingLabelsRaw.map((l) => l.name));
+  // state=all: the API lists only open milestones by default, so a completed
+  // milestone would look absent and be re-created (422, and the sync dies
+  // before the body-rewrite pass).
   const existingMilestonesRaw: { title: string; number: number }[] = JSON.parse(
     gh([
       "api",
-      `repos/${repo}/milestones`,
+      `repos/${repo}/milestones?state=all`,
       "--paginate",
       "-q",
       "[.[] | {title,number}]",
@@ -376,7 +398,7 @@ function main() {
     const title = `[${m.id}] ${m.title}`;
     if (idToIssue.has(m.id)) {
       console.log(`= tracking issue ${title} (#${idToIssue.get(m.id)})`);
-      if (!dryRun)
+      if (!dryRun) {
         gh([
           "issue",
           "edit",
@@ -385,9 +407,13 @@ function main() {
           repo,
           "--title",
           title,
-          "--milestone",
-          m.id,
         ]);
+        setMilestone(
+          repo,
+          mustGet(idToIssue, m.id),
+          mustGet(existingMilestones, m.id),
+        );
+      }
     } else {
       console.log(`+ tracking issue ${title}`);
       if (!dryRun) {
@@ -400,11 +426,10 @@ function main() {
           title,
           "--body",
           "_(pending)_",
-          "--milestone",
-          m.id,
         ]);
         const num = Number.parseInt(lastSegment(url), 10);
         idToIssue.set(m.id, num);
+        setMilestone(repo, num, mustGet(existingMilestones, m.id));
       }
     }
   }
@@ -426,11 +451,14 @@ function main() {
           repo,
           "--title",
           title,
-          "--milestone",
-          task.milestone,
           "--add-label",
           labels.join(","),
         ]);
+        setMilestone(
+          repo,
+          mustGet(idToIssue, task.id),
+          mustGet(existingMilestones, task.milestone),
+        );
       }
     } else {
       console.log(
@@ -446,13 +474,12 @@ function main() {
           title,
           "--body",
           "_(pending)_",
-          "--milestone",
-          task.milestone,
           "--label",
           labels.join(","),
         ]);
         const num = Number.parseInt(lastSegment(url), 10);
         idToIssue.set(task.id, num);
+        setMilestone(repo, num, mustGet(existingMilestones, task.milestone));
       }
     }
   }
@@ -517,4 +544,11 @@ function main() {
   );
 }
 
-main();
+// Without this, a throw inside main() still leaves the process exiting 0 — a
+// half-finished sync (pass 1 applied, bodies not) reporting success.
+try {
+  main();
+} catch (err) {
+  console.error(err);
+  process.exit(1);
+}

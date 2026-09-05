@@ -80,6 +80,14 @@ describe("validateCoordinationRef", () => {
   });
 
   test("rejects refs/cankan/../heads/main — matches the regex but not check-ref-format", async () => {
+    // This is also the regression guard for a real defect this task found:
+    // `check-ref-format` fails with a bare non-zero exit and empty stderr,
+    // and simple-git's error detection requires both exit code *and* stderr
+    // to be non-empty to treat a task as failed. Routing this call through
+    // the shared simple-git chokepoint (rather than the direct spawn in
+    // `refValidation.ts`) makes this exact test fail — see that file's doc
+    // comment. If this test ever goes green for the wrong reason, it will
+    // be because someone "simplified" that call site back onto simple-git.
     await expectCode(
       validateCoordinationRef("refs/cankan/../heads/main"),
       GitErrorCodes.GIT_REF_INVALID,
@@ -664,13 +672,15 @@ describe("temp-index hygiene", () => {
 });
 
 describe("withEnv discipline", () => {
-  test("this module never reads or writes an XDG path or $HOME (no lease store is built here — see R4)", async () => {
-    // Not a functional test of the adapter — a structural guard proving the
-    // suite's own setup never touches the real home directory even though
-    // most of these tests don't call withEnv() directly. M2.6 builds no
-    // lease-observation store (R4: that is M2.7's, under
-    // $XDG_STATE_HOME/cankan/), so there is nothing in this module for
-    // withEnv() to guard — recorded here rather than silently omitted.
+  test("recorded rather than omitted: no test in this file needs withEnv", async () => {
+    // This test does not prove the adapter is safe around $HOME/XDG paths in
+    // some special way — it merely runs one ordinary operation inside
+    // withEnv() without incident. The real reason no test here depends on
+    // withEnv() is structural: M2.6 builds no lease-observation store (R4 —
+    // that is M2.7's, under $XDG_STATE_HOME/cankan/), so this module never
+    // reads or writes an XDG path or $HOME anywhere, and there is nothing
+    // for withEnv() to guard against. Recorded so the absence reads as a
+    // deliberate scope boundary rather than an oversight.
     await withEnv(undefined, async () => {
       const repo = await tempRepo();
       const adapter = await createGitAdapter(repo.dir);

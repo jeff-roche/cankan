@@ -154,11 +154,10 @@ describe("updateRefCAS — PLAN.md's floor and the inversion hazard", () => {
     // Observed for this task (git 2.55.0, 15 repeated races): the loser of a
     // race to *create* a not-yet-existing ref gets `reference already
     // exists`, not the ADR's literal `is at X but expected Y` form — both
-    // are the ref's actual state disagreeing with the compare value. Logged
-    // here (not just asserted) so the observed form is visible in test
-    // output, per the task brief.
-    console.log("CAS-rejection stderr observed (ref-creation race):", loser.stderr);
-    expect(loser.stderr).toMatch(/cannot lock ref/);
+    // are the ref's actual state disagreeing with the compare value.
+    // Asserted on the exact observed wording (see the task report for the
+    // full account) rather than logged.
+    expect(loser.stderr).toContain("reference already exists");
 
     const finalRef: string | null = await adapter.readRef(COORD_REF);
     expect(finalRef).not.toBeNull();
@@ -189,7 +188,7 @@ describe("updateRefCAS — PLAN.md's floor and the inversion hazard", () => {
 
     const loser = resultA.outcome === "rejected" ? resultA : resultB;
     if (loser.outcome !== "rejected") throw new Error("unreachable");
-    console.log("CAS-rejection stderr observed (value-mismatch race):", loser.stderr);
+    // The ADR's own stated form (0001:471-473), observed as-is here.
     expect(loser.stderr).toMatch(/cannot lock ref '[^']*': is at [0-9a-f]+ but expected [0-9a-f]+/);
   });
 
@@ -494,6 +493,12 @@ describe("diverged reconciliation (failure mode 3/4, R9)", () => {
     try {
       git(otherRoot, ["clone", repo.remoteDir, "other"]);
       otherDir = join(otherRoot, "other");
+      // A fresh clone has no local identity configured; unlike `dir` (which
+      // `makeTempRepo` configures), this environment's global identity (if
+      // any) cannot be relied on — CI runners typically have none, and
+      // `commit-tree` fails with "Author identity unknown" without it.
+      git(otherDir, ["config", "user.name", "CanKan Test"]);
+      git(otherDir, ["config", "user.email", "test@cankan.invalid"]);
       otherAdapter = await createGitAdapter(otherDir);
       expect((await otherAdapter.fetch("origin", COORD_REF)).outcome).toBe("ok");
       const baseline = (await otherAdapter.readRef(COORD_REF)) as RefSha;

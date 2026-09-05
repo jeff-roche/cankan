@@ -62,8 +62,21 @@ describe("makeTempRepo", () => {
     // relying on the host's own directory structure to happen to exercise
     // it — confirmed this reproduces the bug: reverting the `realpath()`
     // call in `tempRepo.ts` makes this exact test fail on this exact host.
-    const realBase = await mkdtemp(join(tmpdir(), "cankan-tmpdir-real-"));
-    const linkedBase = join(await realpath(tmpdir()), "cankan-tmpdir-link");
+    // Both bases this test constructs must themselves be canonical before
+    // they're used in a comparison — `tmpdir()` itself can be under a
+    // symlinked prefix (macOS: `/var/folders/...` -> `/private/var/...`),
+    // independent of the `TMPDIR`-symlink override this test adds on top.
+    // `realBase` was the one CI caught missing this: it held the
+    // unresolved `mkdtemp` result while `linkedBase` (one line down)
+    // already resolved `tmpdir()` first, so the two bases disagreed on
+    // this platform's own ambient symlink, not on the override this test
+    // introduces — the exact class of bug this test exists to catch.
+    const realBase = await realpath(await mkdtemp(join(tmpdir(), "cankan-tmpdir-real-")));
+    // Derived from `realBase`'s own `mkdtemp`-minted unique suffix, not a
+    // fixed name — parallel lanes running `bun test` concurrently on the
+    // same host would otherwise collide on a shared `symlink()` target and
+    // throw `EEXIST` before either lane's `finally` can clean up.
+    const linkedBase = `${realBase}-link`;
     await symlink(realBase, linkedBase);
 
     const previousTmpdir = process.env.TMPDIR;
@@ -75,9 +88,18 @@ describe("makeTempRepo", () => {
         // verbatim (confirmed: `TMPDIR=<link> bun -e 'console.log(require("os").tmpdir())'`
         // prints `<link>`, unresolved) — so if `makeTempRepo` returned
         // `mkdtemp`'s raw result, `repo.root` would start with
-        // `linkedBase`, not `realBase`. It must not.
+        // `linkedBase`, not `realBase`. These two are diagnostic — they
+        // locate which side of the symlink `repo.root` landed on — not the
+        // canonicalization proof itself: both `realBase` and `linkedBase`
+        // are already resolved forms on this host (and, after this fix,
+        // on macOS too), so the pair alone couldn't distinguish a
+        // genuinely canonical `repo.root` from one that merely happened to
+        // match a resolved base by coincidence.
         expect(repo.root.startsWith(linkedBase)).toBe(false);
         expect(repo.root.startsWith(realBase)).toBe(true);
+        // This is the actual proof, and does not depend on either base
+        // being correctly constructed: `repo.root` equals its own
+        // `realpath()`, full stop.
         expect(repo.root).toBe(await realpath(repo.root));
         expect(repo.dir).toBe(await realpath(repo.dir));
 

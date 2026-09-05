@@ -154,7 +154,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, type Stats } from "node:fs";
-import { chmod, link, lstat, mkdir, open, rm, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { CanKanError, isCanKanError } from "../errors";
@@ -314,17 +314,24 @@ interface StoredObservation {
  * content is treated the same as "no record" (see `firstSeen`/`observe`'s
  * doc comments).
  *
- * **Bounded to `[-MAX_DATE_MS, MAX_DATE_MS]` — fix round 2, read-side
- * hygiene.** The write side already bounds `now` to exactly this range via
- * `validateNowForDateFormatting` before `observe()` ever stores it, so any
- * value outside it was never legitimately written by this module — it can
- * only be a planted or corrupted record. `Number.isFinite` alone rejects
+ * **Bounded to `[0, MAX_DATE_MS]` — fix round 2, read-side hygiene;
+ * tightened from `[-MAX_DATE_MS, MAX_DATE_MS]` in fix round 3, Minor 6.**
+ * `observe()`'s own write side stores only `Date.now()` or a caller-injected
+ * test value (see `ObserveOptions.now`'s doc comment) — a reader-local
+ * wall-clock observation is never negative, so `[0, MAX_DATE_MS]` is the
+ * tighter, still-honest mirror of what this module ever legitimately
+ * writes, in exactly the direction that matters: a negative
+ * `firstSeenAtMs` reads as *maximally* ancient to any expiry arithmetic
+ * that subtracts it from "now." `Number.isFinite` alone rejects
  * `NaN`/`Infinity` but not an in-range-for-`isFinite`, absurd-for-a-Date
  * value (e.g. `Number.MAX_SAFE_INTEGER`, which exceeds `MAX_DATE_MS`).
  * Mirroring the write side's own bound removes that degree of freedom from
  * whatever reads this value next, without this module needing to reason
  * about which specific downstream computation an out-of-range value might
- * corrupt.
+ * corrupt. **This is hygiene, not the security control**: any value in
+ * `[0, now]` still lets a planted record report an earlier-than-true
+ * first-observation time — the defense against that is the ownership
+ * chain (`ensurePrivateDir`), not this bound.
  */
 function parseStoredObservation(content: string): number | undefined {
   try {
@@ -335,7 +342,7 @@ function parseStoredObservation(content: string): number | undefined {
       "firstSeenAtMs" in parsed &&
       typeof (parsed as StoredObservation).firstSeenAtMs === "number" &&
       Number.isFinite((parsed as StoredObservation).firstSeenAtMs) &&
-      (parsed as StoredObservation).firstSeenAtMs >= -MAX_DATE_MS &&
+      (parsed as StoredObservation).firstSeenAtMs >= 0 &&
       (parsed as StoredObservation).firstSeenAtMs <= MAX_DATE_MS
     ) {
       return (parsed as StoredObservation).firstSeenAtMs;
@@ -577,9 +584,32 @@ const DIR_ABSENT = Symbol("absent");
  * shares with whatever else the XDG spec's `$XDG_STATE_HOME` reservation
  * covers — enforcing ownership there is outside this module's remit.
  *
- * No-op (skips the ownership/mode check entirely, verifying only
- * directory-ness) where `process.getuid` does not exist (Windows has no
- * POSIX uid/mode model to check).
+ * **On a runtime with no `process.getuid` (Windows), this check is
+ * unmitigated, not merely "skipped" — fix round 3, Ruling R41.** Node/Bun
+ * expose no POSIX uid or mode model there, so *both* halves of this
+ * function's own security property fall away together: the ownership
+ * check never runs (nothing to compare against), and the mode-tightening
+ * `chmod` never runs either, since it exists only to enforce the same
+ * ownership property this check can no longer establish. A world-writable
+ * store with a planted record is not caught on such a runtime — recorded
+ * here explicitly (per Ruling R41: Windows is not in this project's
+ * supported-platform list today — no `engines`/`os` field, no CI job for
+ * it — so this is not a defect to fix now, but whoever adds Windows
+ * support must inherit this obligation, not the false assumption that
+ * "no uid to check" merely means "less strict").
+ *
+ * **A failed tightening `chmod` is fatal only on the write path — fix
+ * round 3, Ruling R40.** `create: true` (`observe()`) still hard-errors if
+ * the `chmod` fails: obligation R7's whole reason for existing is that a
+ * swallowed *write* failure silently re-observes the same event forever,
+ * so no lease ever expires. `create: false` (`firstSeen()`) does not: nothing
+ * about a read depends on this directory's mode bits being tightened
+ * *right now* — the record underneath may still be perfectly readable — so
+ * failing the read because the tightening attempt (a courtesy, not this
+ * call's actual job) hit a read-only mount would be a self-inflicted
+ * outage R7 was never written to require. The **ownership** check above
+ * this one is unconditionally fatal on both paths regardless — that is the
+ * actual security property, and this ruling does not touch it.
  */
 async function ensurePrivateDir(dir: string, options: { create: boolean }): Promise<typeof DIR_ABSENT | undefined> {
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -602,20 +632,20 @@ async function ensurePrivateDir(dir: string, options: { create: boolean }): Prom
           //
           // **`mode: 0o700` here is narrower than it looks, disclosed
           // honestly**: the ownership+mode check just below (`uid`/`0o077`)
-          // already `chmod`s *any* directory this call reaches back to
+          // already tightens *any* directory this call reaches back to
           // `0o700` regardless of what `mkdir` created it as (confirmed
           // directly: deleting this `mode` option alone, with that check
           // left in place, does not change the mode `observe()` leaves
-          // behind — the `chmod` step already fixes it up on the very same
-          // call). What this option alone still buys, which the
-          // fixed-mode `mkdir` versus separate `chmod` do not, is
+          // behind — the tightening step already fixes it up on the very
+          // same call). What this option alone still buys, which the
+          // fixed-mode `mkdir` versus a separate tightening step do not, is
           // *atomicity*: without it, a freshly-created directory exists
-          // briefly at its unmasked default before the `chmod` below runs,
-          // a narrow window a local attacker racing this exact call could
-          // in principle use. Untested (isolating a single-syscall race
-          // window from outside this function isn't practical), kept as
-          // defense in depth, not claimed as independently guarded by a
-          // test the way the `chmod` step is.
+          // briefly at its unmasked default before the tightening step
+          // below runs, a narrow window a local attacker racing this exact
+          // call could in principle use. Untested (isolating a
+          // single-syscall race window from outside this function isn't
+          // practical), kept as defense in depth, not claimed as
+          // independently guarded by a test the way the tightening step is.
           await mkdir(dir, { recursive: true, mode: 0o700 });
         } catch (mkdirError) {
           if (isNodeError(mkdirError) && mkdirError.code === "EEXIST") {
@@ -638,19 +668,60 @@ async function ensurePrivateDir(dir: string, options: { create: boolean }): Prom
     const uid = process.getuid?.();
     if (uid !== undefined) {
       if (stat.uid !== uid) {
+        // Unconditionally fatal on both paths (Ruling R40) -- this is the
+        // actual security property.
         throw storeUnavailableError("state directory is not owned by the current user", undefined);
       }
       if ((stat.mode & 0o077) !== 0) {
         try {
-          await chmod(dir, 0o700);
+          await tightenDirPermissions(dir);
         } catch (cause) {
-          throw storeUnavailableError("restrict state directory permissions", cause);
+          if (options.create) {
+            throw storeUnavailableError("restrict state directory permissions", cause);
+          }
+          // Ruling R40: on the read path, a failed tightening attempt
+          // (e.g. a read-only mount) is not this call's failure to report
+          // -- proceed and let the caller's own read of the record decide
+          // whether *that* succeeds.
         }
       }
     }
     return undefined;
   }
   throw storeUnavailableError("state directory contention exceeded retry bound", undefined);
+}
+
+/**
+ * `chmod(dir, 0o700)` — fix round 2's original mechanism — resolves `dir`
+ * by path and follows a symlink at that path, exactly like every other
+ * plain path-based `fs` call this module has already had to route around
+ * (`readFile`, `writeFile`). Confirmed directly: `chmod` on a symlinked
+ * *directory* target moves the mode of the symlink's target, not the
+ * symlink itself, for both a file and a directory target. A local attacker
+ * who can win the narrow window between this function's own `lstat` (which
+ * confirmed a real, owned directory) and this call swapping in a symlink
+ * could redirect the tightening onto an arbitrary path the current user
+ * owns — fix round 3, Minor 3.
+ *
+ * **Fix: `open(dir, O_DIRECTORY | O_NOFOLLOW)`, then `chmod` the resulting
+ * handle (`fchmod`).** The open refuses a symlink outright (confirmed:
+ * `ENOTDIR`, since `O_DIRECTORY` requires the target to already be a
+ * directory and `O_NOFOLLOW` refuses to resolve through a symlink to find
+ * out), and once open, the handle names a specific inode — there is no
+ * further path to re-resolve, so the check (`ensurePrivateDir`'s own
+ * `lstat`) and the change now name provably the same thing.
+ */
+// Exported (module-internal — not re-exported from `events/index.ts`) so a
+// test can race this exact function against a concurrent attacker
+// swapping `dir` for a symlink, and confirm the race the old
+// `chmod(dir, 0o700)` mechanism lost is now unwinnable by construction.
+export async function tightenDirPermissions(dir: string): Promise<void> {
+  const handle = await open(dir, fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+  try {
+    await handle.chmod(0o700);
+  } finally {
+    await handle.close();
+  }
 }
 
 export interface ObserveOptions {
@@ -731,6 +802,20 @@ export async function observe(
   assertValidEventId(eventId);
   const now = opts.now ?? Date.now();
   validateNowForDateFormatting(now);
+  // Fix round 3, Minor 6: `validateNowForDateFormatting` (log.ts, frozen,
+  // shared with `append`/`initRef`'s own wider domain) accepts a negative
+  // `now` — this module's own domain is narrower. A reader-local
+  // wall-clock observation is never negative, so this extra,
+  // module-specific check tightens `now` to `[0, MAX_DATE_MS]` before it
+  // is ever stored, mirroring the same tightened bound
+  // `parseStoredObservation` now enforces on read.
+  if (now < 0) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+      `now must be non-negative -- a reader-local wall-clock observation is never negative, got ${now}`,
+      { details: { now, minValue: 0 } },
+    );
+  }
 
   const path = recordPath(boardKey, eventId);
   const boardHashDir = dirname(path);
@@ -876,12 +961,38 @@ export async function firstSeen(boardKey: string, eventId: EventId): Promise<num
  * unwritable-or-unreadable store throws
  * `EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE` — deletion is a
  * write for this purpose, subject to the same Ruling R7 disposition.
+ *
+ * **Every existing directory level is ownership-and-permission checked,
+ * the same as `observe()`/`firstSeen()` — fix round 3, Minor 4.** Ruling
+ * R37 scoped the original ownership/mode check to `observe()`/`firstSeen()`
+ * only, which left `discard()` acting through a poisoned path: with
+ * `observations/` or `<boardhash>` symlinked (or genuinely owned by
+ * another user), `observe()`/`firstSeen()` would hard-error but `discard()`
+ * would `rm` straight through the attacker's directory and report success
+ * — a weak arbitrary-unlink primitive, and an inconsistent disposition
+ * across the three functions for the identical poisoned-path condition.
+ * `{ create: false }`, the same as `firstSeen()`: `discard()` never
+ * creates a directory that isn't already there, and an absent directory at
+ * any level means there is nothing to discard (idempotent, not an error).
  */
 export async function discard(boardKey: string, eventId: EventId): Promise<void> {
   assertValidBoardKey(boardKey);
   assertValidEventId(eventId);
 
   const path = recordPath(boardKey, eventId);
+  const boardHashDir = dirname(path);
+  const observationsDir = dirname(boardHashDir);
+  const cankanDir = dirname(observationsDir);
+
+  if ((await ensurePrivateDir(cankanDir, { create: false })) === DIR_ABSENT) {
+    return;
+  }
+  if ((await ensurePrivateDir(observationsDir, { create: false })) === DIR_ABSENT) {
+    return;
+  }
+  if ((await ensurePrivateDir(boardHashDir, { create: false })) === DIR_ABSENT) {
+    return;
+  }
 
   try {
     await rm(path, { force: true });

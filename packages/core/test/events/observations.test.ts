@@ -15,6 +15,7 @@ import {
   observe,
   recordPath,
   resolveStateDir,
+  tightenDirPermissions,
 } from "../../src/events/observations";
 import type { EventId } from "../../src/events/schema";
 import { createGitAdapter } from "../../src/git/index";
@@ -696,19 +697,46 @@ describe("Fix round 2, Medium M1 -- ownership, not shape, is the property that m
   // without a second uid available, cannot) prove a *different real user*
   // is also refused -- that half rests on `lstat`'s `uid` field being the
   // filesystem's own ownership record, which is not this module's code to
-  // verify.
-  function withFakeUid<T>(fakeUid: number, fn: () => Promise<T>): Promise<T> {
+  // verify. (Fix round 3 update: the reviewer separately confirmed this
+  // against a real, filesystem-recorded foreign uid via `unshare -Ur
+  // --map-auto`, available in this sandbox because subuids are configured
+  // -- worth knowing for future work, not required here.)
+  //
+  // **Fix round 3, Important I1**: a stub that returns one *constant*
+  // foreign uid (this file's original version) makes `observe()`'s and
+  // `firstSeen()`'s *first* `ensurePrivateDir` call (`cankan/`) trip the
+  // mismatch and never reach the `<boardhash>` leaf at all -- so a test
+  // built that way cannot tell "the leaf check works" from "some check,
+  // anywhere in the chain, works," and a mutation that keeps the
+  // ownership check at `cankan/`/`observations/` but skips it at the leaf
+  // (exactly the field scenario R37 exists for: a store left `0777` by the
+  // vulnerable build, where the ancestors are victim-owned and pass, and
+  // only the leaf is attacker-owned) passed the whole suite, 50/50, while
+  // the real exploit stayed open. `withCountingUid` instead returns the
+  // *real* uid for the first `realCallsBeforeForeign` calls to
+  // `process.getuid()` and only fakes a mismatch from the next call
+  // onward -- since a clean, uncontested `ensurePrivateDir` call makes
+  // exactly one such call, `withCountingUid(2, ...)` lets `cankan/` and
+  // `observations/` see their true (matching) owner and pass normally,
+  // and only the third call -- the `<boardhash>` leaf -- sees the fake
+  // mismatch. This is what specifically proves the *leaf* check, not
+  // "some check somewhere," is what closes the exploit.
+  function withCountingUid<T>(realCallsBeforeForeign: number, foreignUid: number, fn: () => Promise<T>): Promise<T> {
     const real = process.getuid;
     if (!real) {
       throw new Error("process.getuid is unavailable -- this suite assumes POSIX");
     }
-    process.getuid = () => fakeUid;
+    let callCount = 0;
+    process.getuid = () => {
+      callCount++;
+      return callCount <= realCallsBeforeForeign ? real() : foreignUid;
+    };
     return fn().finally(() => {
       process.getuid = real;
     });
   }
 
-  test("observe() refuses a <boardhash> directory whose recorded owner does not match the current (simulated) user", async () => {
+  test("observe() refuses a <boardhash> directory whose recorded owner does not match the current (simulated) user -- specifically the leaf check, with cankan/ and observations/ seeing their true, matching owner", async () => {
     await withEnv(undefined, async () => {
       const eventId = ulid() as EventId;
       const path = recordPath("board-m1-observe", eventId);
@@ -716,7 +744,10 @@ describe("Fix round 2, Medium M1 -- ownership, not shape, is the property that m
       await mkdir(boardHashDir, { recursive: true, mode: 0o700 });
 
       const realUid = process.getuid?.() ?? 0;
-      await withFakeUid(realUid + 1, () =>
+      // `observe()` calls `ensurePrivateDir` for cankan/, observations/,
+      // then <boardhash>, in that order -- 2 real-uid calls, then the
+      // leaf sees the fake mismatch.
+      await withCountingUid(2, realUid + 1, () =>
         expectCode(
           observe("board-m1-observe", eventId, { now: 1 }),
           EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
@@ -725,7 +756,7 @@ describe("Fix round 2, Medium M1 -- ownership, not shape, is the property that m
     });
   });
 
-  test("firstSeen() refuses the M1 scenario exactly: a real directory, containing a plain file at the correctly-hashed record name, that the current user does not own -- every fix round 1 shape check is satisfied and only the ownership check catches it", async () => {
+  test("firstSeen() refuses the M1 scenario exactly: a real directory, containing a plain file at the correctly-hashed record name, that the current user does not own -- every fix round 1 shape check is satisfied and only the leaf ownership check catches it", async () => {
     await withEnv(undefined, async () => {
       const eventId = ulid() as EventId;
       const path = recordPath("board-m1-firstseen", eventId);
@@ -737,9 +768,27 @@ describe("Fix round 2, Medium M1 -- ownership, not shape, is the property that m
       await writeFile(path, JSON.stringify({ firstSeenAtMs: 1 }), "utf8");
 
       const realUid = process.getuid?.() ?? 0;
-      await withFakeUid(realUid + 1, () =>
+      await withCountingUid(2, realUid + 1, () =>
         expectCode(
           firstSeen("board-m1-firstseen", eventId),
+          EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+        ),
+      );
+    });
+  });
+
+  test("discard() refuses the same leaf-ownership scenario (fix round 3, Minor 4 -- discard() gained the same check)", async () => {
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-m1-discard", eventId);
+      const boardHashDir = dirname(path);
+      await mkdir(boardHashDir, { recursive: true, mode: 0o700 });
+      await writeFile(path, JSON.stringify({ firstSeenAtMs: 1 }), "utf8");
+
+      const realUid = process.getuid?.() ?? 0;
+      await withCountingUid(2, realUid + 1, () =>
+        expectCode(
+          discard("board-m1-discard", eventId),
           EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
         ),
       );
@@ -920,6 +969,136 @@ describe("Fix round 2, L3 -- a filesystem that cannot make hard links is diagnos
   });
 });
 
+describe("Fix round 3, Minor 3 -- tightening permissions never follows a symlink, deterministically", () => {
+  // A race-based test of this fix was tried and removed. `chmod(dir,
+  // 0o700)` (fix round 2's original mechanism) resolves `dir` by path a
+  // *second* time, so a local attacker who wins the narrow window between
+  // `ensurePrivateDir`'s own `lstat` and this call swapping `dir` for a
+  // symlink redirects the tightening. A race harness built to reproduce
+  // that window was flaky in this exact suite -- reliable standalone
+  // (3/3 at 4000 iterations, run as its own process), but only ~60%
+  // reliable *inside* `bun test` even at 20000 iterations, for reasons not
+  // fully diagnosed. The orchestrator's own numbers for the original
+  // finding put the win rate at roughly 1.5% (4572 redirections in 305,819
+  // runs) -- a race test here is fighting a genuinely rare window, so a
+  // "passing" run is weak evidence and a flaky one is worse than none: it
+  // trains a re-run-until-green habit and would undermine every
+  // consecutive-green-runs claim this phase has made. Deleted rather than
+  // tuned around.
+  //
+  // **What replaces it is deterministic**, because the property that
+  // matters doesn't need a race to observe: `open(dir, O_DIRECTORY |
+  // O_NOFOLLOW)` either resolves `dir` to a real directory and hands back
+  // a handle bound to that specific inode, or it fails outright if `dir`
+  // is a symlink -- there is no third outcome, and no separate
+  // path-resolution step for an attacker to interleave with, regardless of
+  // *when* the symlink appears. Testing "a symlink already at `dir` when
+  // `tightenDirPermissions` is called" therefore exercises the identical
+  // code path that also closes the race -- `open(..., O_NOFOLLOW)` doesn't
+  // know or care whether the symlink was there a nanosecond or an hour
+  // before the call.
+  test("a symlinked directory is refused outright, and the symlink's target is never touched", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cankan-minor3-probe-"));
+    try {
+      const victimTarget = join(dir, "victim");
+      const plantedSymlink = join(dir, "planted-symlink-dir");
+      await mkdir(victimTarget, { mode: 0o755 });
+      await symlink(victimTarget, plantedSymlink);
+
+      let threw: unknown;
+      try {
+        await tightenDirPermissions(plantedSymlink);
+      } catch (error) {
+        threw = error;
+      }
+      expect(threw).toBeDefined();
+      if (threw !== undefined && !(threw instanceof Error && "code" in threw)) {
+        throw new Error(`expected a Node error with a code, got ${String(threw)}`);
+      }
+      // ENOTDIR: `O_DIRECTORY` requires the target to already be a
+      // directory; `O_NOFOLLOW` refuses to resolve through the symlink to
+      // find out, so the combination fails before either can succeed --
+      // confirmed directly (task-3-report.md's fix round 3 probe).
+      expect((threw as NodeJS.ErrnoException).code).toBe("ENOTDIR");
+
+      expect((await lstat(victimTarget)).mode & 0o777).toBe(0o755);
+      // The symlink itself is untouched too -- never replaced, never
+      // chmod'd (a symlink's own permission bits are meaningless on Linux
+      // and this call never reaches a point where it would try).
+      expect((await lstat(plantedSymlink)).isSymbolicLink()).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a real, non-symlinked directory is tightened normally (the deterministic test above isn't merely testing that every call fails)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cankan-minor3-probe-2-"));
+    try {
+      const realDir = join(dir, "real");
+      await mkdir(realDir, { mode: 0o777 });
+      await tightenDirPermissions(realDir);
+      expect((await lstat(realDir)).mode & 0o777).toBe(0o700);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Fix round 3, Ruling R40 -- a failed permission-tightening attempt is fatal on the write path, not the read path", () => {
+  test("firstSeen() still returns the record when the store is on a read-only mount and its directory mode can't be tightened (real bind-mount remount, not simulated)", async () => {
+    // Requires unprivileged user namespaces with mount capability
+    // (`unshare --user --mount --map-root-user`) -- confirmed available in
+    // this sandbox; skip cleanly where it isn't (CI runners may lack it).
+    const probe = Bun.spawnSync(["unshare", "--user", "--mount", "--map-root-user", "true"]);
+    if (probe.exitCode !== 0) {
+      return;
+    }
+
+    await withEnv(undefined, async () => {
+      const home = process.env.HOME as string;
+      const eventId = ulid() as EventId;
+      await observe("board-r40", eventId, { now: 1234 });
+      const path = recordPath("board-r40", eventId);
+      const boardHashDir = dirname(path);
+      const modulePath = new URL("../../src/events/observations.ts", import.meta.url).pathname;
+
+      // A directory with group/other bits set -- the "vulnerable build
+      // left it 0777" scenario -- bind-mounted onto itself and remounted
+      // read-only within the child's own mount namespace (this process's
+      // mount table is untouched), so `chmod`/`fchmod` fails (`EROFS`) but
+      // reading the file underneath does not.
+      await chmod(boardHashDir, 0o755);
+
+      const scriptPath = join(home, "firstseen-under-ro.ts");
+      await writeFile(
+        scriptPath,
+        [
+          `import { firstSeen } from ${JSON.stringify(modulePath)};`,
+          `firstSeen(${JSON.stringify("board-r40")}, ${JSON.stringify(eventId)}).then(`,
+          `  (v) => console.log("RESULT:ok", v),`,
+          `  (e) => console.log("RESULT:error", e && e.code),`,
+          `);`,
+        ].join("\n"),
+        "utf8",
+      );
+
+      const script = [
+        `mount --bind ${JSON.stringify(boardHashDir)} ${JSON.stringify(boardHashDir)}`,
+        `mount -o remount,ro,bind ${JSON.stringify(boardHashDir)}`,
+        `bun run ${JSON.stringify(scriptPath)}`,
+      ].join(" && ");
+
+      const result = Bun.spawnSync(["unshare", "--user", "--mount", "--map-root-user", "bash", "-c", script], {
+        env: { ...process.env, HOME: home, XDG_STATE_HOME: "" },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const stdout = result.stdout.toString();
+      expect(stdout).toContain("RESULT:ok 1234");
+    });
+  });
+});
+
 describe("Fix round 2 -- parseStoredObservation bounds firstSeenAtMs, mirroring the write side", () => {
   test("firstSeen() treats an absurdly out-of-range firstSeenAtMs as corrupt (null), not as a value to hand to a caller", async () => {
     await withEnv(undefined, async () => {
@@ -945,6 +1124,38 @@ describe("Fix round 2 -- parseStoredObservation bounds firstSeenAtMs, mirroring 
       const recorded = await observe("board-bound-2", eventId, { now: 777 });
       expect(recorded).toBe(777);
       expect(await firstSeen("board-bound-2", eventId)).toBe(777);
+    });
+  });
+
+  test("fix round 3, Minor 6: a modestly negative firstSeenAtMs is rejected too, not only an astronomically out-of-range one", async () => {
+    // -1000 is well within the *original* [-MAX_DATE_MS, MAX_DATE_MS]
+    // bound (the previous two tests use values so far out of range they
+    // would have been caught by that bound too, so neither actually
+    // exercises the round-3 tightening to [0, MAX_DATE_MS]) -- a
+    // reader-local wall-clock observation is never negative, so this
+    // value is exactly the class Minor 6 exists to catch.
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-bound-3", eventId);
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      await writeFile(path, JSON.stringify({ firstSeenAtMs: -1000 }), "utf8");
+
+      expect(await firstSeen("board-bound-3", eventId)).toBeNull();
+    });
+  });
+
+  test("fix round 3, Minor 6: observe() rejects a negative now on the write side too, not only an astronomically out-of-range one", async () => {
+    // `validateNowForDateFormatting` (log.ts, frozen) accepts -1 -- its
+    // own domain is [-MAX_DATE_MS, MAX_DATE_MS]. This module's own,
+    // narrower check (a reader-local wall-clock observation is never
+    // negative) is what rejects it.
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      await expectCode(
+        observe("board-bound-now", eventId, { now: -1 }),
+        EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+      );
+      expect(await firstSeen("board-bound-now", eventId)).toBeNull();
     });
   });
 });

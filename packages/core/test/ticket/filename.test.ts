@@ -210,3 +210,95 @@ describe("parseTicketFilename", () => {
     );
   });
 });
+
+describe("round 2 fix-in: build/parse agreement is a property, not a spot check (S-1)", () => {
+  // The discriminating test is the agreement itself, not a rejection case:
+  // a test that only asserts `buildTicketFilename` rejects "ck 1" proves one
+  // input is rejected, not that the two predicates agree. This table covers
+  // every shape `unsafeIdReason` permits and every shape it rejects, so a
+  // future loosening of either predicate on its own breaks this test.
+  const ACCEPTED_IDS = [
+    "ck-a1b2c3",
+    "task-1",
+    "CK-1",
+    "a",
+    "ck_1",
+    "123456",
+    "ck-847213",
+    "c".repeat(100), // exactly at the byte cap
+  ];
+
+  const REJECTED_IDS = [
+    "ck 1", // the milder ghost case from the finding
+    "a - b", // the serious conflation case from the finding
+    "a/b",
+    "a\\b",
+    "a\0b",
+    ".",
+    "..",
+    ".git",
+    ".GIT",
+    "",
+    "   ",
+    "c".repeat(101), // one over the byte cap
+    "ck:1",
+    `${String.fromCodePoint(0x202e)}evil`,
+  ];
+
+  for (const id of ACCEPTED_IDS) {
+    test(`accepted id ${JSON.stringify(id.length > 24 ? `${id.slice(0, 24)}…` : id)} round-trips through build -> parse to the identical id`, () => {
+      const filename = buildTicketFilename(id, "hello");
+      const parsed = parseTicketFilename(filename);
+      expect(parsed?.id).toBe(id);
+    });
+  }
+
+  for (const id of REJECTED_IDS) {
+    test(`rejected id ${JSON.stringify(id.length > 24 ? `${id.slice(0, 24)}…` : id)} throws on build, so it can never reach the read path disagreeing`, () => {
+      expect(() => buildTicketFilename(id, "hello")).toThrow();
+    });
+  }
+
+  test("the exact repro from the finding: 'ck 1' is rejected (the ghost-file case) and 'a - b' is rejected (the conflation case)", () => {
+    expect(() => buildTicketFilename("ck 1", "hello")).toThrow();
+    expect(() => buildTicketFilename("a - b", "hello")).toThrow();
+  });
+});
+
+describe("round 2 fix-in: slug byte cap and surrogate-pair safety (S-4, S-5)", () => {
+  test("caps the slug by UTF-8 byte length, not UTF-16 code-unit count", () => {
+    // 100 CJK characters is 100 UTF-16 code units but 300 UTF-8 bytes —
+    // the pre-fix `.slice(0, 100)` cap let this straight through.
+    const slug = slugifyTitle("字".repeat(100));
+    expect(Buffer.byteLength(slug, "utf8")).toBeLessThanOrEqual(100);
+  });
+
+  test("never splits a surrogate pair when truncating, and the result is well-formed Unicode", () => {
+    const title = `a${"\u{1F600}".repeat(60)}`; // "a" + 60 emoji
+    const slug = slugifyTitle(title);
+    // `tsconfig.base.json` (frozen, shared) targets ES2022, which predates
+    // `String.prototype.isWellFormed`. `encodeURIComponent` throws
+    // `URIError` on a lone surrogate, which is exactly what a split pair
+    // would leave behind, so it serves the same check here.
+    expect(() => encodeURIComponent(slug)).not.toThrow();
+    expect(Buffer.byteLength(slug, "utf8")).toBeLessThanOrEqual(100);
+  });
+});
+
+describe("round 2 fix-in: the .git rule is case-insensitive (S-6)", () => {
+  test("rejects .GIT, .Git, and .git identically on both the write and read paths", () => {
+    for (const variant of [".git", ".GIT", ".Git", ".gIt"]) {
+      expect(() => buildTicketFilename(variant, "hello")).toThrow();
+      expect(parseTicketFilename(`${variant} - x.md`)).toBeNull();
+    }
+  });
+});
+
+describe("round 2 fix-in: title sanitization strips bidi/zero-width characters too, matching the id-side check (S-8)", () => {
+  test("slugifyTitle strips a right-to-left override and a zero-width space from a title", () => {
+    const rtlOverride = String.fromCodePoint(0x202e);
+    const zeroWidthSpace = String.fromCodePoint(0x200b);
+    const slug = slugifyTitle(`foo${rtlOverride}bar${zeroWidthSpace}baz`);
+    expect(slug).toBe("foobarbaz");
+  });
+});

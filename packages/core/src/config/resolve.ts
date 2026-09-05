@@ -674,7 +674,15 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
   // `false` for the global path (the user's own file -- see
   // `assertNotSymlink` in layers.ts for why that asymmetry is deliberate).
   const globalPath = resolveGlobalConfigPath(env);
-  const [globalLoaded, repoLoaded, repoLocalLoaded] = await Promise.all([
+  // `Promise.all` rejects with whichever load settles first, which made the
+  // reported error a race whenever more than one layer fails at once. A
+  // symlinked `.cankan` DIRECTORY is exactly that case: the repo and
+  // repo-local guards both reject, and the filename in the message flipped
+  // between `config.yml` and `local.yml` run to run (~25% locally). Settle
+  // all three, then rethrow in a fixed layer precedence -- repo, then
+  // repo-local, then global -- so a board with several broken layers always
+  // names the same one, and names the most specific.
+  const settled = await Promise.allSettled([
     globalPath
       ? loadValidatedLayer("global", globalPath, globalConfigSchema, POLICY_TAGS, false)
       : Promise.resolve(undefined),
@@ -697,6 +705,25 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
         )
       : Promise.resolve(undefined),
   ]);
+
+  const [globalSettled, repoSettled, repoLocalSettled] = settled;
+  // Precedence order, not array order: the most specific layer's failure is
+  // the one worth reporting.
+  for (const outcome of [repoSettled, repoLocalSettled, globalSettled]) {
+    if (outcome.status === "rejected") {
+      throw outcome.reason;
+    }
+  }
+  const fulfilledValue = <T,>(outcome: PromiseSettledResult<T>): T => {
+    /* c8 ignore next 3 -- unreachable: every rejection was rethrown above */
+    if (outcome.status === "rejected") {
+      throw outcome.reason;
+    }
+    return outcome.value;
+  };
+  const globalLoaded = fulfilledValue(globalSettled);
+  const repoLoaded = fulfilledValue(repoSettled);
+  const repoLocalLoaded = fulfilledValue(repoLocalSettled);
 
   // R6: !policy is honored only in .cankan/config.yml -- a load error
   // naming the file otherwise. This also settles S4's alias/nested-tag

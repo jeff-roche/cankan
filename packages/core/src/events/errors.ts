@@ -29,13 +29,29 @@ export const EventErrorCodes = {
    */
   EVENT_APPEND_REJECTED: "EVENT_APPEND_REJECTED",
   /**
-   * An `AppendOptions` field was shaped wrong (fix round 2, Low). Currently
-   * only `maxExistingBlobBytes`: `NaN` would silently disable the size cap
-   * (`existingBytes > NaN` is always `false`), and a negative value would
-   * refuse even an empty month. Must be `>= 0` (`Number.POSITIVE_INFINITY`
-   * — the documented recovery-write bypass — is explicitly allowed; only
-   * `NaN` and negative values are rejected). Raised before any git
-   * invocation.
+   * An `AppendOptions` field (or a value returned by one) was shaped
+   * wrong. Raised before any git invocation, at three sites:
+   * - `maxExistingBlobBytes` (fix round 2, Low; fix round 4, Low 2):
+   *   must be `>= 0` (`Number.POSITIVE_INFINITY` — the documented
+   *   recovery-write bypass — is explicitly allowed). `typeof v !==
+   *   "number"` is checked explicitly, not just `Number.isNaN`/`< 0`:
+   *   `Number.isNaN` does not coerce, so a non-number value (a string, an
+   *   object) is neither `NaN` nor `< 0` in JavaScript's own comparison
+   *   semantics and previously passed both checks, silently disabling the
+   *   cap.
+   * - `casRetry.maxAttempts` (fix round 3 sweep, Ruling R27): must be a
+   *   finite integer in `[1, MAX_CAS_ATTEMPTS]` (`log.ts`) —
+   *   `withCasRetry`'s own loop bound does not validate this itself,
+   *   confirmed directly (`Infinity` makes the loop unbounded; `NaN`
+   *   makes it never run even once).
+   * - `casRetry.backoffMs`'s *return value* (fix round 4, Medium 2): must
+   *   be a finite number in `[0, MAX_BACKOFF_MS]` — an in-range
+   *   `setTimeout` delay is not clamped the way an out-of-range one is,
+   *   confirmed directly that an otherwise-valid ~24.8-day delay is
+   *   genuinely scheduled (and keeps the process alive) rather than
+   *   firing immediately, defeating the same "bounded retry" obligation
+   *   `maxAttempts` closes for attempt count, reachable instead through
+   *   backoff duration.
    */
   EVENT_APPEND_INVALID_OPTION: "EVENT_APPEND_INVALID_OPTION",
   /**
@@ -80,12 +96,18 @@ export const EventErrorCodes = {
    */
   EVENT_LOG_AGGREGATE_TOO_LARGE: "EVENT_LOG_AGGREGATE_TOO_LARGE",
   /**
-   * One of `read`'s two window-shaping inputs was invalid — either
+   * One of `read`'s window/cursor-shaping inputs was invalid — one of:
    * `read()`'s own `trailingMonths` was not a finite integer in the
    * accepted range (fix round 1, S1; **`append` has no `trailingMonths`
    * parameter** — an earlier version of this comment wrongly implied it
-   * did, a fix-round-2 correction), or `read`'s/`append`'s shared `now`
-   * clock reading was not finite (fix round 2, NEW-2).
+   * did, a fix-round-2 correction); `read`'s/`append`'s shared `now`
+   * clock reading was outside the domain its actual consumer (date
+   * formatting, or — `append` only — a ULID factory) can represent (fix
+   * round 2, NEW-2; tightened in fix round 3, M1 — `Number.isFinite` alone
+   * was not a tight enough bound); or `read`'s `since` was not a valid
+   * ULID event id (fix round 4, Medium 1 — the fix-round-3 sweep's
+   * invariant said "every *numeric* option," so this string option was
+   * never checked).
    *
    * Degenerate `trailingMonths` values (`0`, a negative number, `NaN`)
    * previously produced an empty month-key list and made `read()` resolve
@@ -96,8 +118,15 @@ export const EventErrorCodes = {
    * has the identical fail-open effect in `read()` (a month-key window of
    * months that cannot exist) via a different, sibling parameter — not
    * peer-reachable, but reachable from an upstream `Date.parse` failure
-   * with no attacker at all. All are rejected here, before either failure
-   * mode can occur.
+   * with no attacker at all. An invalid `since` is the most consequential
+   * of the three: `id > since` is a lexicographic string comparison that
+   * JavaScript performs against *any* string without throwing, so a
+   * malformed cursor (a lowercased-but-otherwise-real ULID, or a
+   * degenerate value like `null`/`{}`/`0` coerced through) does not
+   * surface as an empty-window edge case — it silently makes every real
+   * event's `id` compare as "not greater than," so `read()` returns `[]`
+   * on a board that has events. All three are rejected here, before
+   * either failure mode can occur.
    */
   EVENT_LOG_INVALID_WINDOW: "EVENT_LOG_INVALID_WINDOW",
   /**

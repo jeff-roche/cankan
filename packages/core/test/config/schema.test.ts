@@ -7,6 +7,18 @@ import {
   repoConfigSchema,
 } from "../../src/config/schema";
 
+/*
+ * NOTE FOR TASK B (yaml@2's default schema, not this lane's concern to fix):
+ * `parse()` here relies on yaml@2's default core schema (YAML 1.2), under
+ * which a bare `off` scalar parses as the string `"off"` — exactly what
+ * `sync.auto_push: off` (CONCEPT.md 303) needs to validate against the
+ * `syncAutoPushSchema` enum. Under a YAML 1.1 schema (`parse(src, {
+ * version: "1.1" })` or the `"core"`/`"failsafe"` legacy schemas), `off` /
+ * `on` / `yes` / `no` are boolean-ish and this same fixture would fail to
+ * validate. `layers.ts` (Task B) must not pass a `version` option that
+ * changes this default.
+ */
+
 /**
  * Verbatim from CONCEPT.md 278-358, `.cankan/config.yml` (repo, checked in).
  * This is the single highest-value test in Task A (see the brief): if the
@@ -321,6 +333,32 @@ describe("backers — repo keys by type, global keys by name with explicit type 
   });
 });
 
+describe("status_map — modeled permissively, with one documented limitation", () => {
+  test("accepts every shape CONCEPT.md's examples show (github's and jira's)", () => {
+    expect(
+      repoConfigSchema.safeParse({
+        backers: { github: { status_map: { "To Do": { state: "open" } } } },
+      }).success,
+    ).toBe(true);
+    expect(
+      repoConfigSchema.safeParse({
+        backers: { jira: { status_map: { "To Do": { status: "To Do" } } } },
+      }).success,
+    ).toBe(true);
+  });
+
+  test("does NOT accept a bare-string column value — a limitation of modeling the value as record(field -> unknown), not a discriminated union", () => {
+    // CONCEPT.md never shows a status_map entry as a bare string (every
+    // example is `{ state: ... }` or `{ status: ... }`), so this is a
+    // documented gap rather than a spec example that fails: see the
+    // implementer report's "inference list".
+    const result = repoConfigSchema.safeParse({
+      backers: { github: { status_map: { "To Do": "open" } } },
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
 describe("no field anywhere holds a secret value", () => {
   test("backer entries only ever carry a credential *name*", () => {
     const parsed = repoConfigSchema.parse({
@@ -373,6 +411,36 @@ describe("built-in defaults materialize on an empty effective config", () => {
     expect(eff.backers).toBeUndefined();
     expect(eff.hooks).toBeUndefined();
     expect(eff.definition_of_done).toBeUndefined();
+  });
+});
+
+describe("every file is a rung on both precedence chains (contract R1, R7(a))", () => {
+  test("global config parses a policy key (columns) — legal per R7(a), silently overridden, not rejected at parse", () => {
+    // R7(a): "A global config setting `columns` (a built-in policy key) is
+    // *legal* — global is simply the lowest file rung of the policy chain."
+    // That can only be true if the schema lets the key through in the first
+    // place; a parse failure here would make "silently overridden" a dead
+    // letter.
+    const result = globalConfigSchema.safeParse({ columns: ["Backlog", "Done"] });
+    expect(result.success).toBe(true);
+  });
+
+  test("repo-local config parses every claims/sync field, not just the ones its own example shows", () => {
+    // R1: preference keys resolve `env > repo-local > repo > global >
+    // default` — repo-local is the *top* file rung for every preference
+    // key, including ones CONCEPT.md's local.yml example never happens to
+    // set (only `sync.auto_pull` is shown there).
+    expect(localConfigSchema.safeParse({ claims: { lease: "4h" } }).success).toBe(true);
+    expect(
+      localConfigSchema.safeParse({
+        sync: { auto_push: "all", auto_pull: "on_prime", conflict_policy: "ours" },
+      }).success,
+    ).toBe(true);
+  });
+
+  test("repo config parses fields its own example never sets but the chain allows (e.g. output, editor)", () => {
+    expect(repoConfigSchema.safeParse({ output: { color: "never" } }).success).toBe(true);
+    expect(repoConfigSchema.safeParse({ editor: "vim" }).success).toBe(true);
   });
 });
 

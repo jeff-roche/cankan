@@ -62,16 +62,30 @@ describe("classifyKey — every row of CONCEPT.md 415-426, by example key", () =
   });
 });
 
+/**
+ * Whether some `KEY_CLASSIFICATION` pattern matches `key`, mirroring
+ * `keys.ts`'s own `matchesPattern` (not exported — it's an implementation
+ * detail of `classifyKey`). Kept as one small local helper rather than
+ * inlined twice below, so a drift in the prefix/wildcard rule only needs
+ * fixing in one place in this file. This intentionally does not route
+ * through `classifyKey` itself: `classifyKey` collapses "matched by a
+ * preference pattern" and "matched by nothing" to the same `"preference"`
+ * result (contract R2's default), which is exactly the distinction these
+ * tests need to keep separate.
+ */
+function isMatchedByAnyPattern(key: string): boolean {
+  const keySegments = key.split(".");
+  return KEY_CLASSIFICATION.some((entry) => {
+    const patternSegments = entry.pattern.split(".");
+    if (patternSegments.length > keySegments.length) return false;
+    return patternSegments.every((segment, i) => segment === "*" || segment === keySegments[i]);
+  });
+}
+
 describe("UNCLASSIFIED_KEYS", () => {
   test("every listed key is genuinely unmatched by KEY_CLASSIFICATION", () => {
     for (const key of UNCLASSIFIED_KEYS) {
-      const matched = KEY_CLASSIFICATION.some((entry) => {
-        const patternSegments = entry.pattern.split(".");
-        const keySegments = key.split(".");
-        if (patternSegments.length > keySegments.length) return false;
-        return patternSegments.every((s, i) => s === "*" || s === keySegments[i]);
-      });
-      expect(matched, `${key} should be unmatched`).toBe(false);
+      expect(isMatchedByAnyPattern(key), `${key} should be unmatched`).toBe(false);
     }
   });
 
@@ -147,15 +161,9 @@ describe("the gap test (contract R2)", () => {
     expect(leaves.length).toBeGreaterThan(0);
 
     const unclassifiedSet = new Set(UNCLASSIFIED_KEYS);
-    const unaccountedFor = leaves.filter((key) => {
-      const matched = KEY_CLASSIFICATION.some((entry) => {
-        const patternSegments = entry.pattern.split(".");
-        const keySegments = key.split(".");
-        if (patternSegments.length > keySegments.length) return false;
-        return patternSegments.every((seg, i) => seg === "*" || seg === keySegments[i]);
-      });
-      return !matched && !unclassifiedSet.has(key);
-    });
+    const unaccountedFor = leaves.filter(
+      (key) => !isMatchedByAnyPattern(key) && !unclassifiedSet.has(key),
+    );
 
     expect(unaccountedFor).toEqual([]);
   });

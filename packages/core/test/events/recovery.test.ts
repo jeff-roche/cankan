@@ -1193,11 +1193,20 @@ describe("recover — fix round 2, Ruling R45(a): a single line's raw content is
     expect(record.rawTruncated).toBe(true);
     expect(record.raw.length).toBeLessThan(poison.length);
     // Bounded, not unbounded — the entire point of the truncation: the
-    // record's own on-disk size stays a small, predictable multiple of
-    // `MAX_QUARANTINE_RAW_BYTES_PER_RECORD`, never proportional to the
-    // original line's own size (which, in NEW-1's real construction, was
-    // 45 MiB and produced a ~283 MB record).
-    expect(Buffer.byteLength(quarantineRaw ?? "", "utf8")).toBeLessThan(70 * 1024 * 1024);
+    // record's own on-disk size stays at or under this module's own stated
+    // per-record estimate ceiling (`MAX_QUARANTINE_RAW_BYTES_PER_RECORD *
+    // QUARANTINE_ESCAPE_EXPANSION_FACTOR + QUARANTINE_RECORD_OVERHEAD_BYTES`
+    // — the same figure the algebraic-invariant test above checks against
+    // the run budget), never proportional to the original line's own size
+    // (which, in NEW-1's real construction, was 45 MiB and produced a
+    // ~283 MB record). Pinning the *actual* measured bytes to this exact
+    // ceiling — not a looser, hand-picked round number — is what makes the
+    // final safety-net throw's "should never fire" claim a tested property:
+    // a future change to the escape factor or `JSON.stringify`'s own
+    // escaping table that broke the estimate would fail this assertion.
+    expect(Buffer.byteLength(quarantineRaw ?? "", "utf8")).toBeLessThanOrEqual(
+      MAX_QUARANTINE_RAW_BYTES_PER_RECORD * QUARANTINE_ESCAPE_EXPANSION_FACTOR + QUARANTINE_RECORD_OVERHEAD_BYTES,
+    );
 
     expect(result.unresolved).toEqual([]);
     const records = await read(adapter, COORD_REF, { now: NOW });

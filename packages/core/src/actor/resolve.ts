@@ -45,7 +45,7 @@
  * to a user, as "your global config file" in a future `config show`.
  */
 
-import type { ConfigResult, ResolvedEntry } from "../config/index";
+import type { ConfigLayer, ConfigResult, ResolvedEntry } from "../config/index";
 import { CanKanError } from "../errors";
 import type { ActorId } from "../types";
 import { ActorErrorCodes } from "./errors";
@@ -169,16 +169,43 @@ export interface ResolveActorOptions {
 // its own queue; and `claims.max_per_actor` gives each look-alike its own
 // budget against a policy whose entire point is capping *one* actor.
 //
+// **User-visible consequence (fix round 3):** `\p{Default_Ignorable_Code_Point}`
+// includes U+FE0F VARIATION SELECTOR-16 -- the codepoint that turns a
+// black-and-white glyph into its emoji presentation (`"❤"` + U+FE0F ->
+// "❤️"). A `name` built with an emoji-presentation character therefore no
+// longer parses. This is intended, not an oversight: it is in the exact
+// bypass set this fix closes, and CONCEPT.md's own actor examples are all
+// plain ASCII handles -- but it is worth knowing before someone hits it.
+//
 // R-8 ("empty is malformed, not absent") still falls out for free: `""`
 // and `"   "` still fail the empty/leading-trailing-whitespace checks
 // below, unchanged by any of this.
 // ---------------------------------------------------------------------------
 
-/** The whole actor value's length cap (R-18) -- an attribution key with no
- *  bound would let an arbitrarily large string (a full file, say) become a
- *  permanent key in the append-only event log. 256 is generous for every
- *  real example CONCEPT.md shows, with room to spare for a long
- *  `tool:name/context`. */
+/**
+ * The whole actor value's length cap (R-18) -- an attribution key with no
+ * bound would let an arbitrarily large string (a full file, say) become a
+ * permanent key in the append-only event log. 256 is generous for every
+ * real example CONCEPT.md shows, with room to spare for a long
+ * `tool:name/context`.
+ *
+ * Measured **after** `tryParseActor`'s `.normalize("NFC")` (fix round 3,
+ * re-review-confirmed as the right side of the boundary), never before: the
+ * cap bounds what actually ends up stored, and it fails closed rather than
+ * open on the direction normalization can move length -- NFC composition
+ * usually shortens decomposed text, but a pathological input (200 copies of
+ * U+0344, which does not compose) can round-trip through `normalize("NFC")`
+ * *longer* than it started; checking pre-normalization length would let
+ * such a value slip under the cap and still land in the log oversized.
+ * `.normalize()` itself therefore always runs on unbounded input, which is
+ * acceptable here: every rung this module reads from is the invoking
+ * user's own side (the `--actor` flag, `CANKAN_ACTOR`, their own
+ * `.cankan/local.yml`, their own global config file, their own git
+ * identity) -- `actor`/`parent` are deliberately excluded from the
+ * checked-in, repo-controlled config file (`config/schema.ts`'s file-level
+ * comment) precisely so a hostile repo can never be the one feeding this
+ * function anything, unbounded or otherwise.
+ */
 const MAX_ACTOR_LENGTH = 256;
 
 /**
@@ -401,11 +428,28 @@ function joinActorSegments(actor: Actor): string {
  * revalidation, and from there into M2.7's append-only JSONL log. This
  * function closes that by joining the segments and then running the
  * result back through the *real* grammar (`tryParseActor`, the same
- * function `parseActor` uses) rather than a second, parallel validator --
- * a naive `"a/b"` name (illegal on its own, but only reachable by hand
- * construction, since `parseActor` never produces one) round-trips into
- * `context: "b"` with no tool and is correctly rejected as "a context
- * requires a tool", exactly as if a human had typed `"a/b"` at the flag.
+ * function `parseActor` uses) rather than a second, parallel validator.
+ *
+ * **This validates the joined string, not the original decomposition --
+ * it can silently re-decompose a hand-built `Actor`, not merely reject
+ * one** (fix round 3, caught in re-review): a bare `{ tool: null, name:
+ * "a/b", context: null }` round-trips into `context: "b"` with no tool
+ * and is correctly rejected as "a context requires a tool", exactly as if
+ * a human had typed `"a/b"` at the flag -- but
+ * `{ tool: "codex", name: "alice/evil", context: null }` returns
+ * `"codex:alice/evil"` with no error at all, because that candidate
+ * string is grammar-valid once a tool is present; the `/` that was inside
+ * `name` is *re-parsed* as the tool/context separator, silently becoming
+ * `name: "alice"` + `context: "evil"` instead of the caller's `name:
+ * "alice/evil"`. This is deliberately left as-is, not a residual bug: the
+ * minted `ActorId` is still grammar-valid and canonical (the one invariant
+ * this function exists to protect), and every value that could actually
+ * be attacker-controlled reaches an `Actor` through `parseActor`, never
+ * through hand construction. A caller relying on `formatActor` to
+ * preserve an exact decomposition it built by hand, rather than merely to
+ * mint a valid canonical id, is relying on something this function does
+ * not promise.
+ *
  * The value returned is built from the *reparsed* segments, not the
  * original candidate string, so a caller-constructed `Actor` whose text
  * was not already NFC-normalized still mints a canonical `ActorId`.
@@ -490,14 +534,14 @@ function rungDetailsFrom(entry: { file?: string; envVar?: string } | undefined):
  *  from -- both are kept out of `repoConfigSchema`/`globalConfigSchema`
  *  (`config/schema.ts`'s file-level comment), so only `CANKAN_*` (`"env"`)
  *  or `.cankan/local.yml` (`"repo-local"`) can ever produce one. */
-const LOCAL_ONLY_LAYERS = ["env", "repo-local"];
+const LOCAL_ONLY_LAYERS: readonly ConfigLayer[] = ["env", "repo-local"];
 
 /** The layers `cfg.value.identity?.name` can legally resolve from --
  *  `identity` lives only in `globalConfigSchema`/`effectiveConfigSchema`,
  *  reachable either from the global file (`"global"`) or a
  *  `CANKAN_IDENTITY__NAME` override (`"env"`, per `config/resolve.ts`'s S5
  *  comment on `effectiveConfigSchema` including global-only sections). */
-const IDENTITY_LAYERS = ["env", "global"];
+const IDENTITY_LAYERS: readonly ConfigLayer[] = ["env", "global"];
 
 /**
  * R-17 (fix round 2, defence in depth): the same "M2.3's own schema
@@ -512,7 +556,7 @@ const IDENTITY_LAYERS = ["env", "global"];
  */
 function requireExpectedLayer(
   entry: ResolvedEntry | undefined,
-  allowedLayers: readonly string[],
+  allowedLayers: readonly ConfigLayer[],
   field: string,
 ): asserts entry is ResolvedEntry {
   if (entry === undefined || !allowedLayers.includes(entry.layer)) {

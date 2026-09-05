@@ -1,0 +1,121 @@
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
+import { withEnv } from "../../../test-utils/src/withEnv";
+import { ensurePersonalBoard, resolvePersonalBoardPath } from "../../src/board/personal";
+import { hermeticEnv } from "../config/testHelpers";
+
+describe("resolvePersonalBoardPath -- XDG resolution (mirrors config/layers.ts's XDG_CONFIG_HOME rule)", () => {
+  test("uses XDG_DATA_HOME when it is set and absolute", () => {
+    expect(resolvePersonalBoardPath({ XDG_DATA_HOME: "/x/data", HOME: "/x/home" })).toBe(
+      "/x/data/cankan/personal",
+    );
+  });
+
+  test("falls back to $HOME/.local/share when XDG_DATA_HOME is unset", () => {
+    expect(resolvePersonalBoardPath({ HOME: "/x/home" })).toBe("/x/home/.local/share/cankan/personal");
+  });
+
+  test("falls back to $HOME/.local/share when XDG_DATA_HOME is empty", () => {
+    expect(resolvePersonalBoardPath({ XDG_DATA_HOME: "", HOME: "/x/home" })).toBe(
+      "/x/home/.local/share/cankan/personal",
+    );
+  });
+
+  test("falls back to $HOME/.local/share when XDG_DATA_HOME is relative", () => {
+    expect(resolvePersonalBoardPath({ XDG_DATA_HOME: "relative/data", HOME: "/x/home" })).toBe(
+      "/x/home/.local/share/cankan/personal",
+    );
+  });
+
+  test("returns undefined when neither HOME nor an absolute XDG_DATA_HOME is available", () => {
+    expect(resolvePersonalBoardPath({})).toBeUndefined();
+  });
+
+  test("reads env at call time, not at module load: withEnv()'s post-import mutation is observed", async () => {
+    await withEnv({ XDG_DATA_HOME: "/env-time/data" }, async () => {
+      expect(resolvePersonalBoardPath()).toBe("/env-time/data/cankan/personal");
+    });
+  });
+});
+
+describe("ensurePersonalBoard -- lazy, idempotent creation", () => {
+  test("creates the board on first call and reports created: true", async () => {
+    await withEnv(undefined, async () => {
+      const result = await ensurePersonalBoard({ env: hermeticEnv() });
+      expect(result.created).toBe(true);
+      expect(result.board.kind).toBe("personal");
+      expect(result.board.name).toBe("personal");
+      expect(result.board.root).toBe(await realpath(result.board.root));
+    });
+  });
+
+  test("a second call is idempotent: same board, created: false", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const first = await ensurePersonalBoard({ env });
+      const second = await ensurePersonalBoard({ env });
+      expect(second.created).toBe(false);
+      expect(second.board.root).toBe(first.board.root);
+      expect(second.board.ticketsDir).toBe(first.board.ticketsDir);
+    });
+  });
+
+  test("needsGitInit is true when <root>/.git is absent (this module never runs git init)", async () => {
+    await withEnv(undefined, async () => {
+      const result = await ensurePersonalBoard({ env: hermeticEnv() });
+      expect(result.needsGitInit).toBe(true);
+    });
+  });
+
+  test("effective config defaults apply with no starter .cankan/config.yml written", async () => {
+    await withEnv(undefined, async () => {
+      const result = await ensurePersonalBoard({ env: hermeticEnv() });
+      expect(result.board.coordinationRef).toBe("refs/cankan/coordination");
+      expect(result.board.ticketsDir).toBe(await realpath(join(result.board.root, "backlog", "tasks")));
+    });
+  });
+
+  test("two concurrent ensurePersonalBoard() calls converge on one board, exactly one reporting created: true", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const [a, b] = await Promise.all([ensurePersonalBoard({ env }), ensurePersonalBoard({ env })]);
+      expect(a.board.root).toBe(b.board.root);
+      expect(a.board.ticketsDir).toBe(b.board.ticketsDir);
+      const createdFlags = [a.created, b.created].sort();
+      expect(createdFlags).toEqual([false, true]);
+    });
+  });
+});
+
+describe("ensurePersonalBoard -- canonicalization ruling (mandatory macOS-shaped test)", () => {
+  test("board.root is the realpath of a symlinked XDG_DATA_HOME, not the symlink itself", async () => {
+    await withEnv(undefined, async () => {
+      // `withEnv()`'s own temp data directory is the "temp data directory"
+      // the brief asks for; a symlink to it is created at a sibling path
+      // and XDG_DATA_HOME is pointed at the symlink, not the real thing.
+      const realDataHome = process.env.XDG_DATA_HOME;
+      if (!realDataHome) throw new Error("test setup: withEnv() did not set XDG_DATA_HOME");
+      // `withEnv()` only creates `HOME` itself, not the XDG subdirectories
+      // it computes from it -- create the real target before symlinking to it.
+      await mkdir(realDataHome, { recursive: true });
+      const linkParent = await mkdtemp(join(tmpdir(), "cankan-personal-link-"));
+      try {
+        const symlinkedDataHome = join(linkParent, "data-link");
+        await symlink(realDataHome, symlinkedDataHome);
+
+        const env = { ...hermeticEnv(), XDG_DATA_HOME: symlinkedDataHome };
+        const result = await ensurePersonalBoard({ env });
+
+        expect(result.board.root).toBe(join(await realpath(symlinkedDataHome), "cankan", "personal"));
+        expect(result.board.root.startsWith(symlinkedDataHome)).toBe(false);
+
+        const rel = result.board.ticketsDir.slice(result.board.root.length);
+        expect(rel.includes("..")).toBe(false);
+      } finally {
+        await rm(linkParent, { recursive: true, force: true });
+      }
+    });
+  });
+});

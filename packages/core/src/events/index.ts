@@ -41,10 +41,11 @@ export type {
 
 export { EventErrorCodes } from "./errors";
 
-// `monthKeyUtc` and `splitJsonlLines` (`log.ts`) are module-internal helpers
-// shared between `log.ts` and `ref.ts` (and used directly by tests) — not
-// part of the public surface. No downstream task's brief asks for either as
-// a standalone utility (constraint 7).
+// `monthKeyUtc`, `splitJsonlLines`, and `validateNowForDateFormatting`
+// (`log.ts`) are module-internal helpers shared between `log.ts` and
+// `ref.ts` (and used directly by tests) — not part of the public surface.
+// No downstream task's brief asks for any of them as a standalone utility
+// (constraint 7).
 export { append, read } from "./log";
 export type { AppendedEvent, AppendOptions, EventCandidate, EventRecord, ReadOptions } from "./log";
 

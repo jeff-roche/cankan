@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { decodeTime } from "ulid";
+import { decodeTime, monotonicFactory } from "ulid";
 import { isCanKanError } from "../../src/errors";
 import { createGitAdapter, GitErrorCodes, type GitAdapter } from "../../src/git/index";
 import { EventErrorCodes } from "../../src/events/errors";
@@ -711,6 +711,163 @@ describe("read/append — fix round 2, NEW-2: now must be a finite number", () =
 });
 
 // ============================================================================
+// Fix round 3, M1 — `Number.isFinite` was the wrong bound: probes at each
+// consumer's actual boundary value (one inside, one outside)
+// ============================================================================
+
+const MAX_DATE_MS = 8_640_000_000_000_000; // Date's own representable range
+const MAX_ULID_TIME_MS = 281_474_976_710_655; // ulid's own encodable maximum
+
+describe("read — fix round 3, M1: now bounded against Date's representable range, not just isFinite", () => {
+  test("accepts now exactly at Date's representable boundary", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    // No event exists at this absurd future month — the point is only that
+    // the boundary value itself does not trip validation.
+    await expect(read(adapter, COORD_REF, { now: MAX_DATE_MS })).resolves.toEqual([]);
+  });
+
+  test("rejects now one millisecond past the boundary, even though it is finite, rather than silently hiding a real event", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    // Before the fix: `monthKeyUtc(MAX_DATE_MS + 1)` is already `"NaN-NaN"`,
+    // and `Number.isFinite(MAX_DATE_MS + 1)` is `true` — fix round 2's
+    // bound admitted this value and `read()` silently resolved `[]` on a
+    // board holding a real event.
+    expect(Number.isFinite(MAX_DATE_MS + 1)).toBe(true);
+    await expectCode(read(adapter, COORD_REF, { now: MAX_DATE_MS + 1 }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+  });
+
+  test("rejects a now far below -Date's representable range", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await expectCode(read(adapter, COORD_REF, { now: -MAX_DATE_MS - 1 }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+  });
+});
+
+describe("append — fix round 3, M1: now bounded against ulid's encodable range", () => {
+  test("accepts now exactly at ulid's encodable boundary", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    // A fresh, dedicated factory — not the shared `injectedClockUlidFactory`
+    // — because minting at the *absolute maximum* encodable time would
+    // otherwise permanently pin the module-level shared factory to that
+    // maximum for every later test in this file that also injects `now`
+    // (the monotonic factory never rolls its watermark back down), which
+    // would silently break e.g. the Ruling R23 test's exact-value
+    // assertion below. This test's own point (the boundary value itself is
+    // accepted) does not depend on which factory instance is used.
+    const appended = await append(adapter, COORD_REF, claim("ck-1", { ts: "2026-01-01T00:00:00Z" }), {
+      now: MAX_ULID_TIME_MS,
+      ulidFactory: monotonicFactory(),
+      casRetry: FAST_RETRY,
+    });
+    expect(appended.event.ticket as string).toBe("ck-1");
+  });
+
+  test("rejects now one millisecond past ulid's boundary with a CanKanError, not a raw ULIDError", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    try {
+      await append(adapter, COORD_REF, claim("ck-1"), { now: MAX_ULID_TIME_MS + 1, casRetry: FAST_RETRY });
+      throw new Error("expected append() to reject");
+    } catch (error) {
+      // Before the fix: this was an unwrapped, third-party `ULIDError`
+      // (`ENC_TIME_SIZE_EXCEED`) — not a `CanKanError`, so any
+      // `isCanKanError`-based handler downstream would not recognize it.
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+    }
+  });
+
+  test("rejects a negative now with a CanKanError, not a raw TypeError", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    try {
+      await append(adapter, COORD_REF, claim("ck-1"), { now: -1, casRetry: FAST_RETRY });
+      throw new Error("expected append() to reject");
+    } catch (error) {
+      // Before the fix: `ulid`'s own encoder throws a raw `TypeError`
+      // ("undefined is not an object (evaluating 'str.length')") for a
+      // negative seed time, confirmed by probe (task-2-report.md).
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+    }
+  });
+
+  test("rejecting an out-of-range now does not permanently poison the injected-clock ULID lane", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { now: MAX_ULID_TIME_MS + 1, casRetry: FAST_RETRY }),
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+    );
+
+    // Before the fix: `ulid`'s monotonic factory is permanently poisoned by
+    // one out-of-range call — confirmed by probe that a *second*, ordinary
+    // call against the same factory instance still throws, echoing the
+    // original bad seed. This asserts the poisoning never happened because
+    // `mint(now)` was never reached for the rejected call.
+    const appended = await append(adapter, COORD_REF, claim("ck-2"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    expect(appended.event.ticket as string).toBe("ck-2");
+  });
+});
+
+// ============================================================================
+// Fix round 3 sweep — AppendOptions.casRetry.maxAttempts was forwarded to
+// withCasRetry (git/retry.ts) unvalidated (Ruling R27)
+// ============================================================================
+
+describe("append — fix round 3 sweep: casRetry.maxAttempts validated against withCasRetry's loop domain", () => {
+  test("rejects Infinity, which would otherwise make the retry loop unbounded", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { casRetry: { maxAttempts: Number.POSITIVE_INFINITY } }),
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+    );
+  });
+
+  test("rejects NaN, which would otherwise fail every attempt immediately on an uncontended repo", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    // Before the fix: `withCasRetry`'s loop condition is `1 <= NaN`, which
+    // is always `false`, so the loop body — and therefore `attempt` itself
+    // — never runs even once, and `append` fails with a misleading
+    // `GIT_CAS_CONTENTION_EXCEEDED` on a completely uncontended repo.
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { casRetry: { maxAttempts: Number.NaN } }),
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+    );
+  });
+
+  test("rejects 0 and a negative value", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { casRetry: { maxAttempts: 0 } }),
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+    );
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-2"), { casRetry: { maxAttempts: -5 } }),
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+    );
+  });
+
+  test("accepts a legitimate small maxAttempts", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const appended = await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: { maxAttempts: 3, backoffMs: () => 0 } });
+    expect(appended.event.ticket as string).toBe("ck-1");
+  });
+});
+
+// ============================================================================
 // Fix round 2, Ruling R23 — S6's two-lane design was correct but unguarded:
 // the suite stayed green even with the fix reverted to a single shared factory
 // ============================================================================
@@ -722,10 +879,23 @@ describe("append — Ruling R23: an injected far-future now must not pin the rea
 
     // Mint via the injected-clock lane, seeded decades in the future.
     const farFuture = Date.parse("2100-01-01T00:00:00Z");
-    await append(adapter, COORD_REF, claim("ck-future", { ts: "2026-09-04T10:12:00Z" }), {
+    const futureAppended = await append(adapter, COORD_REF, claim("ck-future", { ts: "2026-09-04T10:12:00Z" }), {
       now: farFuture,
       casRetry: FAST_RETRY,
     });
+
+    // Fix round 3, L3: the injected-clock append's OWN minted id must
+    // reflect the *injected* `now`, not real time — this is the assertion
+    // the original version of this test was missing. It specifically
+    // catches `mint(now)` silently becoming `mint()` (dropping the seed
+    // argument): under that mutation, every injected-clock id would be
+    // seeded at real time while its event still lands in the *injected*
+    // month, desynchronizing read()'s ULID ordering and the `since` bound
+    // from `(month, line)` — and the assertion below (real-clock lands
+    // near Date.now()) stays true under that exact mutation, since nothing
+    // pins the real-clock lane either way. Mutation result confirming this
+    // line is what catches it: see task-2-report.md's fix-round-3 addendum.
+    expect(decodeTime(futureAppended.event.id as string)).toBe(farFuture);
 
     // A later, real-clock append (no `now` override) must mint an id whose
     // decoded timestamp reflects *real* time, not the far-future value the

@@ -253,3 +253,75 @@ describe("initRef — the fm10 ref gate", () => {
     await expectCode(initRef(adapter, "refs/heads/main", { now: NOW }), GitErrorCodes.GIT_REF_INVALID);
   });
 });
+
+// ============================================================================
+// Fix round 3 sweep — initRef validated no `now` at all
+// ============================================================================
+
+describe("initRef — fix round 3 sweep: now validated against Date's representable range", () => {
+  test("rejects now: NaN rather than committing a permanent events/NaN-NaN.jsonl", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // Before the fix: `initRef` validated no `now` at all, and this
+    // resolved successfully having committed a permanent
+    // `events/NaN-NaN.jsonl` onto the board's coordination root — a file
+    // `read()` can never see.
+    await expectCode(initRef(adapter, COORD_REF, { now: Number.NaN }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+    expect(await adapter.readRef(COORD_REF)).toBeNull();
+  });
+
+  test("rejects now one millisecond past Date's representable boundary", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const MAX_DATE_MS = 8_640_000_000_000_000;
+
+    await expectCode(
+      initRef(adapter, COORD_REF, { now: MAX_DATE_MS + 1 }),
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+    );
+    expect(await adapter.readRef(COORD_REF)).toBeNull();
+  });
+
+  test("accepts now exactly at the boundary", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const MAX_DATE_MS = 8_640_000_000_000_000;
+
+    await initRef(adapter, COORD_REF, { now: MAX_DATE_MS });
+    expect(await adapter.readRef(COORD_REF)).not.toBeNull();
+  });
+});
+
+// ============================================================================
+// Fix round 3, L2 — a ref that vanishes between readRef and the usability
+// probe is a benign local race ("absent"), not a hard failure ("unusable")
+// ============================================================================
+
+describe("initRef — fix round 3, L2: a ref that vanishes between readRef and the usability probe is treated as absent", () => {
+  test("proceeds to (re)create the ref rather than throwing EVENT_REF_UNUSABLE", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    // A real, healthy, already-initialized ref.
+    await initRef(adapter, COORD_REF, { now: NOW });
+    expect(await adapter.readRef(COORD_REF)).not.toBeNull();
+
+    const hooks: InitRefHooks = {
+      beforeUsabilityCheck: async () => {
+        // Simulate a concurrent *local* process racing this initRef call —
+        // never a remote peer, who has no way to delete this clone's local
+        // refs/cankan/*. A real `git update-ref -d`, not a mock.
+        rawGit(repo.dir, ["update-ref", "-d", COORD_REF]);
+      },
+    };
+
+    // Before the fix: `checkRefUsability`'s probe throws `GIT_REF_NOT_FOUND`
+    // once the ref is gone, and the "any other error is unusable" branch
+    // mapped that to a hard `EVENT_REF_UNUSABLE` — on a board whose only
+    // problem was a benign local race, not a corrupted ref.
+    await initRefCore(adapter, COORD_REF, { now: NOW }, hooks);
+
+    // Converged: the ref was recreated, not left absent or thrown on.
+    expect(await adapter.readRef(COORD_REF)).not.toBeNull();
+  });
+});

@@ -683,10 +683,10 @@ describe("F5 — readRef distinguishes absent from present-but-unreadable", () =
   test("a directory/file conflict on the ref's path reads as absent, and a write attempt still fails closed", async () => {
     // `show-ref --exists` reports this specific sub-case (a directory
     // sitting where the ref file would be) as exit 2, the same code as a
-    // genuinely absent ref — recorded as an accepted, deliberate
-    // simplification (see adapter.ts's `readRefCore` doc comment): a read
-    // cannot distinguish "absent" from "blocked by a directory" any better
-    // than git itself does, and the important property is that a *write*
+    // genuinely absent ref. `readRefCore`'s doc comment states the honest
+    // reason plainly: `show-ref --exists` collapses the two cases by exit
+    // code, this module adds no `lstat`-level check to tell them apart, and
+    // what makes that acceptable is the fail-closed write below — a *write*
     // attempt against that same path still cannot silently succeed.
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);

@@ -1,25 +1,52 @@
 /**
  * Zod schemas transcribed from CONCEPT.md "Configuration" (lines 277-413).
  *
- * Three schemas mirror the three config *files* exactly as CONCEPT.md shows
- * them — `.cankan/config.yml` (repo), `.cankan/local.yml` (repo-local), and
- * `~/.config/cankan/config.yml` (global). Each is deliberately narrower than
- * the merged result: a file's schema only accepts the keys CONCEPT.md's own
- * example block for *that file* shows. That is why a fourth schema exists.
+ * Three schemas mirror the three config *files* — `.cankan/config.yml`
+ * (repo), `.cankan/local.yml` (repo-local), and `~/.config/cankan/config.yml`
+ * (global). They are **not** restricted to literally the keys each file's
+ * own CONCEPT.md example block happens to show. CONCEPT.md's resolution
+ * rules (256-257, contract R1) put every one of the three files on the
+ * precedence chain for both preference keys (`env > repo-local > repo >
+ * global > default`) and policy keys (`repo > repo-local > global >
+ * default`) — so any key on either chain must be *parseable* from any of
+ * the three files, or contract R7(a)'s ruling that "a global config setting
+ * `columns` [a policy key] is legal — overridden silently" would be
+ * unreachable: a file that cannot even parse a key can never reach the
+ * merge step that would silently override it. Repo, repo-local, and global
+ * therefore share one common field set (`commonConfigFields` below).
  *
- * `effectiveConfigSchema` is the superset — the union of every key any layer
- * can contribute — and is the only one of the four that carries built-in
- * (fifth-layer) defaults via `.default(...)`. The per-file schemas never
- * default: a repo file that omits `claims.lease` must parse to `undefined`
- * for that key, not silently materialize `"2h"`, or layer-precedence
- * resolution (Task B's `resolve.ts`) could not tell "this layer set it" from
- * "this layer didn't."
+ * The one genuine structural difference between files is `backers`
+ * (contract R4): repo keys it by backer *type* with no `type` field;
+ * global keys it by user-chosen *name* with `type` required. Repo-local
+ * follows the repo shape — a local override targets an already-declared
+ * repo backer by that same type name, it does not introduce a new one.
  *
- * Every object shape below is `z.strictObject(...)` so an unknown key
+ * `identity`, `credentials`, `personal`, and `repos` are kept **global-only
+ * by design**, not by the same "narrow transcription" mistake this file
+ * originally made elsewhere: CONCEPT.md's own layers table (~247-251)
+ * names exactly this set — "identity, editor, default lease, agent tool,
+ * credential references, ... personal board settings" — as what
+ * distinguishes the global layer's *purpose*, and none of the four appears
+ * in the classification table (415-426) or in more than one file's
+ * example, so there is no documented multi-file resolution chain for them
+ * to plug into the way there is for `claims`, `sync`, `columns`, etc. This
+ * is a scoping call, flagged in the implementer report, not a contract
+ * ruling — it could reasonably go the other way.
+ *
+ * `effectiveConfigSchema` is the superset — the union of every key any
+ * layer can contribute — and is the only one of the four schemas that
+ * carries built-in (fifth-layer) defaults via `.default(...)`. The
+ * per-file schemas never default: a file that omits `claims.lease` must
+ * parse to `undefined` for that key, not silently materialize `"2h"`, or
+ * layer-precedence resolution (Task B's `resolve.ts`) could not tell "this
+ * layer set it" from "this layer didn't."
+ *
+ * Every fixed-shape object below is `z.strictObject(...)` so an unknown key
  * anywhere in a config file surfaces as a zod issue naming that key's path
  * (contract R13). Only genuinely dynamic maps (`backers`, `queues`, `hooks`,
  * `priority_map`, `status_map`, `repos.names`) use `z.record(...)`, which
- * has no notion of "unrecognized key" — any string is a legal map key.
+ * has no notion of "unrecognized key" — any string is a legal map key, so
+ * strictness cannot apply there; see the implementer report.
  */
 
 import { z } from "zod";
@@ -174,23 +201,27 @@ const queuesSchema = z.record(z.string(), queueEntrySchema);
 const hooksSchema = z.record(z.string(), z.string());
 
 // ---------------------------------------------------------------------------
-// `.cankan/config.yml` — repo, checked in (CONCEPT.md 277-358)
+// Fields shared by all three files (see the file-level comment: contract R1
+// and R7(a) put every one of repo/repo-local/global on the precedence chain
+// for both preference and policy keys, so none of these can be restricted
+// to a single file). None default here — only `effectiveConfigSchema`
+// below does.
 // ---------------------------------------------------------------------------
 
-const repoCoordinationSchema = z.strictObject({
+const coordinationSchema = z.strictObject({
   ref: coordinationRefSchema.optional(),
   mode: coordinationModeSchema.optional(),
   push_ref: z.boolean().optional(),
 });
 
-const repoClaimsSchema = z.strictObject({
+const claimsSchema = z.strictObject({
   lease: durationSchema.optional(),
   /** `0 = unlimited` (CONCEPT.md 299). */
   max_per_actor: z.number().int().min(0).optional(),
   require_ready: z.boolean().optional(),
 });
 
-const repoSyncSchema = z.strictObject({
+const syncSchema = z.strictObject({
   auto_push: syncAutoPushSchema.optional(),
   auto_pull: syncAutoPullSchema.optional(),
   conflict_policy: syncConflictPolicySchema.optional(),
@@ -201,45 +232,62 @@ const readySchema = z.strictObject({
   exclude_labels: z.array(z.string()).optional(),
 });
 
-const repoAgentsSchema = z.strictObject({
+const agentsSchema = z.strictObject({
   instructions_file: z.string().optional(),
   mcp: z.boolean().optional(),
+  default_tool: z.string().optional(),
 });
 
-export const repoConfigSchema = z.strictObject({
+const outputSchema = z.strictObject({
+  color: outputColorSchema.optional(),
+  json_pretty: z.boolean().optional(),
+});
+
+/** Every field valid in repo, repo-local, *and* global — everything except `backers` (R4) and the global-only sections. */
+const commonConfigFields = {
   version: z.number().int().optional(),
   project: z.string().optional(),
   id_prefix: z.string().optional(),
   tickets_dir: z.string().optional(),
   columns: z.array(z.string()).optional(),
-  coordination: repoCoordinationSchema.optional(),
-  claims: repoClaimsSchema.optional(),
-  sync: repoSyncSchema.optional(),
-  backers: z.record(z.string(), repoBackerEntrySchema).optional(),
+  coordination: coordinationSchema.optional(),
+  claims: claimsSchema.optional(),
+  sync: syncSchema.optional(),
   default_backer: defaultBackerChoiceSchema.optional(),
   ready: readySchema.optional(),
   queues: queuesSchema.optional(),
   hooks: hooksSchema.optional(),
-  agents: repoAgentsSchema.optional(),
+  agents: agentsSchema.optional(),
   definition_of_done: z.array(z.string()).optional(),
+  actor: z.string().optional(),
+  parent: z.string().optional(),
+  editor: z.string().optional(),
+  output: outputSchema.optional(),
+};
+
+// ---------------------------------------------------------------------------
+// `.cankan/config.yml` — repo, checked in (CONCEPT.md 277-358)
+// ---------------------------------------------------------------------------
+
+export const repoConfigSchema = z.strictObject({
+  ...commonConfigFields,
+  backers: z.record(z.string(), repoBackerEntrySchema).optional(),
 });
 
 export type RepoConfig = z.infer<typeof repoConfigSchema>;
 
 // ---------------------------------------------------------------------------
-// `.cankan/local.yml` — repo-local, gitignored (CONCEPT.md 360-369)
+// `.cankan/local.yml` — repo-local, gitignored (CONCEPT.md 360-369). Same
+// shape as `repoConfigSchema` — see the file-level comment on why a
+// per-file schema is not restricted to one file's own example block, and
+// why `backers` still follows the repo (type-keyed) shape here: a local
+// override targets an already-declared repo backer by type, it does not
+// introduce a global-style named one.
 // ---------------------------------------------------------------------------
 
-const localSyncSchema = z.strictObject({
-  auto_pull: syncAutoPullSchema.optional(),
-});
-
 export const localConfigSchema = z.strictObject({
-  actor: z.string().optional(),
-  parent: z.string().optional(),
-  default_backer: defaultBackerChoiceSchema.optional(),
-  sync: localSyncSchema.optional(),
-  hooks: hooksSchema.optional(),
+  ...commonConfigFields,
+  backers: z.record(z.string(), repoBackerEntrySchema).optional(),
 });
 
 export type LocalConfig = z.infer<typeof localConfigSchema>;
@@ -253,25 +301,8 @@ const identitySchema = z.strictObject({
   email: z.string().optional(),
 });
 
-const globalClaimsSchema = z.strictObject({
-  lease: durationSchema.optional(),
-});
-
-const globalSyncSchema = z.strictObject({
-  auto_push: syncAutoPushSchema.optional(),
-});
-
 const credentialsSchema = z.strictObject({
   store: credentialsStoreSchema.optional(),
-});
-
-const globalAgentsSchema = z.strictObject({
-  default_tool: z.string().optional(),
-});
-
-const outputSchema = z.strictObject({
-  color: outputColorSchema.optional(),
-  json_pretty: z.boolean().optional(),
 });
 
 const personalSchema = z.strictObject({
@@ -291,15 +322,11 @@ const reposSchema = z.strictObject({
 });
 
 export const globalConfigSchema = z.strictObject({
-  version: z.number().int().optional(),
-  identity: identitySchema.optional(),
-  editor: z.string().optional(),
-  claims: globalClaimsSchema.optional(),
-  sync: globalSyncSchema.optional(),
-  credentials: credentialsSchema.optional(),
-  agents: globalAgentsSchema.optional(),
-  output: outputSchema.optional(),
+  ...commonConfigFields,
   backers: z.record(z.string(), globalBackerEntrySchema).optional(),
+  // Global-only sections — see the file-level comment.
+  identity: identitySchema.optional(),
+  credentials: credentialsSchema.optional(),
   personal: personalSchema.optional(),
   repos: reposSchema.optional(),
 });

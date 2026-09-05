@@ -11,7 +11,7 @@
  * decision this file makes.
  */
 
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { type Document, type Tags, parseDocument } from "yaml";
 import type { z } from "zod";
@@ -112,9 +112,60 @@ function isEnoent(err: unknown): boolean {
 }
 
 /**
+ * Review round 2 finding 12: with no containment check before `readFile`
+ * (which follows symlinks), a committed symlink at `.cankan/config.yml` or
+ * `.cankan/local.yml` — both repo-controlled, attacker-supplyable paths —
+ * turns `loadConfig` into a read oracle for any file the invoking user can
+ * read. Reproduced against a `~/.config/gh/hosts.yml`-shaped target: the
+ * resulting error surfaced that file's top-level YAML key names (after
+ * fix round 1's truncation, bounded to a 20-char prefix each) plus a
+ * file-existence/parseability oracle. R13's constructed messages and R16
+ * both still hold — no *value* leaks, only key names and existence — which
+ * is why this is Minor rather than Important.
+ *
+ * `lstat`s the target and rejects with a `CanKanError` if it is a symlink,
+ * **without ever calling a realpath function** (checked deliberately: on
+ * macOS `$TMPDIR` sits under `/var/folders/...`, and `/var` itself is a
+ * symlink to `/private/var`, so a resolved path and a constructed one can
+ * differ by a `/private` prefix — the exact hazard that broke M2.6's CI.
+ * `lstat` inspects the link itself and returns no path, so it carries none
+ * of that risk).
+ *
+ * Deliberately asymmetric: only `resolveRepoConfigPath`/
+ * `resolveRepoLocalConfigPath` results are checked (`resolve.ts` passes
+ * `rejectSymlink: true` for those two, `false` for the global path). The
+ * global config (`~/.config/cankan/config.yml`) is the user's *own* file —
+ * symlinking personal dotfiles into a dotfiles repo is an entirely normal
+ * workflow, and rejecting it would break that to close nothing, since the
+ * user already fully controls what that path points at.
+ */
+async function assertNotSymlink(absPath: string): Promise<void> {
+  let stats: Awaited<ReturnType<typeof lstat>>;
+  try {
+    stats = await lstat(absPath);
+  } catch {
+    // ENOENT (or any other lstat failure) is not this check's concern --
+    // `readFile` below will hit the same condition and report it uniformly
+    // (R12 missing-layer, or its own read-failure message).
+    return;
+  }
+  if (stats.isSymbolicLink()) {
+    throw new CanKanError(
+      ConfigErrorCodes.INVALID_CONFIG,
+      `${absPath}: refusing to read a symlinked repo config file`,
+      { details: { file: absPath } },
+    );
+  }
+}
+
+/**
  * Reads and parses one YAML file. Returns `undefined` when the file does
  * not exist (R12 — a missing layer is normal, not an error). Throws on any
  * other read failure, and on a YAML syntax error.
+ *
+ * `rejectSymlink`: see `assertNotSymlink` above (review round 2 finding
+ * 12). Repo/repo-local callers pass `true`; the global-layer caller passes
+ * `false`.
  *
  * R16: `yaml@2.9.0`'s `YAMLParseError.message` quotes the offending source
  * line verbatim — a syntax error near `personal.remote` would otherwise put
@@ -129,7 +180,12 @@ function isEnoent(err: unknown): boolean {
 export async function readYamlFile(
   absPath: string,
   customTags: Tags,
+  rejectSymlink: boolean,
 ): Promise<ParsedYamlFile | undefined> {
+  if (rejectSymlink) {
+    await assertNotSymlink(absPath);
+  }
+
   let text: string;
   try {
     text = await readFile(absPath, "utf8");
@@ -271,20 +327,27 @@ function deepFreeze<T>(value: T): T {
 /**
  * Reads, parses, and schema-validates one layer file. Returns `undefined`
  * when the file does not exist (R12). Throws a `CanKanError` naming the
- * file for a read failure, a YAML syntax error (R16), a schema validation
- * failure (R13/S2), or a failure converting the parsed document to a plain
- * value (e.g. `yaml`'s alias-expansion guard rejecting an anchor/alias
- * bomb) — `doc.toJS()` sat outside this function's try/catch in an earlier
- * version, so that last case escaped `loadConfig` as a bare, unwrapped
- * error with no file named and no `CanKanError` code.
+ * file for a read failure, a symlinked repo-controlled path (review round
+ * 2 finding 12, when `rejectSymlink` is `true`), a YAML syntax error
+ * (R16), a schema validation failure (R13/S2), or a failure converting the
+ * parsed document to a plain value (e.g. `yaml`'s alias-expansion guard
+ * rejecting an anchor/alias bomb) — `doc.toJS()` sat outside this
+ * function's try/catch in an earlier version, so that last case escaped
+ * `loadConfig` as a bare, unwrapped error with no file named and no
+ * `CanKanError` code.
+ *
+ * `rejectSymlink`: pass `true` for the repo and repo-local paths (attacker
+ * -supplyable), `false` for the global path (the user's own file — see
+ * `assertNotSymlink`'s comment for why that asymmetry is deliberate).
  */
 export async function loadValidatedLayer(
   layer: LoadedLayer["layer"],
   absPath: string,
   schema: z.ZodType,
   customTags: Tags,
+  rejectSymlink: boolean,
 ): Promise<ValidatedLayer | undefined> {
-  const parsed = await readYamlFile(absPath, customTags);
+  const parsed = await readYamlFile(absPath, customTags, rejectSymlink);
   if (!parsed) {
     return undefined;
   }

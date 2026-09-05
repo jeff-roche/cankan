@@ -1,13 +1,12 @@
 /**
- * Public surface of the event log (M2.7 dispatches 1-3: schema, append/read,
- * ref init, the lease-observation store). The poisoned-ref recovery path
- * (dispatch 4) appends its own exports here later.
+ * Public surface of the event log (M2.7: schema, append/read, ref init, the
+ * lease-observation store, and the poisoned-ref recovery path).
  *
- * **Deliberately not re-exported here**: `appendCore` (`log.ts`) and
- * `initRefCore` (`ref.ts`) — the test-only seams behind `append`/`initRef`.
- * A test reaches them via a relative import to the source file (the same
- * pattern `git.test.ts` uses for `updateRefCASCore`), never through this
- * module's public surface.
+ * **Deliberately not re-exported here**: `appendCore` (`log.ts`),
+ * `initRefCore` (`ref.ts`), and `recoverCore` (`recovery.ts`) — the
+ * test-only seams behind `append`/`initRef`/`recover`. A test reaches them
+ * via a relative import to the source file (the same pattern `git.test.ts`
+ * uses for `updateRefCASCore`), never through this module's public surface.
  */
 
 export {
@@ -58,3 +57,17 @@ export type { InitRefOptions } from "./ref";
 // `observations.ts`'s doc comment for exactly when.
 export { boardKeyFor, discard, firstSeen, observe } from "./observations";
 export type { ObserveOptions } from "./observations";
+
+// The poisoned-ref recovery path (M2.7 dispatch 4, ADR 0001:828-847). Never
+// wired into `append`/`read` — see `recovery.ts`'s own doc comment.
+export { diagnose, recover, safeLinePreview } from "./recovery";
+export type {
+  DiagnoseOptions,
+  DiagnosticFailure,
+  DiagnosticFailureReason,
+  DiagnosticReport,
+  QuarantinedLineSummary,
+  QuarantineRecord,
+  RecoveryOptions,
+  RecoveryResult,
+} from "./recovery";

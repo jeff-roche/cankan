@@ -236,4 +236,21 @@ export const EventErrorCodes = {
    * this module does not control and must not publish.
    */
   EVENT_OBSERVATION_STORE_UNAVAILABLE: "EVENT_OBSERVATION_STORE_UNAVAILABLE",
+  /**
+   * `recovery.ts`'s `recover()` was given a `RecoveryOptions.casRetry` shaped
+   * wrong — the same class of defect `EVENT_APPEND_INVALID_OPTION` closes
+   * for `append()`, applied here because `recover()` forwards its own
+   * `casRetry` to the same `withCasRetry` (M2.6), which does not validate it
+   * itself. Raised before any git invocation, at the same four sites:
+   * `casRetry` itself must not be `null`; `casRetry.maxAttempts` must be a
+   * finite integer in `[1, MAX_CAS_ATTEMPTS]`; `casRetry.backoffMs` itself,
+   * and every value it returns, must be a function / a finite number in
+   * `[0, MAX_BACKOFF_MS]` respectively; `casRetry.sleep` must be a function.
+   * `now`/`trailingMonths` validation failures reuse
+   * `EVENT_LOG_INVALID_WINDOW` instead of a new code — `diagnose()`/
+   * `recover()` apply the identical bound `read()` does to the identical
+   * parameters, so the failure is the same class, just raised from a
+   * different function.
+   */
+  EVENT_RECOVERY_INVALID_OPTION: "EVENT_RECOVERY_INVALID_OPTION",
 } as const;

@@ -8,6 +8,13 @@
  * that is what makes the remaining M2 rounds parallelizable across lanes.
  * Editing this file is a merge conflict with every other lane.
  *
+ * Exports flow up to here; imports must never flow back through it. Inside a
+ * module, import `../errors` and `../types` directly, and a sibling module by
+ * its own path (`../config/resolve`) — never `../index`. Importing the root
+ * from a module the root re-exports makes a cycle (`index → state → index`);
+ * ESM permits it, but a class such as `CanKanError` referenced at module
+ * scope is then still in its temporal dead zone and reads as `undefined`.
+ *
  * The thirteen module folders are re-exported **namespaced** rather than
  * flat: thirteen flat `export *`s would collide the moment two folders
  * export the same name, which is already scheduled to happen (M2.3 creates

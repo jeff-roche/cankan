@@ -1,12 +1,21 @@
 /**
  * `CanKanError` — the one error type every CanKan module throws.
  *
- * `code` is a plain `string`, deliberately left open. Six later lanes each
- * introduce their own failure codes (M2.3's `POLICY_VIOLATION`, M2.6's
- * ref-validation codes, M2.10's claim-rejection codes, and more): each module
- * declares its own code constants in its own folder, never here. This file
- * seeds only the codes CONCEPT.md's exit-code map already names (CONCEPT.md
- * "Exit codes", ~line 575).
+ * `code` is a plain `string`, deliberately left open. This file seeds only
+ * the codes CONCEPT.md's exit-code map already names (CONCEPT.md "Exit
+ * codes", ~line 575). Later modules relate to those codes in two ways, and
+ * neither one edits this file:
+ *
+ * - They **raise** a seeded code in their own domain — the config module
+ *   raises `POLICY_VIOLATION` when a `!policy` pin is overridden, the claims
+ *   module raises `CLAIM_REJECTED` when a ticket is already held.
+ * - They **may additionally define** codes of their own, for failures the
+ *   exit-code map does not name — ref validation against
+ *   `docs/decisions/0001-coordination-ref.md`, say. Those constants belong
+ *   in the defining module's own folder (e.g. a future `git/errors.ts`).
+ *
+ * A closed union here would force every one of those modules to edit this
+ * shared file, and they are built concurrently.
  *
  * This file does NOT build the code→exit-code mapping — that is M3.10's
  * `Creates`, and the numbers from CONCEPT.md's exit-code line are
@@ -14,9 +23,8 @@
  */
 
 /**
- * The exit-code-map failure codes seeded at M2.1. Every other module's error
- * codes live in that module's own folder (e.g. a future `config/errors.ts`),
- * not here.
+ * The exit-code-map failure codes seeded at M2.1. Any code a module defines
+ * beyond these lives in that module's own folder, not here.
  */
 export const ErrorCodes = {
   GENERIC_ERROR: "GENERIC_ERROR",
@@ -42,7 +50,11 @@ export const ErrorCodes = {
  * values that are safe to show the user who ran the command — a config file
  * path they already know, the actor name holding a claim, a config key.
  * Never credentials, tokens, environment values, a backer's HTTP response
- * body, or text copied out of `cause.message`, which may carry any of those.
+ * body, or anything copied out of `cause` — and note that `cause` leaks from
+ * more than its `message`: a `simple-git` `GitError` carries the raw argv in
+ * `cause.task.commands`, including a credential-bearing remote URL that
+ * git's own stderr redacts. Copying a whole command line into `details` is
+ * the easy path and the wrong one.
  *
  * Keep it flat: JSON primitives, or arrays of them. The constructor's freeze
  * is shallow, so a nested object stays aliased to the caller's and stays
@@ -68,6 +80,13 @@ export interface SerializedCanKanError {
  * comment. `cause` is the native ES2022 `Error.cause` (this repo's
  * `tsconfig.base.json` sets `"lib": ["ES2022"]`), passed through via
  * `super(message, { cause })`; there is no separate `cause` property here.
+ *
+ * **`message` is published too** — `toJSON` always emits it and the terminal
+ * always prints it — so build it from fixed text plus values you chose, and
+ * never by interpolating `cause.message`. A `yaml` `YAMLParseError` quotes
+ * the offending source line verbatim with a caret under it, so a syntax
+ * error next to `personal.remote` in global config puts a credential-bearing
+ * URL straight into the message.
  *
  * `details` is copied and frozen on construction, so a caller that mutates
  * the object it passed in cannot change an already-thrown error. Read the

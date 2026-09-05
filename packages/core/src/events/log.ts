@@ -22,7 +22,7 @@ import type { CasRetryOptions, GitAdapter } from "../git/index";
 import { validateCoordinationRef, withCasRetry } from "../git/index";
 import { EventErrorCodes } from "./errors";
 import { canonicalizeTicketId, parseEvent } from "./schema";
-import type { Event, EventId } from "./schema";
+import type { Event, EventId, EventValidationIssue } from "./schema";
 
 // ============================================================================
 // Month keys — the append-time clock decides the file, never a peer's `ts`
@@ -49,12 +49,50 @@ export function monthKeyUtc(nowMs: number): string {
 }
 
 /**
+ * Upper bound on `trailingMonths`/`ReadOptions.trailingMonths` (fix round 1,
+ * S1). 120 (10 years) is generous headroom over any lease-derived value a
+ * sane config could produce, while bounding the loop below against a
+ * degenerate or hostile one: `config/schema.ts`'s lease-duration pattern
+ * (`/^\d+(ms|s|m|h|d|w)$/`) admits an unbounded digit count, so a checked-in
+ * `lease: <hundreds of digits>w` value can produce `Infinity` (or a
+ * similarly absurd finite number) once converted to a month count —
+ * confirmed by probe (see task-2-report.md's fix-round-1 addendum) that,
+ * unguarded, this drove a synchronous, unbounded `Array.push` loop that
+ * starved the event loop.
+ */
+const MAX_TRAILING_MONTHS = 120;
+
+/**
+ * Validates `trailingMonths` before it drives any loop (fix round 1, S1).
+ * Must be a finite integer in `[1, MAX_TRAILING_MONTHS]` — `0`, a negative
+ * number, `NaN`, and `Infinity` are all rejected by `Number.isInteger`
+ * alone (which is `false` for all four), and the upper bound additionally
+ * rejects a merely-huge-but-finite value that would otherwise still hang
+ * the loop for an unreasonable time. Raised **before** any git invocation:
+ * this is a parameter-shape check, not a git-state check.
+ */
+function validateTrailingMonths(trailingMonths: number): void {
+  if (!Number.isInteger(trailingMonths) || trailingMonths < 1 || trailingMonths > MAX_TRAILING_MONTHS) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+      `trailingMonths must be an integer in [1, ${MAX_TRAILING_MONTHS}]`,
+      { details: { trailingMonths, max: MAX_TRAILING_MONTHS } },
+    );
+  }
+}
+
+/**
  * The `trailingMonths` trailing month keys ending at `monthKeyUtc(nowMs)`,
  * **oldest first** — the order `read()` walks in, so line indices and the
  * `position` counter both advance in append-only chain order (obligation D's
  * companion: a month's *name* is decided by the clock, but which months get
  * read, and in what order, must still walk oldest-to-newest to mean
  * anything as a chain position).
+ *
+ * `trailingMonths` must already be validated (`validateTrailingMonths`) by
+ * the time this runs — this function does not re-check it, so it stays a
+ * pure "compute the keys" helper with no error-raising responsibility of
+ * its own.
  */
 function trailingMonthKeysOldestFirst(nowMs: number, trailingMonths: number): string[] {
   const keys: string[] = [];
@@ -111,23 +149,172 @@ export function splitJsonlLines(content: string): string[] {
   return parts;
 }
 
+/**
+ * Counts `content`'s logical lines under the exact same rule
+ * `splitJsonlLines` applies, **without allocating the array of substrings**
+ * (fix round 1, S2). `append`'s retry loop only ever needs the *count* (to
+ * report `AppendedEvent.line`), and building the whole split array purely to
+ * read its `.length` is wasted allocation on every attempt, of content that
+ * can be up to `MAX_MONTH_BLOB_BYTES` in size (measured to matter —
+ * task-2-report.md's fix-round-1 addendum).
+ *
+ * Single forward scan counting `\n` occurrences (a `\r\n` pair still
+ * contains exactly one `\n`, so this counts identically to `splitJsonlLines`
+ * for either line ending) plus one more if `content` does not end in a
+ * newline — mirroring `splitJsonlLines`'s "an un-terminated tail is one more
+ * line" rule exactly, even though `appendCore`'s own malformed-tail check
+ * (immediately before this is called) means that branch is unreachable from
+ * `append` today; kept correct anyway so this stays a faithful, reusable
+ * counterpart to `splitJsonlLines` rather than a shortcut valid only under
+ * `append`'s specific preconditions.
+ */
+function countJsonlLines(content: string): number {
+  if (content.length === 0) {
+    return 0;
+  }
+  let count = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (content.charCodeAt(i) === 10 /* "\n" */) {
+      count += 1;
+    }
+  }
+  if (!content.endsWith("\n")) {
+    count += 1;
+  }
+  return count;
+}
+
+// ============================================================================
+// Size bounds — obligation A, and fix round 1's S1/S2
+// ============================================================================
+
+/**
+ * Obligation A: the byte cap applied to each line *before* `parseEvent` (and
+ * therefore `JSON.parse`) ever sees it — confirmed by probe (dispatch 1's
+ * report) that a `.max()` inside the schema cannot prevent the allocation,
+ * since `JSON.parse` has already materialized the whole string by the time
+ * zod runs. Derived, not guessed: `MAX_HOOK_OUTPUT_CHARS` (100,000,
+ * `schema.ts`) is this schema's single largest free-text field, and
+ * `JSON.stringify` can expand a character to a 6-byte `\uXXXX` escape in the
+ * worst case (a lone surrogate or a control character), so the largest
+ * legitimate `hook` event's `output` field alone can occupy up to 600,000
+ * bytes of line content. 1 MiB (1,048,576 bytes) rounds that up with
+ * headroom for the rest of the envelope and every other field, while still
+ * bounding a single push far below "every peer that fetches the ref pays a
+ * 500MB allocation on every read" (the attack obligation A names).
+ */
+const MAX_LINE_BYTES = 1_048_576;
+
+/**
+ * A month blob's own overall size bound. **Honesty about what this bound
+ * can and cannot do, stated directly rather than implied**: by the time
+ * `readBlobFromRef` returns, `git cat-file` has already materialized the
+ * entire blob as one string — `GitAdapter` exposes no way to size-check
+ * before that happens, so this check runs strictly *after* the allocation
+ * obligation A is concerned with, unlike `MAX_LINE_BYTES` above (which runs
+ * before `parseEvent`/`JSON.parse` touch a specific line). This is
+ * therefore a resource **sanity** bound — it stops a single month file from
+ * growing without limit and stops a `read()` call from continuing to
+ * process a blob that is already absurd — not a pre-allocation DoS defense.
+ * A true pre-allocation guard would need `readBlobFromRef`'s own `cat-file`
+ * invocation to size-check before streaming the content back, which is
+ * M2.6's surface, not this module's, and is flagged in the report rather
+ * than worked around here.
+ *
+ * 64 MiB is deliberately generous: at `MAX_LINE_BYTES`'s cap, that is still
+ * room for 64 fully-maximal lines, and for the realistic case of small
+ * claim/renew/release events (well under a kilobyte each), tens of millions
+ * of events in one month — far beyond anything a real board produces.
+ * **A separate line-count bound was considered and rejected as redundant**:
+ * the shortest possible valid JSONL line this schema can produce is well
+ * over ten bytes (`{"ts":"...",...}`), so a byte bound already caps the
+ * line count by construction; a second, independent counter would duplicate
+ * the same protection without adding a case this bound misses.
+ *
+ * **Fix round 1, S2: also enforced by `append`, against the blob it is
+ * about to extend, not only by `read`.** Before this fix, `read` refused a
+ * month past this size while `append` had no bound at all — a write path
+ * that helped an attacker grow exactly what the read path already refused,
+ * silently. `AppendOptions.maxExistingBlobBytes` (default: this constant) is
+ * the escape hatch a caller with a legitimate reason to write past this
+ * bound (dispatch 4's poisoned-ref recovery/quarantine write) can use —
+ * see that option's own doc comment.
+ */
+const MAX_MONTH_BLOB_BYTES = 64 * 1024 * 1024;
+
+/**
+ * `read`'s aggregate cap across its whole `trailingMonths` window (fix
+ * round 1, S2). The per-month cap above bounds one file; without this, a
+ * caller passing a large `trailingMonths` (a legitimate use of the
+ * documented M2.10 contract on that parameter — see `DEFAULT_TRAILING_MONTHS`'s
+ * doc comment) could still be asked to hold `trailingMonths ×
+ * MAX_MONTH_BLOB_BYTES` in memory at once: 24 months × 64 MiB = 1.5 GiB for
+ * one `read()` call. 256 MiB is generous for any real board (the same
+ * "tens of millions of small events" headroom `MAX_MONTH_BLOB_BYTES`'s own
+ * comment describes, spread across up to `MAX_TRAILING_MONTHS` files
+ * instead of one) while giving `read()` a resource ceiling independent of
+ * how large a window a caller asks for.
+ */
+const MAX_AGGREGATE_READ_BYTES = 256 * 1024 * 1024;
+
+/** Flattens `EventValidationIssue[]` into plain strings (fix round 1, S5) — see the call sites' comments for why. */
+function renderIssues(issues: readonly EventValidationIssue[]): string[] {
+  return issues.map((issue) =>
+    issue.path.length > 0 ? `${issue.path}: ${issue.message} (${issue.code})` : `${issue.message} (${issue.code})`,
+  );
+}
+
 // ============================================================================
 // `append(event)`
 // ============================================================================
 
 /**
- * A one-shot ULID factory shared across every `append` call that does not
- * inject its own (obligation: two events minted in the same millisecond by
- * this process must still sort strictly increasing — confirmed by probe,
- * see task-2-report.md). **Module-level and stateful on purpose**: `ulid`'s
+ * A ULID factory shared across every `append` call that runs on the real,
+ * un-injected clock (obligation: two events minted in the same millisecond
+ * by this process still sort strictly increasing — confirmed by probe, see
+ * task-2-report.md). **Module-level and stateful on purpose**: `ulid`'s
  * `monotonicFactory` return value tracks the last time/randomness it
  * produced internally, so a *fresh* factory per call would lose that state
- * and defeat same-millisecond monotonicity across separate `append` calls
- * from this process. A caller that needs deterministic ids in a test
- * supplies its own factory via `AppendOptions.ulidFactory` instead of
- * relying on (or fighting) this shared instance.
+ * and defeat same-millisecond monotonicity across separate `append` calls.
+ *
+ * **Fix round 1, S6 — this instance is used only when `options.now` is NOT
+ * supplied.** The original bug: feeding a caller-injected `now` into this
+ * *shared* factory permanently "pins" it — `ulid`'s monotonic factory does
+ * not roll its internal clock backward for a smaller seed time than it has
+ * already seen (confirmed by probe, task-2-report.md); it just keeps
+ * incrementing randomness against the highest timestamp it was ever given.
+ * So one caller injecting a `now` in the past (a replay tool, a CLI `--at`
+ * flag, a test sharing this process with a real board) would silently stop
+ * every *subsequent, real-clock* `append` call from tracking real time.
+ *
+ * **The first fix attempt (a fresh `monotonicFactory()` per call whenever
+ * `now` is injected) was itself wrong, caught by this dispatch's own test
+ * suite going red**: two separate `append` calls injecting the *same* `now`
+ * (a completely ordinary pattern — any test or replay that holds a clock
+ * fixed across a burst of appends) got two *independent* fresh factories,
+ * each drawing its own random suffix with no ordering relationship to the
+ * other — breaking the very "same millisecond, same process, still
+ * monotonic" guarantee this factory exists for, this time across calls
+ * instead of within one. The real fix needs two *persistent* lanes, not a
+ * shared one and a disposable one: see `injectedClockUlidFactory` below.
  */
 const defaultUlidFactory = monotonicFactory();
+
+/**
+ * The second lane (fix round 1, S6): a *separate*, equally persistent
+ * `monotonicFactory()` instance used for every `append` call that supplies
+ * its own `options.now` (and no explicit `ulidFactory`). Sharing this one
+ * instance across every injected-clock call preserves monotonicity within a
+ * sequence of such calls — exactly what a test or replay tool holding a
+ * fixed or scripted clock needs — while keeping it **completely isolated**
+ * from `defaultUlidFactory`, so an injected `now` (however far in the past)
+ * can never pin or otherwise affect a real-clock `append`'s minted ids, and
+ * vice versa. Two independent lanes, not "shared" and "disposable," is what
+ * makes both halves of the original property hold at once: monotonic across
+ * repeated calls sharing a clock, and never cross-contaminated between the
+ * real-clock and injected-clock paths.
+ */
+const injectedClockUlidFactory = monotonicFactory();
 
 /**
  * Every event kind, with `id` optional — the shape `append`'s caller
@@ -160,20 +347,46 @@ export interface AppendOptions {
    * `Date.now()`. Injectable so a month-rollover test can write events
    * either side of a UTC boundary without waiting for real time to cross
    * it.
+   *
+   * **Fix round 1, S6**: supplying this also switches id-minting (when
+   * `ulidFactory` is not separately given) to the separate
+   * `injectedClockUlidFactory` lane instead of the real-clock
+   * `defaultUlidFactory` — see both constants' doc comments for why two
+   * persistent lanes, not a shared one and a disposable one, are what keep
+   * this correct.
    */
   readonly now?: number;
   /**
    * The ULID factory used to mint `id` when the caller's candidate omits
-   * it. Defaults to a shared, module-level `monotonicFactory()` instance
-   * (see `defaultUlidFactory`'s doc comment for why module-level, not
-   * per-call). Injectable so a test can control minted ids deterministically
-   * (`ulid`'s `ULIDFactory` type is `(seedTime?: number) => string`, and
-   * `monotonicFactory()`'s return value accepts an explicit seed time —
-   * confirmed by probe, see task-2-report.md).
+   * it. Defaults to `defaultUlidFactory` (the real-clock lane) when `now` is
+   * not supplied, or `injectedClockUlidFactory` (the injected-clock lane)
+   * when it is (fix round 1, S6 — see both constants' doc comments).
+   * Injectable so a test can control
+   * minted ids deterministically (`ulid`'s `ULIDFactory` type is
+   * `(seedTime?: number) => string`, and `monotonicFactory()`'s return
+   * value accepts an explicit seed time — confirmed by probe, see
+   * task-2-report.md).
    */
   readonly ulidFactory?: (seedTime?: number) => string;
   /** Passed through to `withCasRetry` unchanged — the retry policy is M2.6's, not reimplemented here. */
   readonly casRetry?: CasRetryOptions;
+  /**
+   * The cap on the *existing* month blob's size, checked before this call
+   * extends it (fix round 1, S2). Defaults to `MAX_MONTH_BLOB_BYTES` — the
+   * same bound `read()` enforces, so a normal `append` can never grow a
+   * month past what a subsequent `read()` would accept.
+   *
+   * **This is a deliberate, public escape hatch, not a normal-use knob.**
+   * A caller with a legitimate reason to write into an already-oversized
+   * month — dispatch 4's poisoned-ref recovery/quarantine write, most
+   * plausibly — can override this (e.g. to `Number.POSITIVE_INFINITY`) to
+   * disable the check for that one call. Left reachable deliberately:
+   * making this cap absolute would give a corrupted, oversized log no
+   * write path back to a recoverable state, which is a worse outcome than
+   * the DoS this cap defends against. Ordinary callers should never touch
+   * this field.
+   */
+  readonly maxExistingBlobBytes?: number;
 }
 
 /**
@@ -222,22 +435,23 @@ export interface AppendHooks {
  *
  * **The mandated cycle (ADR 0001:696-699), generalized from `claimViaCAS` to
  * the full event union**: read the ref and the current month's blob, check
- * the blob's own integrity (the trailing-newline invariant below), build the
- * new commit off-tree, `updateRefCAS`, and on rejection, re-read and
- * re-check — never blind-retry the same built commit. `withCasRetry` (M2.6)
- * owns the attempt bound and backoff; the callback passed to it owns the
- * re-read, which is why the read is written inside that callback rather
- * than hoisted above the `withCasRetry` call (see the doc comment directly
- * on the callback below, and test 4 in `log.test.ts`, which fails if this
- * is ever restructured to read once and reuse a stale blob across
- * attempts).
+ * the blob's own integrity (the size bound and trailing-newline invariant
+ * below), build the new commit off-tree, `updateRefCAS`, and on rejection,
+ * re-read and re-check — never blind-retry the same built commit.
+ * `withCasRetry` (M2.6) owns the attempt bound and backoff; the callback
+ * passed to it owns the re-read, which is why the read is written inside
+ * that callback rather than hoisted above the `withCasRetry` call (see the
+ * doc comment directly on the callback below, and test 4 in `log.test.ts`,
+ * which fails if this is ever restructured to read once and reuse a stale
+ * blob across attempts).
  *
  * **Does not check whether the event is otherwise valid to append** (e.g.
  * "is this ticket already claimed") — that business logic belongs to
  * whatever decided to call `append` in the first place (M2.8's fold, per
  * Ruling R5), not to this low-level primitive. This function's only "check"
  * is git-and-blob-level: does the ref's current state disagree with what a
- * built commit assumed, and is the blob it is about to extend intact.
+ * built commit assumed, and is the blob it is about to extend intact and
+ * within bounds.
  *
  * **Lazy ref initialization happens here, implicitly, not via a call to
  * `ref.ts`'s `initRef`.** When `readRef` returns `null` (fm6: a fresh clone,
@@ -271,7 +485,14 @@ export async function appendCore(
   hooks: AppendHooks,
 ): Promise<AppendedEvent> {
   const now = options.now ?? Date.now();
-  const mint = options.ulidFactory ?? defaultUlidFactory;
+  // Fix round 1, S6: an injected `now` uses the separate, equally
+  // persistent `injectedClockUlidFactory` lane rather than the real-clock
+  // `defaultUlidFactory` — see both constants' doc comments for why two
+  // persistent lanes (not one shared, one disposable) are what preserve
+  // monotonicity within an injected-clock sequence while still isolating it
+  // from the real-clock path.
+  const mint = options.ulidFactory ?? (options.now !== undefined ? injectedClockUlidFactory : defaultUlidFactory);
+  const maxExistingBlobBytes = options.maxExistingBlobBytes ?? MAX_MONTH_BLOB_BYTES;
   const validatedRef = await validateCoordinationRef(ref);
 
   // The id is minted once, before the retry loop — not per attempt. A retry
@@ -291,7 +512,12 @@ export async function appendCore(
   const parsed = parseEvent(line, { now });
   if (!parsed.ok) {
     throw new CanKanError(EventErrorCodes.EVENT_APPEND_REJECTED, "event failed schema validation before append", {
-      details: { reason: parsed.error.reason, issues: parsed.error.issues },
+      // Fix round 1, S5: flattened to strings — `errors.ts`'s flatness
+      // policy ("JSON primitives, or arrays of them") applies to `details`,
+      // and `EventValidationIssue[]` is an array of objects that would
+      // otherwise stay aliased to zod's own (mutable) issue objects despite
+      // this error's shallow freeze.
+      details: { reason: parsed.error.reason, issues: renderIssues(parsed.error.issues) },
     });
   }
   const event = parsed.event;
@@ -312,6 +538,20 @@ export async function appendCore(
       existing = (await adapter.readBlobFromRef(validatedRef, path)) ?? "";
     }
 
+    // Fix round 1, S2: bound the blob this attempt is about to extend,
+    // before doing anything else with it. Without this, `append` had no
+    // size check at all while `read` refused anything past
+    // `MAX_MONTH_BLOB_BYTES` — a write path that silently helped an
+    // attacker grow exactly what the read path already declined. Checked
+    // every attempt (not hoisted) for the same reason the read below is not
+    // hoisted: `existing` is re-fetched fresh each time.
+    const existingBytes = Buffer.byteLength(existing, "utf8");
+    if (existingBytes > maxExistingBlobBytes) {
+      throw new CanKanError(EventErrorCodes.EVENT_LOG_BLOB_TOO_LARGE, `month file exceeds the maximum blob size, refusing to extend it: ${path}`, {
+        details: { ref: validatedRef, month, path, bytes: existingBytes, maxBytes: maxExistingBlobBytes },
+      });
+    }
+
     // The "check" half of read-check-build, generalized: this attempt's
     // month blob must be intact before this function extends it. A month
     // file this module wrote always ends in `\n`; a non-empty blob that
@@ -327,7 +567,12 @@ export async function appendCore(
       );
     }
 
-    const priorLineCount = splitJsonlLines(existing).length;
+    // Fix round 1, S2: count lines without allocating the split array —
+    // `appendCore` only needs the count, and building the whole array
+    // (`splitJsonlLines(existing).length`) allocated a full copy of
+    // `existing`'s content as substrings on every attempt, up to
+    // `maxExistingBlobBytes` in size.
+    const priorLineCount = countJsonlLines(existing);
     const newContent = `${existing}${line}\n`;
 
     await hooks.beforeCas?.(attemptNumber);
@@ -363,65 +608,51 @@ export async function appendCore(
  * lease — enough trailing months that a lease taken out near the end of a
  * month is still visible after the boundary (ADR 0001:765-773, fm9). This
  * default is the ADR's stated floor, not a value tuned to any specific
- * lease length.
+ * lease length. **Must be a finite integer in `[1, 120]` (fix round 1, S1)**
+ * — see `validateTrailingMonths`.
  */
 const DEFAULT_TRAILING_MONTHS = 2;
 
 /**
- * Obligation A: the byte cap applied to each line *before* `parseEvent` (and
- * therefore `JSON.parse`) ever sees it — confirmed by probe (dispatch 1's
- * report) that a `.max()` inside the schema cannot prevent the allocation,
- * since `JSON.parse` has already materialized the whole string by the time
- * zod runs. Derived, not guessed: `MAX_HOOK_OUTPUT_CHARS` (100,000,
- * `schema.ts`) is this schema's single largest free-text field, and
- * `JSON.stringify` can expand a character to a 6-byte `\uXXXX` escape in the
- * worst case (a lone surrogate or a control character), so the largest
- * legitimate `hook` event's `output` field alone can occupy up to 600,000
- * bytes of line content. 1 MiB (1,048,576 bytes) rounds that up with
- * headroom for the rest of the envelope and every other field, while still
- * bounding a single push far below "every peer that fetches the ref pays a
- * 500MB allocation on every read" (the attack obligation A names).
- */
-const MAX_LINE_BYTES = 1_048_576;
-
-/**
- * A month blob's own overall size bound. **Honesty about what this bound
- * can and cannot do, stated directly rather than implied**: by the time
- * `readBlobFromRef` returns, `git cat-file` has already materialized the
- * entire blob as one string — `GitAdapter` exposes no way to size-check
- * before that happens, so this check runs strictly *after* the allocation
- * obligation A is concerned with, unlike `MAX_LINE_BYTES` above (which runs
- * before `parseEvent`/`JSON.parse` touch a specific line). This is
- * therefore a resource **sanity** bound — it stops a single month file from
- * growing without limit and stops a `read()` call from continuing to
- * process a blob that is already absurd — not a pre-allocation DoS defense.
- * A true pre-allocation guard would need `readBlobFromRef`'s own `cat-file`
- * invocation to size-check before streaming the content back, which is
- * M2.6's surface, not this module's, and is flagged in the report rather
- * than worked around here.
- *
- * 64 MiB is deliberately generous: at `MAX_LINE_BYTES`'s cap, that is still
- * room for 64 fully-maximal lines, and for the realistic case of small
- * claim/renew/release events (well under a kilobyte each), tens of millions
- * of events in one month — far beyond anything a real board produces.
- * **A separate line-count bound was considered and rejected as redundant**:
- * the shortest possible valid JSONL line this schema can produce is well
- * over ten bytes (`{"ts":"...",...}`), so a byte bound already caps the
- * line count by construction; a second, independent counter would duplicate
- * the same protection without adding a case this bound misses.
- */
-const MAX_MONTH_BLOB_BYTES = 64 * 1024 * 1024;
-
-/**
  * One event as returned by `read` — the event itself plus its position in
  * the append-only chain (Ruling R3, the single API-shape decision M2.8
- * depends on most). **Chain position, not `ts`, is the ordering authority**
- * (ADR 0001:723-725, fm7): a ULID's timestamp prefix is itself
- * peer-supplied, so `read`'s sorted return order (by `id`, for PLAN.md's
- * named test and for display) is not the same thing as this record's
- * `month`/`line`/`position` — the latter three are what M2.8's ADR-mandated
- * reconciliation tie-break (0001:802-809) and fm7's "most recent by
- * position, never by `ts`" are meant to consume.
+ * depends on most).
+ *
+ * **`(month, line)` is the stable chain coordinate — the one M2.8's
+ * ADR-mandated tie-break (0001:802-809) must key on (fix round 1, Ruling
+ * R16).** Ordered month-ascending then line-ascending, `(month, line)` is
+ * identical for a given event across every `read()` call that includes its
+ * month, regardless of `trailingMonths`/`now`.
+ *
+ * **`position` is a within-call ordinal convenience only — never a stable
+ * identifier.** Its absolute value depends on how many months this
+ * particular call aggregated: two peers running `read()` with different
+ * `trailingMonths` (different lease configs, per the M2.10 contract above)
+ * assign *different* `position` values to the *same* event, which is not
+ * the determinism ADR 0001:811-826 requires of a reconciliation tie-break.
+ * `position` must never be stored, compared across separate `read()` calls,
+ * or treated as a cross-peer identifier — it exists only to let a caller
+ * order the records this one call returned without re-deriving
+ * `(month, line)` comparisons itself.
+ *
+ * **Chain position is deterministic, not trustworthy — read this before
+ * building a tie-break on it.** `ts` is disqualified as ordering authority
+ * because a ULID's timestamp prefix is peer-supplied (ADR 0001:723-725,
+ * fm7) — true, but incomplete on its own: a peer with push access can
+ * rewrite an *entire* month blob (there is nothing that pins history), so
+ * file order — and therefore `(month, line)` — is peer-influenceable too,
+ * not merely peer-observed. ADR 0001:811-826 admits chain position as
+ * authority anyway **because it is deterministic** (two peers reconciling
+ * the identical union of events compute the identical order), not because
+ * it cannot be manipulated. A concrete, cheap manipulation: a peer that
+ * replays an already-observed line **byte-identically** into an *earlier*
+ * month moves that one event's reported `(month, line)`/`position` without
+ * touching any other line at all, via this function's own
+ * first-occurrence-wins dedupe fold (a byte-identical duplicate is folded
+ * into whichever occurrence is encountered first in the oldest-to-newest
+ * walk). M2.8's tie-break must be built with this in mind: "deterministic
+ * across peers reconciling the same events" is the property chain position
+ * provides, not "immune to a peer choosing where its own events land."
  */
 export interface EventRecord {
   readonly event: Event;
@@ -436,9 +667,8 @@ export interface EventRecord {
    * order, incrementing once per *distinct* event id (a byte-identical
    * duplicate line is folded into the earlier record and does not consume
    * a new position). **Meaningful only for comparing records returned by
-   * this same `read()` call** — not a stable identifier across two calls
-   * with different `trailingMonths` or `now`, since a wider or narrower
-   * window changes which position a given event gets assigned.
+   * this same `read()` call** — see this interface's own doc comment for
+   * the full "never store or compare across calls" rule.
    */
   readonly position: number;
 }
@@ -450,6 +680,8 @@ export interface ReadOptions {
    * How many trailing months (current plus this many minus one before it)
    * to aggregate, oldest to newest. Defaults to `DEFAULT_TRAILING_MONTHS`
    * (2) — see that constant's doc comment for the M2.10 config contract.
+   * Validated (fix round 1, S1): must be a finite integer in `[1, 120]`, or
+   * `read()` throws `EVENT_LOG_INVALID_WINDOW` before doing anything else.
    */
   readonly trailingMonths?: number;
   /**
@@ -477,23 +709,23 @@ export interface ReadOptions {
  * append-only chain** (Ruling R3): `month`, `line` (zero-based index within
  * that file), assigned as this function walks months oldest-to-newest and
  * lines in file order — the ordering *authority* per ADR 0001:723-725 and
- * fm7, since a ULID's timestamp prefix is itself peer-supplied. **This
- * position is only meaningful for comparing records returned by this same
- * `read()` call** — it is not a stable identifier across two calls with
- * different `trailingMonths` or `now`, and callers (M2.8's tie-break) must
- * not treat it as one.
+ * fm7, since a ULID's timestamp prefix is itself peer-supplied. See
+ * `EventRecord`'s own doc comment for what "authority" does and does not
+ * mean here, and for why `(month, line)`, not `position`, is the stable
+ * coordinate.
  *
  * **Fails closed** (ADR 0001:829-831): a schema-invalid line, an oversized
- * line or blob, or a duplicate event id with differing content throws
- * rather than skipping — the whole read aborts. **Never drops an event**
- * otherwise (ADR 0001:796-800): a byte-identical duplicate id is folded
- * into one record, but every other validated line survives into the
- * result, filters included — filtering (`ticket`/`actor`/`since`) is
- * applied only after every line in the aggregated window has been
- * validated, so a malformed line elsewhere in the window still aborts a
- * `read({ ticket: "ck-1" })` call even though that line would not have
- * matched the filter. A board that answers a narrow query by silently
- * ignoring an unrelated corruption is not actually fail-closed.
+ * line, blob, or aggregate window, a degenerate `trailingMonths`, or a
+ * duplicate event id with differing content throws rather than skipping —
+ * the whole read aborts. **Never drops an event** otherwise (ADR
+ * 0001:796-800): a byte-identical duplicate id is folded into one record,
+ * but every other validated line survives into the result, filters
+ * included — filtering (`ticket`/`actor`/`since`) is applied only after
+ * every line in the aggregated window has been validated, so a malformed
+ * line elsewhere in the window still aborts a `read({ ticket: "ck-1" })`
+ * call even though that line would not have matched the filter. A board
+ * that answers a narrow query by silently ignoring an unrelated corruption
+ * is not actually fail-closed.
  *
  * An absent ref (fm6 — a fresh clone with no `refs/cankan/*` yet) returns
  * `[]`, not an error: this function does not fetch or lazily create
@@ -504,6 +736,11 @@ export interface ReadOptions {
 export async function read(adapter: GitAdapter, ref: string, options: ReadOptions = {}): Promise<readonly EventRecord[]> {
   const now = options.now ?? Date.now();
   const trailingMonths = options.trailingMonths ?? DEFAULT_TRAILING_MONTHS;
+  // Fix round 1, S1: validated before any git invocation and before the
+  // month-key loop that a degenerate value (0, negative, NaN) or a
+  // pathologically large one (a hostile config-derived Infinity) would
+  // otherwise reach unguarded.
+  validateTrailingMonths(trailingMonths);
   const validatedRef = await validateCoordinationRef(ref);
 
   const head = await adapter.readRef(validatedRef);
@@ -519,6 +756,10 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
   const seen = new Map<EventId, { readonly rawLine: string; readonly recordIndex: number }>();
   const records: EventRecord[] = [];
   let nextPosition = 0;
+  // Fix round 1, S2: the sum of every trailing month's blob size in this
+  // call's window — bounded independently of the per-month cap below (see
+  // `MAX_AGGREGATE_READ_BYTES`'s doc comment).
+  let aggregateBytes = 0;
 
   for (const month of months) {
     const path = monthPath(month);
@@ -527,10 +768,19 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
       continue; // No file for this month (yet, or never) — not an error.
     }
 
-    if (Buffer.byteLength(raw, "utf8") > MAX_MONTH_BLOB_BYTES) {
+    const rawBytes = Buffer.byteLength(raw, "utf8");
+    if (rawBytes > MAX_MONTH_BLOB_BYTES) {
       throw new CanKanError(EventErrorCodes.EVENT_LOG_BLOB_TOO_LARGE, `month file exceeds the maximum blob size: ${path}`, {
-        details: { ref: validatedRef, month, path, maxBytes: MAX_MONTH_BLOB_BYTES },
+        details: { ref: validatedRef, commit: head, month, path, bytes: rawBytes, maxBytes: MAX_MONTH_BLOB_BYTES },
       });
+    }
+    aggregateBytes += rawBytes;
+    if (aggregateBytes > MAX_AGGREGATE_READ_BYTES) {
+      throw new CanKanError(
+        EventErrorCodes.EVENT_LOG_AGGREGATE_TOO_LARGE,
+        `the aggregated read window exceeds the maximum total size across ${months.length} month(s)`,
+        { details: { ref: validatedRef, commit: head, month, path, aggregateBytes, maxAggregateBytes: MAX_AGGREGATE_READ_BYTES } },
+      );
     }
 
     const lines = splitJsonlLines(raw);
@@ -542,7 +792,7 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
       const lineBytes = Buffer.byteLength(rawLine, "utf8");
       if (lineBytes > MAX_LINE_BYTES) {
         throw new CanKanError(EventErrorCodes.EVENT_LOG_LINE_TOO_LARGE, `event log line exceeds the maximum size: ${path}:${line}`, {
-          details: { ref: validatedRef, month, path, line, bytes: lineBytes, maxBytes: MAX_LINE_BYTES },
+          details: { ref: validatedRef, commit: head, month, path, line, bytes: lineBytes, maxBytes: MAX_LINE_BYTES },
         });
       }
 
@@ -551,7 +801,22 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
         throw new CanKanError(
           EventErrorCodes.EVENT_LOG_LINE_INVALID,
           `event log line failed validation (${parsed.error.reason}): ${path}:${line}`,
-          { details: { ref: validatedRef, month, path, line, reason: parsed.error.reason, issues: parsed.error.issues } },
+          {
+            // Fix round 1, F1: `commit` (the already-resolved, module-derived
+            // `head`) is fm8's third required coordinate — "the offending
+            // ref/commit/file" — previously omitted. Fix round 1, S5: issues
+            // flattened to strings, matching `append`'s own fix (see
+            // `renderIssues`).
+            details: {
+              ref: validatedRef,
+              commit: head,
+              month,
+              path,
+              line,
+              reason: parsed.error.reason,
+              issues: renderIssues(parsed.error.issues),
+            },
+          },
         );
       }
 
@@ -581,6 +846,7 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
         throw new CanKanError(EventErrorCodes.EVENT_LOG_DUPLICATE_ID_CONFLICT, `duplicate event id with differing content: ${event.id}`, {
           details: {
             ref: validatedRef,
+            commit: head,
             id: event.id,
             firstMonth: first?.month,
             firstLine: first?.line,

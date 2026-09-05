@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readdir, realpath, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { ulid } from "ulid";
@@ -284,6 +284,24 @@ describe("input validation guards a caller mistake, not only a peer-supplied val
       expect(await firstSeen("board-now", eventId)).toBeNull();
     });
   });
+
+  test("observe(boardKey, eventId, null) is treated as 'no options', not a raw TypeError (fix round 1, Important)", async () => {
+    // A default parameter (`options: ObserveOptions = {}`) only substitutes
+    // for `undefined`, not an explicit `null` -- the original signature let
+    // `null` reach `options.now` and throw an unwrapped `TypeError`, which
+    // `isCanKanError` cannot recognize and M3.10 cannot map to an exit
+    // code. Fixed via `options ?? {}`, which treats `null` the same as
+    // omitting the argument entirely.
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      const before = Date.now();
+      const recorded = await observe("board-null-options", eventId, null);
+      const after = Date.now();
+      expect(recorded).toBeGreaterThanOrEqual(before);
+      expect(recorded).toBeLessThanOrEqual(after);
+      expect(await firstSeen("board-null-options", eventId)).toBe(recorded);
+    });
+  });
 });
 
 describe("discarded on release (required test 3)", () => {
@@ -346,53 +364,80 @@ describe("absent store tolerated (required test 4)", () => {
 });
 
 describe("unwritable store is a typed hard error (required test 5)", () => {
-  test("observe() hard-errors when the board's hash directory cannot be written to", async () => {
-    if (process.getuid?.() === 0) {
-      // root bypasses permission bits entirely -- chmod does not restrict.
-      return;
-    }
-    await withEnv(undefined, async () => {
-      const eventId = ulid() as EventId;
-      const path = recordPath("board-h", eventId);
-      const boardHashDir = dirname(path);
+  // Fix round 1 minor: a silent early `return` under root reports "pass"
+  // having asserted nothing (root bypasses permission bits entirely, so
+  // chmod does not restrict) -- `test.skipIf` makes a root run show
+  // "skip" instead, the honest outcome.
+  test.skipIf(process.getuid?.() === 0)(
+    "observe() hard-errors when the board's hash directory cannot be written to",
+    async () => {
+      await withEnv(undefined, async () => {
+        const eventId = ulid() as EventId;
+        const path = recordPath("board-h", eventId);
+        const boardHashDir = dirname(path);
 
-      // Pre-create the board-hash directory (and its parents) so
-      // `observe()`'s own `mkdir(..., { recursive: true })` is a no-op,
-      // then strip write permission -- reproducing a read-only or full
-      // state directory (ADR 1142-1148).
-      await mkdir(boardHashDir, { recursive: true });
-      await chmod(boardHashDir, 0o500);
+        // Pre-create the board-hash directory (and its parents) so
+        // `observe()`'s own `mkdir(..., { recursive: true })` is a no-op,
+        // then strip write permission -- reproducing a read-only or full
+        // state directory (ADR 1142-1148).
+        await mkdir(boardHashDir, { recursive: true });
+        await chmod(boardHashDir, 0o500);
 
-      try {
-        await expectCode(
-          observe("board-h", eventId, { now: 7000 }),
-          EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
-        );
-      } finally {
-        // Restore write permission so withEnv()'s own cleanup (`rm`) can
-        // remove the temp $HOME tree afterward.
-        await chmod(boardHashDir, 0o700);
-      }
-    });
-  });
+        try {
+          await expectCode(
+            observe("board-h", eventId, { now: 7000 }),
+            EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+          );
+        } finally {
+          // Restore write permission so withEnv()'s own cleanup (`rm`) can
+          // remove the temp $HOME tree afterward.
+          await chmod(boardHashDir, 0o700);
+        }
+      });
+    },
+  );
 
-  test("firstSeen() hard-errors on a record file it cannot read, distinct from 'no record'", async () => {
-    if (process.getuid?.() === 0) {
-      return;
-    }
-    await withEnv(undefined, async () => {
-      const eventId = ulid() as EventId;
-      await observe("board-i", eventId, { now: 8000 });
-      const path = recordPath("board-i", eventId);
+  test.skipIf(process.getuid?.() === 0)(
+    "firstSeen() hard-errors on a record file it cannot read, distinct from 'no record'",
+    async () => {
+      await withEnv(undefined, async () => {
+        const eventId = ulid() as EventId;
+        await observe("board-i", eventId, { now: 8000 });
+        const path = recordPath("board-i", eventId);
 
-      await chmod(path, 0o000);
-      try {
-        await expectCode(firstSeen("board-i", eventId), EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE);
-      } finally {
-        await chmod(path, 0o600);
-      }
-    });
-  });
+        await chmod(path, 0o000);
+        try {
+          await expectCode(firstSeen("board-i", eventId), EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE);
+        } finally {
+          await chmod(path, 0o600);
+        }
+      });
+    },
+  );
+
+  test.skipIf(process.getuid?.() === 0)(
+    "discard() hard-errors when it cannot remove the record (fix round 1 coverage gap)",
+    async () => {
+      await withEnv(undefined, async () => {
+        const eventId = ulid() as EventId;
+        await observe("board-discard-perm", eventId, { now: 12000 });
+        const path = recordPath("board-discard-perm", eventId);
+        const boardHashDir = dirname(path);
+
+        // `rm`/`unlink` needs write permission on the *containing*
+        // directory, not the file itself.
+        await chmod(boardHashDir, 0o500);
+        try {
+          await expectCode(
+            discard("board-discard-perm", eventId),
+            EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+          );
+        } finally {
+          await chmod(boardHashDir, 0o700);
+        }
+      });
+    },
+  );
 
   test("firstSeen() hard-errors (not 'no record') when a path component that should be a directory is a plain file -- ENOTDIR is a broken store, not an absent one", async () => {
     // Probed directly (task-3-report.md): `readFile("<file>/<segment>")`
@@ -409,6 +454,163 @@ describe("unwritable store is a typed hard error (required test 5)", () => {
 
       const eventId = ulid() as EventId;
       await expectCode(firstSeen("board-enotdir", eventId), EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE);
+    });
+  });
+
+  test("state directories are created 0700, regardless of umask (fix round 1, High S1)", async () => {
+    // Probed directly (task-3-report.md): with no explicit `mode`, a
+    // freshly-created directory ends up `0777` under `umask 000` --
+    // routine in containers and CI -- which lets any local user plant a
+    // file or symlink inside it. `mode: 0o700` is unaffected by `umask`
+    // (also probed directly), so this must hold regardless of the
+    // running process's own umask.
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      await observe("board-mode", eventId, { now: 1 });
+
+      const path = recordPath("board-mode", eventId);
+      const boardHashDir = dirname(path);
+      const observationsDir = dirname(boardHashDir);
+      const cankanDir = dirname(observationsDir);
+
+      for (const dir of [cankanDir, observationsDir, boardHashDir]) {
+        const stat = await lstat(dir);
+        expect(stat.mode & 0o777).toBe(0o700);
+      }
+    });
+  });
+});
+
+describe("Fix round 1, High S1 -- a planted symlink is refused, never followed or healed over", () => {
+  test("observe() refuses to read through a symlinked record, and never touches the symlink's target", async () => {
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-symlink-observe", eventId);
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+
+      const victimPath = join(dirname(path), "victim.json");
+      const victimContent = JSON.stringify({ firstSeenAtMs: 1 });
+      await writeFile(victimPath, victimContent, "utf8");
+      await symlink(victimPath, path);
+
+      await expectCode(
+        observe("board-symlink-observe", eventId, { now: 99999 }),
+        EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+      );
+
+      // The symlink itself is untouched (still a symlink, not replaced by
+      // a "healed" plain file) and the victim's content is untouched --
+      // `observe()` never read through it, and never wrote through it
+      // either.
+      const relstat = await lstat(path);
+      expect(relstat.isSymbolicLink()).toBe(true);
+      expect(await readFile(victimPath, "utf8")).toBe(victimContent);
+    });
+  });
+
+  test("firstSeen() refuses the same way, rather than trusting the attacker's planted value", async () => {
+    await withEnv(undefined, async () => {
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-symlink-firstseen", eventId);
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+
+      const victimPath = join(dirname(path), "victim2.json");
+      // A far-in-the-past `firstSeenAtMs` -- if this were trusted, M2.10
+      // would see the claim as ancient and take it over.
+      await writeFile(victimPath, JSON.stringify({ firstSeenAtMs: 1 }), "utf8");
+      await symlink(victimPath, path);
+
+      await expectCode(
+        firstSeen("board-symlink-firstseen", eventId),
+        EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+      );
+    });
+  });
+
+  test("observe() refuses when the board-hash directory itself is a symlink to another directory, and writes nothing into the attacker's target", async () => {
+    await withEnv(undefined, async () => {
+      const home = process.env.HOME as string;
+      const eventId = ulid() as EventId;
+      const path = recordPath("board-symlink-dir", eventId);
+      const boardHashDir = dirname(path);
+      const observationsDir = dirname(boardHashDir);
+      await mkdir(observationsDir, { recursive: true, mode: 0o700 });
+
+      const attackerTarget = join(home, "attacker-target-dir");
+      await mkdir(attackerTarget, { recursive: true });
+      await symlink(attackerTarget, boardHashDir);
+
+      await expectCode(
+        observe("board-symlink-dir", eventId, { now: 1 }),
+        EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+      );
+
+      expect(await listFilesRecursive(attackerTarget)).toEqual([]);
+    });
+  });
+
+  test(
+    "firstSeen() refuses a named pipe (FIFO) planted at the record path, rather than hanging while trying to read it",
+    async () => {
+      // `lstatPlainFileOrNull`'s `isFile()` check is otherwise redundant
+      // with `readPlainFile`'s `O_NOFOLLOW` open for a *symlink* or a
+      // *directory* planted at the record path -- both are independently
+      // rejected by the open/read step alone (probed directly:
+      // `O_NOFOLLOW` open on a directory succeeds, but the subsequent
+      // `readFile` on it fails `EISDIR`). A FIFO is the case where it is
+      // not redundant: opening a FIFO for reading **blocks** until a
+      // writer opens it -- with no writer, that call never returns.
+      // Without the `lstat`-based `isFile()` check running first (a
+      // non-blocking call), this would hang rather than fail, a DoS
+      // instead of a clean error. The explicit test timeout below is the
+      // proof this stays a fast failure, not a hang, if the guard ever
+      // regresses.
+      await withEnv(undefined, async () => {
+        const eventId = ulid() as EventId;
+        const path = recordPath("board-fifo", eventId);
+        await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+
+        const result = Bun.spawnSync(["mkfifo", path]);
+        if (result.exitCode !== 0) {
+          throw new Error(`mkfifo failed: ${result.stderr.toString()}`);
+        }
+
+        await expectCode(firstSeen("board-fifo", eventId), EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE);
+      });
+    },
+    3000,
+  );
+});
+
+describe("Fix round 1, Critical C1 -- observe() is idempotent under genuine concurrency, not only sequential repetition", () => {
+  test("many concurrent observe() calls for the same key all agree with each other and with what's persisted", async () => {
+    // The original "idempotence" test below calls `observe()` sequentially
+    // (`await`, then `await`) -- it tests repetition, not concurrency, and
+    // passed even though a genuine race could make two callers disagree
+    // (fix round 1 found ~1% of trials under a real `Promise.all` race
+    // disagreed, once even landing on a value neither caller returned).
+    // This test launches every call at once and repeats across many
+    // independent keys to clear that rate reliably.
+    await withEnv(undefined, async () => {
+      const TRIALS = 300;
+      const CONCURRENCY = 6;
+      for (let trial = 0; trial < TRIALS; trial++) {
+        const boardKey = `board-race-${trial}`;
+        const eventId = ulid() as EventId;
+        const results = await Promise.all(
+          Array.from({ length: CONCURRENCY }, (_, i) => observe(boardKey, eventId, { now: 1_000_000 + trial * 100 + i })),
+        );
+
+        const distinctValues = new Set(results);
+        if (distinctValues.size !== 1) {
+          throw new Error(
+            `trial ${trial}: concurrent observe() calls disagreed: ${JSON.stringify(results)}`,
+          );
+        }
+
+        const persisted = await firstSeen(boardKey, eventId);
+        expect(persisted).toBe(results[0] as number);
+      }
     });
   });
 });
@@ -477,7 +679,14 @@ describe("boardKeyFor / resolveStateDir sanity", () => {
     expect(await boardKeyFor(adapter)).toBe(await adapter.gitCommonDir());
   });
 
-  test("resolveStateDir with no HOME at all in env falls back to the real os.homedir() (documented, not exercised against the real machine elsewhere in this suite)", () => {
-    expect(resolveStateDir({})).toBe(join(homedir(), ".local", "state", "cankan"));
+  test("resolveStateDir with no HOME at all in env falls back to the real os.homedir() (documented, not exercised against the real machine elsewhere in this suite)", async () => {
+    // No I/O and no real path is touched by `resolveStateDir` itself, but
+    // `homedir()` reads live `process.env.HOME` (fix round 1 minor) --
+    // wrapping in `withEnv()` costs nothing and keeps this test from ever
+    // depending on whatever `$HOME` happens to be on the machine running
+    // the suite.
+    await withEnv(undefined, async () => {
+      expect(resolveStateDir({})).toBe(join(homedir(), ".local", "state", "cankan"));
+    });
   });
 });

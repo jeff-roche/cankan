@@ -152,8 +152,9 @@
  *   consumer of `actor` must.
  */
 
-import { createHash } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { constants as fsConstants, type Stats } from "node:fs";
+import { link, lstat, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { CanKanError } from "../errors";
@@ -321,6 +322,131 @@ export async function boardKeyFor(adapter: GitAdapter): Promise<string> {
   return adapter.gitCommonDir();
 }
 
+/**
+ * Bounds the retry loop in `observe()` (fix round 1, C1/S1) — a
+ * pathologically persistent contention or corruption cycle hard-errors
+ * rather than looping forever. Five is generous headroom over the number of
+ * genuinely concurrent local callers this store is ever expected to see;
+ * per obligation 7, this module does not go further and add backoff/sleep
+ * ceremony around it.
+ */
+const MAX_OBSERVE_ATTEMPTS = 5;
+
+/**
+ * Attempts to atomically place `payload` at `path` **without ever
+ * dereferencing a pre-existing entry at `path`, and without overwriting
+ * one** — fix round 1, Critical C1 / High S1. Returns `true` if this call
+ * won (`path` now holds `payload`, freshly written by this call), `false`
+ * if something already occupies `path` (first-write-wins: a `false` result
+ * is not a failure — it means a prior writer, or an attacker-planted
+ * entry, already got there first, and the caller must inspect it via
+ * `lstat`/`O_NOFOLLOW` before touching it, never via a plain `readFile`).
+ *
+ * **Mechanism, each half load-bearing, confirmed directly (task-3-report.md
+ * fix-round-1 probes):**
+ * - The payload is written to a freshly-named, co-located temp file via
+ *   `writeFile(..., { flag: "wx" })` — `O_CREAT|O_EXCL` refuses an existing
+ *   directory entry at that name, **including a symlink, without following
+ *   it** (confirmed: writing through a pre-planted symlink with `wx` fails
+ *   `EEXIST` and leaves the symlink's target untouched). The name is
+ *   16 random bytes of hex, making a pre-planted collision at the temp name
+ *   itself infeasible to arrange in advance.
+ * - `link()` (a hard link, not a copy) is then attempted from the temp file
+ *   to `path`. `link()` has the identical `EEXIST`-without-dereferencing
+ *   behavior as `wx` above (confirmed by the same probe) — so a pre-planted
+ *   symlink *at `path`* is refused the same way a real prior record is:
+ *   this call learns only "something is there," never what.
+ * - The temp file is always unlinked afterward regardless of outcome
+ *   (`finally`) — `link()` creates a *second* name for the same inode, so
+ *   removing the temp name never removes the data now reachable at `path`
+ *   when this call won.
+ *
+ * This closes the gap `writeFile(path, payload, { flag: "wx" })` alone left
+ * once a *second* write needs to replace something already at `path` (the
+ * self-heal step in `observe()`) — `wx` directly at the final `path` is
+ * only ever a *create*, and this module has no analogous *replace*
+ * primitive that stays symlink-safe without going through a temp file.
+ */
+async function tryPlaceAtomically(path: string, payload: string): Promise<boolean> {
+  const tempPath = `${path}.tmp-${randomBytes(16).toString("hex")}`;
+  try {
+    await writeFile(tempPath, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch (cause) {
+    throw storeUnavailableError("write temporary observation record", cause);
+  }
+  try {
+    await link(tempPath, path);
+    return true;
+  } catch (linkError) {
+    if (!isNodeError(linkError) || linkError.code !== "EEXIST") {
+      throw storeUnavailableError("link observation record into place", linkError);
+    }
+    return false;
+  } finally {
+    // Best-effort cleanup: the temp name is unguessable, so a stray one
+    // left behind by a crash between `writeFile` and `link` is inert, not
+    // a security concern, and cleaning it up is not this call's
+    // correctness requirement.
+    await rm(tempPath, { force: true }).catch(() => {});
+  }
+}
+
+/**
+ * `lstat`s `path` and confirms it is a plain file **without ever
+ * dereferencing a symlink** (fix round 1, High S1, sink 1) — `lstat`
+ * reports on the directory entry itself, unlike `stat`, which would follow
+ * a symlink and report on whatever it points to. Returns the `lstat`
+ * result on success; returns `null` for `ENOENT` (the entry vanished
+ * between a failed `link()` and this call — a concurrent `discard()`, most
+ * likely) so the caller can retry; throws a typed hard error for anything
+ * else, including a successful `lstat` that reports something other than a
+ * plain file (a planted symlink, a directory, a FIFO).
+ */
+async function lstatPlainFileOrNull(path: string): Promise<Stats | null> {
+  let stat: Stats;
+  try {
+    stat = await lstat(path);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return null;
+    }
+    throw storeUnavailableError("stat observation record", error);
+  }
+  if (!stat.isFile()) {
+    // Never read through it, never "heal" over it (sink 1 and sink 2 of
+    // fix round 1's High S1): a legitimate record is always a plain file
+    // this module itself created. Anything else is either an attacker's
+    // plant or a genuinely broken store, and both fail closed here.
+    throw storeUnavailableError("observation record is not a plain file", undefined);
+  }
+  return stat;
+}
+
+/**
+ * Reads `path` via `open(..., O_NOFOLLOW)`, never a plain `readFile` (fix
+ * round 1, High S1, sink 1) — `readFile` follows a symlink at `path`,
+ * letting an attacker who pre-planted one control the value read back
+ * (e.g. `{"firstSeenAtMs":1}`, making every future expiry check see the
+ * claim as ancient). `O_NOFOLLOW` makes the `open` itself fail with
+ * `ELOOP` if `path` is a symlink, atomically — no separate check-then-open
+ * race window. Callers of this function have already confirmed via
+ * `lstatPlainFileOrNull` that `path` is a plain file, so this is
+ * belt-and-suspenders against a symlink swapped in between that `lstat`
+ * and this `open`, not the primary guard.
+ */
+async function readPlainFile(path: string): Promise<string> {
+  try {
+    const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      return await handle.readFile("utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    throw storeUnavailableError("read observation record", error);
+  }
+}
+
 export interface ObserveOptions {
   /**
    * The clock this call records against, if this is the first observation
@@ -339,78 +465,114 @@ export interface ObserveOptions {
  * (or injected) local time — **first write wins**. A second call for the
  * same `(boardKey, eventId)` pair never moves the recorded time; it simply
  * returns the time already on record. Returns the epoch-ms value now on
- * record, whether this call wrote it or a previous one did.
+ * record, whether this call wrote it or a previous one did. `options` may
+ * be omitted, `undefined`, or `null` — all three mean "use the defaults."
  *
  * `eventId` is validated against the ULID grammar before it is hashed
  * (obligation 2) — an invalid id throws
  * `EventErrorCodes.EVENT_OBSERVATION_INVALID_EVENT_ID` before any
- * filesystem access. A missing state directory is created (Ruling R7); an
- * unwritable one throws `EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE`.
+ * filesystem access. A missing state directory is created, `{ mode: 0o700
+ * }` (Ruling R7 graceful case, and fix round 1 High S1: without an explicit
+ * mode, a permissive `umask` — 0, routine in containers and CI, confirmed
+ * directly to leave a freshly-created directory `0777` — would let any
+ * local user plant a symlink inside it; `0o700` is unaffected by `umask`
+ * regardless of its value, also confirmed directly). An unwritable
+ * directory throws `EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE`.
  *
- * **Idempotence is implemented with an exclusive create (`wx`), not a
- * check-then-write** — a concurrent second `observe()` for the same key
- * (two processes, or two calls racing within one) loses the exclusive
- * create with `EEXIST` and reads back whatever the winner wrote, rather
- * than two writers each believing they went first. This is the minimum
- * needed for the idempotence guarantee obligation 1 asks for; per
- * obligation 7, this module does not go further and add fsync ceremony or
- * cross-process locking beyond it.
+ * **Idempotence and symlink-safety are both provided by `tryPlaceAtomically`,
+ * never by a plain `writeFile`/`readFile` pair.** The payload is placed at
+ * `path` via an atomic `link()` from a freshly-written, co-located temp
+ * file — see that function's own doc comment for the full mechanism and
+ * why `link()` rather than `writeFile` is what makes a losing concurrent
+ * caller see either nothing at `path` or its complete final content, never
+ * a torn intermediate write. A losing caller never touches whatever is
+ * already at `path` without first confirming, via `lstatPlainFileOrNull`,
+ * that it is a plain file this module itself could have written, and
+ * reads it only through `readPlainFile`'s `O_NOFOLLOW` open — never a
+ * plain `readFile`, which would follow a symlink an attacker planted there
+ * and let it control the value this call trusts as the lease's
+ * first-observation time. (Fix round 1, Critical C1 / High S1: an earlier
+ * version used `writeFile(path, payload, { flag: "wx" })` for the sequence
+ * this replaces; a genuinely concurrent loser could read the winner's
+ * write mid-flight, torn, misclassify it as corrupt, and overwrite the
+ * winner's value — reproduced directly, ~1% of trials under a real
+ * `Promise.all` race, see task-3-report.md.)
  *
- * A record whose on-disk content fails to parse (truncated by a crash
- * mid-write, since no fsync/rename ceremony guards against that per
- * obligation 7) is treated as if no record existed: this call overwrites
- * it with a fresh observation rather than perpetuating a value nothing can
- * ever read back. This is a strictly safer failure than the alternative
- * (a store that is stuck forever, or a store that hard-errors on ordinary
- * cache corruption) and only ever costs liveness, per the same reasoning
- * obligation 7 already applies to a clock starting late.
+ * A record whose content fails to parse (truncated by a crash mid-write —
+ * still possible, since `tryPlaceAtomically`'s own temp-file write is not
+ * itself `fsync`ed, which is deliberate: obligation 7 forbids fsync
+ * ceremony this store's guarantees don't need) is self-healed: the corrupt
+ * entry is removed (`unlink` never dereferences a symlink, so this is safe
+ * even though `lstatPlainFileOrNull` has already ruled out a symlink being
+ * present) and this function loops back to place a fresh record. This is a
+ * strictly safer failure than the alternative (a store stuck forever, or
+ * a hard error on ordinary local corruption) and only ever costs liveness.
  */
-export async function observe(boardKey: string, eventId: EventId, options: ObserveOptions = {}): Promise<number> {
+export async function observe(
+  boardKey: string,
+  eventId: EventId,
+  options?: ObserveOptions | null,
+): Promise<number> {
+  const opts = options ?? {};
   assertValidBoardKey(boardKey);
   assertValidEventId(eventId);
-  const now = options.now ?? Date.now();
+  const now = opts.now ?? Date.now();
   validateNowForDateFormatting(now);
 
   const path = recordPath(boardKey, eventId);
+  const dir = dirname(path);
 
   try {
-    await mkdir(dirname(path), { recursive: true });
+    await mkdir(dir, { recursive: true, mode: 0o700 });
   } catch (cause) {
     throw storeUnavailableError("create state directory", cause);
   }
 
+  // Fix round 1, High S1, sink 3: `mkdir(..., { recursive: true })`
+  // silently tolerates `dir` already existing as a symlink-to-directory —
+  // it never distinguishes "already a real directory" from "already
+  // resolves to one." Confirmed via `lstat` (not the dereferencing `stat`)
+  // before this function ever writes into `dir`.
+  let dirStat: Stats;
+  try {
+    dirStat = await lstat(dir);
+  } catch (cause) {
+    throw storeUnavailableError("verify state directory", cause);
+  }
+  if (!dirStat.isDirectory()) {
+    throw storeUnavailableError("state directory is not a plain directory", undefined);
+  }
+
   const payload = JSON.stringify({ firstSeenAtMs: now } satisfies StoredObservation);
 
-  try {
-    await writeFile(path, payload, { encoding: "utf8", flag: "wx" });
-    return now;
-  } catch (writeError) {
-    if (!isNodeError(writeError) || writeError.code !== "EEXIST") {
-      throw storeUnavailableError("write observation record", writeError);
+  for (let attempt = 0; attempt < MAX_OBSERVE_ATTEMPTS; attempt++) {
+    if (await tryPlaceAtomically(path, payload)) {
+      return now;
     }
-    // Lost the exclusive-create race (or a previous invocation already
-    // wrote this record): read back whatever is there now.
+
+    const existingStat = await lstatPlainFileOrNull(path);
+    if (existingStat === null) {
+      // The occupant vanished between the failed `link()` and this
+      // `lstat` (a concurrent `discard()`, most likely) — try again.
+      continue;
+    }
+
+    const existingContent = await readPlainFile(path);
+    const existing = parseStoredObservation(existingContent);
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    // Unparseable content in a plain file (see doc comment) — remove the
+    // corrupt entry and loop back to place a fresh one.
+    try {
+      await rm(path, { force: true });
+    } catch (cause) {
+      throw storeUnavailableError("remove corrupt observation record", cause);
+    }
   }
 
-  let existingContent: string;
-  try {
-    existingContent = await readFile(path, "utf8");
-  } catch (readError) {
-    throw storeUnavailableError("read existing observation record", readError);
-  }
-
-  const existing = parseStoredObservation(existingContent);
-  if (existing !== undefined) {
-    return existing;
-  }
-
-  // Corrupt content: self-heal by overwriting outright (see doc comment).
-  try {
-    await writeFile(path, payload, "utf8");
-  } catch (cause) {
-    throw storeUnavailableError("overwrite corrupt observation record", cause);
-  }
-  return now;
+  throw storeUnavailableError("observation record contention exceeded retry bound", undefined);
 }
 
 /**
@@ -426,7 +588,21 @@ export async function observe(boardKey: string, eventId: EventId, options: Obser
  * `eventId` is validated against the ULID grammar before it is hashed
  * (obligation 2), the same as `observe()`. An unwritable-or-unreadable
  * store (permissions, not absence) throws
- * `EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE`.
+ * `EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE` — including,
+ * **not** gracefully, a path component that exists as a plain file where a
+ * directory is expected (`ENOTDIR`, distinct from the graceful `ENOENT`):
+ * confirmed directly that a read through such a path raises `ENOTDIR`, and
+ * `observe()`'s own `mkdir(..., { recursive: true })` already hard-errors
+ * on that same condition, so `firstSeen` must agree rather than fail open
+ * where `observe` fails closed.
+ *
+ * **Never a plain `readFile` — fix round 1, High S1, sink 1.** Uses
+ * `lstatPlainFileOrNull` (confirms a plain file without dereferencing a
+ * symlink) then `readPlainFile` (`O_NOFOLLOW`), the same pair `observe()`
+ * uses for its own "read what's already there" path — a plain `readFile`
+ * would follow a symlink an attacker planted at this hashed path and let
+ * it control the value this call returns, which M2.10 trusts as the
+ * lease's first-observation time.
  */
 export async function firstSeen(boardKey: string, eventId: EventId): Promise<number | null> {
   assertValidBoardKey(boardKey);
@@ -434,27 +610,12 @@ export async function firstSeen(boardKey: string, eventId: EventId): Promise<num
 
   const path = recordPath(boardKey, eventId);
 
-  let content: string;
-  try {
-    content = await readFile(path, "utf8");
-  } catch (error) {
-    if (isNodeError(error) && error.code === "ENOENT") {
-      // No record, or no state directory at all yet — both graceful
-      // (Ruling R7). **Not ENOTDIR**: that means a path component that
-      // should be a directory (e.g. the board-hash directory, or
-      // `observations/` itself) already exists as a plain file — a
-      // genuinely broken store, not an absent one. Reporting that as
-      // `null` would be the exact silent-re-observation failure R7 exists
-      // to forbid (confirmed directly: `readFile` on `<file>/<segment>`
-      // raises `ENOTDIR`, distinctly from `ENOENT` — see task-3-report.md's
-      // probe), and `observe()`'s own `mkdir(..., { recursive: true })`
-      // already hard-errors on that same condition, so `firstSeen` must
-      // agree rather than fail open where `observe` fails closed.
-      return null;
-    }
-    throw storeUnavailableError("read observation record", error);
+  const stat = await lstatPlainFileOrNull(path);
+  if (stat === null) {
+    return null;
   }
 
+  const content = await readPlainFile(path);
   const parsed = parseStoredObservation(content);
   return parsed ?? null;
 }

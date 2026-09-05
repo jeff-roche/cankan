@@ -172,13 +172,38 @@ describe("initRef — fix round 1, S3: refuses to report success on a ref that i
     expect(refAfter as string | null).toBe(blobSha as string);
   });
 
+  test("fix round 4, Low 1: EVENT_REF_UNUSABLE carries the real underlying git error as its cause", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const blobSha = rawGit(repo.dir, ["hash-object", "-w", "--stdin"], "not a tree or a commit").trim() as ObjectSha;
+    const planted = await adapter.updateRefCAS(COORD_REF, blobSha, null);
+    if (planted.outcome !== "applied") throw new Error("setup failed");
+
+    try {
+      await initRef(adapter, COORD_REF, { now: NOW });
+      throw new Error("expected initRef() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_REF_UNUSABLE);
+      // Before the fix: the round-3 refactor (assertRefIsUsable throwing
+      // directly -> checkRefUsability returning a bare string) discarded
+      // the caught error entirely, so `cause` was always `undefined` here
+      // — a diagnosability regression against fm8, since the real
+      // `GIT_COMMAND_FAILED` explaining *why* the ref is unusable was
+      // silently dropped.
+      expect(error.cause).toBeDefined();
+      if (!isCanKanError(error.cause)) throw new Error("expected error.cause to be a CanKanError");
+      expect(error.cause.code).toBe(GitErrorCodes.GIT_COMMAND_FAILED);
+    }
+  });
+
   test("fix round 2, NEW-1: a peer-planted directory at the fixed probe path does not make a healthy ref look unusable", async () => {
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);
 
     // A peer with push access — this module's own trust model — plants a
     // directory (not a plain file) at the exact, predictable
-    // `USABILITY_PROBE_PATH` `assertRefIsUsable` reads (the path is public
+    // `USABILITY_PROBE_PATH` `checkRefUsability` reads (the path is public
     // source, so it is exactly as predictable to an adversary as to this
     // test). The board is otherwise perfectly healthy: a real commit with a
     // real month file.
@@ -195,7 +220,7 @@ describe("initRef — fix round 1, S3: refuses to report success on a ref that i
     // Before this fix: `readBlobFromRef`'s own three-way check raised
     // `GIT_BLOB_AMBIGUOUS` for the directory collision (ls-tree resolved a
     // `040000` tree entry, not the expected `100644` blob), and
-    // `assertRefIsUsable` mapped *any* thrown error to `EVENT_REF_UNUSABLE`
+    // `assertRefIsUsable` (this function was later renamed `checkRefUsability`) mapped *any* thrown error to `EVENT_REF_UNUSABLE`
     // — reporting a fabricated hard failure on a board that is entirely
     // healthy. A fix for a fail-open that creates a peer-triggerable
     // fail-closed is strictly worse than the fail-open it replaced.
@@ -231,7 +256,7 @@ describe("initRef — fix round 1, S3: refuses to report success on a ref that i
     // succeeds against either) without a new adapter primitive (an
     // object-type query) that R19 scopes out of this dispatch. This test
     // exists so the gap is tracked, not silently forgotten — if this ever
-    // starts throwing, `ref.ts`'s doc comment on `assertRefIsUsable` should
+    // starts throwing, `ref.ts`'s doc comment on `checkRefUsability` should
     // be updated to say the gap is closed.
     await expect(initRef(adapter, COORD_REF, { now: NOW })).resolves.toBeUndefined();
   });

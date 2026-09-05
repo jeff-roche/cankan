@@ -31,6 +31,71 @@ import type {
 const ZERO_SHA = "0".repeat(40);
 
 /**
+ * Gap found during verification, reported per the task brief. R7 rules that
+ * every invocation spreads the real `process.env` (never a bare object) so
+ * `PATH` and everything else a git child process needs survives. `simple-git`
+ * ships a default plugin that scans the env object handed to it for a fixed,
+ * short list of variable names (`EDITOR`, `GIT_SSH_COMMAND`, `GIT_PAGER`,
+ * and similar) and throws before running *any* command if one is present —
+ * regardless of whether the command about to run would ever consult it.
+ *
+ * Confirmed directly for this task: this repository's own dev shell exports
+ * `GIT_EDITOR=true` (evidently to suppress interactive editors), and with it
+ * present, spreading `process.env` per R7 made every invocation in this
+ * module fail on first run, in its own development environment.
+ *
+ * None of these variables affects any command this module runs — every
+ * invocation here is a fixed plumbing command with array-form argv this
+ * module built itself; there is no editor, pager, external diff tool, or
+ * custom SSH/proxy command anywhere in this module's command set. Rather
+ * than reconfigure `simple-git`'s plugin, the fix is narrower: strip exactly
+ * this fixed set of key names (case-insensitively) from the copy of
+ * `process.env` this module spreads, so the ambient variable never reaches
+ * `simple-git` at all. Everything else `process.env` carries — `PATH`,
+ * `HOME`, and anything else a git child process needs, per R7's own
+ * rationale — passes through unchanged. The list below is exactly the set
+ * `@simple-git/argv-parser`'s vulnerability check inspects (confirmed by
+ * reading its installed source for this task, `dist/index.mjs`, since it
+ * ships no changelog entry documented against a version range) — it is not
+ * open-ended, so widen it here if a future `simple-git` upgrade adds a
+ * variable to that list and the same false positive resurfaces.
+ */
+const ENV_KEYS_SIMPLE_GIT_TREATS_AS_SENSITIVE = new Set([
+  "editor",
+  "git_askpass",
+  "git_config_global",
+  "git_config_system",
+  "git_config_count",
+  "git_config",
+  "git_editor",
+  "git_exec_path",
+  "git_external_diff",
+  "git_pager",
+  "git_proxy_command",
+  "git_template_dir",
+  "git_sequence_editor",
+  "git_ssh",
+  "git_ssh_command",
+  "pager",
+  "prefix",
+  "ssh_askpass",
+]);
+
+/**
+ * `process.env`, minus the fixed set of names above. The base every
+ * invocation's env is built from — see the constant's doc comment.
+ */
+function baseEnv(): Record<string, string | undefined> {
+  const filtered: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!ENV_KEYS_SIMPLE_GIT_TREATS_AS_SENSITIVE.has(key.toLowerCase())) {
+      filtered[key] = value;
+    }
+  }
+  return filtered;
+}
+
+/**
  * The CAS-rejection signature. ADR 0001:471-473 states one form: `cannot
  * lock ref '...': is at X but expected Y`. Direct verification for this task
  * (git 2.55.0, 15 repeated two-process races) found two further branches of
@@ -57,8 +122,20 @@ const ZERO_SHA = "0".repeat(40);
 const CAS_REJECTION_PATTERN =
   /cannot lock ref '[^']*': (is at [0-9a-f]+ but expected [0-9a-f]+|reference already exists|unable to resolve reference '[^']*')/;
 
-/** Confirmed stderr for a push rejected as non-fast-forward (ADR 0001:647-649). */
-const PUSH_REJECTED_PATTERN = /! \[rejected\][^\n]*\(fetch first\)/;
+/**
+ * Confirmed stderr for a push rejected as non-fast-forward (ADR 0001:647-649
+ * gives `(fetch first)`). Direct verification for this task found a second,
+ * equally common wording: `(non-fast-forward)` — observed when the pusher's
+ * own remote-tracking ref is stale relative to the actual remote (rather
+ * than the pusher having just fetched and *still* being behind, which is
+ * what produces `fetch first`). Both are git's push machinery reporting the
+ * same thing this module cares about — "this was not a fast-forward, and
+ * nothing was pushed" — so both are treated as the same typed outcome.
+ * Reported as a gap in the ADR's stated wording, per the task brief, rather
+ * than matched narrowly and left to surface as a hard error the one time a
+ * caller hits the other form.
+ */
+const PUSH_REJECTED_PATTERN = /! \[rejected\][^\n]*\((fetch first|non-fast-forward)\)/;
 
 /** Confirmed stderr for a fetch of the working ref rejected once diverged (ADR 0001:655-662). */
 const FETCH_REJECTED_PATTERN = /! \[rejected\][^\n]*\(non-fast-forward\)/;
@@ -98,7 +175,7 @@ async function runGit(
   extraEnv?: Readonly<Record<string, string>>,
 ): Promise<string> {
   const git = simpleGit({ baseDir: root });
-  git.env({ ...process.env, LC_ALL: "C", ...extraEnv });
+  git.env({ ...baseEnv(), LC_ALL: "C", ...extraEnv });
   return git.raw([...argv]);
 }
 
@@ -264,7 +341,14 @@ async function updateRefCASCore(
     // ADR 0001:458-475: "the trailing old-value argument to `update-ref` *is*
     // the entire CAS mechanism; no separate locking is needed around it."
     await runGit(root, ["update-ref", "--end-of-options", validatedRef, newSha, compare]);
-    return { outcome: "applied", sha: newSha };
+    // The one sanctioned RefSha/ObjectSha transition (see `CasOutcome`'s doc
+    // comment in `types.ts`): `update-ref` just confirmed the ref now points
+    // to `newSha`, so it is now, in fact, a value "a ref currently points
+    // to" — `RefSha`'s exact meaning. This is not a loophole in the
+    // inversion barrier: it happens once, here, after the write succeeded,
+    // never at a call site as a way to manufacture a `RefSha` to hand back
+    // in as `newSha` on some other call.
+    return { outcome: "applied", sha: newSha as unknown as RefSha };
   } catch (cause) {
     const message = messageOf(cause);
     if (CAS_REJECTION_PATTERN.test(message)) {
@@ -537,7 +621,7 @@ export async function createGitAdapter(cwd: string, options: GitAdapterOptions =
   let root: string;
   try {
     const bootstrap = simpleGit({ baseDir: cwd });
-    bootstrap.env({ ...process.env, LC_ALL: "C" });
+    bootstrap.env({ ...baseEnv(), LC_ALL: "C" });
     root = (await bootstrap.raw(["rev-parse", "--show-toplevel"])).trim();
   } catch (cause) {
     throw new CanKanError(

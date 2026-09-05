@@ -51,9 +51,22 @@ export type RefSha = Sha & { readonly __shaOrigin: "ref" };
  */
 export type ObjectSha = Sha & { readonly __shaOrigin: "object" };
 
-/** The outcome of a compare-and-swap ref update or an off-tree commit build. */
+/**
+ * The outcome of a compare-and-swap ref update or an off-tree commit build.
+ *
+ * The successful branch's `sha` is typed `RefSha`, not `ObjectSha`, even
+ * though the value passed in as `newSha` was an `ObjectSha`: once
+ * `update-ref` has applied it, that value *is* what the ref now points to —
+ * exactly `RefSha`'s meaning (see `RefSha`'s doc comment) — and a caller
+ * chaining commits (using this result as the next call's `parent`, or as a
+ * later `updateRefCAS`'s `oldSha`) needs it in that shape with no cast at
+ * the call site. This is the one place the two brands are related on
+ * purpose: the transition happens once, inside this module, after git has
+ * actually confirmed the write — never as something a caller does to a
+ * value it merely intends to write.
+ */
 export type CasOutcome =
-  | { readonly outcome: "applied"; readonly sha: ObjectSha }
+  | { readonly outcome: "applied"; readonly sha: RefSha }
   | { readonly outcome: "rejected"; readonly stderr: string };
 
 /** The outcome of a steady-state fetch or push of a ref. */

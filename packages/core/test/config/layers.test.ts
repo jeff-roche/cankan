@@ -1,3 +1,4 @@
+import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { withEnv } from "../../../test-utils/src/withEnv";
@@ -262,6 +263,92 @@ describe("out-of-namespace coordination.ref is rejected at load time (R14)", () 
       }
       expect(isCanKanError(thrown)).toBe(true);
       expect((thrown as Error).message).toContain(path);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A committed symlink at a repo-controlled config path turns loadConfig
+// into a read oracle (review round 2, fix round 2, finding 12).
+// ---------------------------------------------------------------------------
+
+describe("a symlinked repo-controlled config file is a load error; a symlinked global one still loads (review round 2 finding 12)", () => {
+  test("a symlinked .cankan/config.yml is rejected, naming the file, without following the link", async () => {
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      const outside = await makeTempRepoRoot(); // an unrelated dir, standing in for "any file the user can read"
+      try {
+        // The target is outside the repo entirely and shaped like a real
+        // secret file (top-level keys that would otherwise leak via S2's
+        // truncated-but-still-present unrecognized_keys message).
+        const target = join(outside.root, "outside-target.yml");
+        await writeFile(target, "github.com:\n  oauth_token: leaked-token-value\n");
+        const linkPath = join(root, ".cankan", "config.yml");
+        await mkdir(join(root, ".cankan"), { recursive: true });
+        await symlink(target, linkPath);
+
+        let thrown: unknown;
+        try {
+          await loadConfig({ repoRoot: root, env: hermeticEnv() });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as Error).message).toContain(linkPath);
+        // The point of the fix: the target's contents never reach the
+        // error at all -- not even truncated -- because the file is never
+        // read.
+        expect((thrown as Error).message).not.toContain("github.com");
+        expect((thrown as Error).message).not.toContain("leaked-token-value");
+      } finally {
+        await cleanup();
+        await outside.cleanup();
+      }
+    });
+  });
+
+  test("a symlinked .cankan/local.yml is rejected, naming the file", async () => {
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      const outside = await makeTempRepoRoot();
+      try {
+        const target = join(outside.root, "outside-target-local.yml");
+        await writeFile(target, "editor: vim\n");
+        const linkPath = join(root, ".cankan", "local.yml");
+        await mkdir(join(root, ".cankan"), { recursive: true });
+        await symlink(target, linkPath);
+
+        let thrown: unknown;
+        try {
+          await loadConfig({ repoRoot: root, env: hermeticEnv() });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as Error).message).toContain(linkPath);
+      } finally {
+        await cleanup();
+        await outside.cleanup();
+      }
+    });
+  });
+
+  test("a symlinked global config.yml still loads normally -- the user's own file is not fenced", async () => {
+    // Deliberate asymmetry: symlinking your own dotfiles (e.g. from a
+    // dotfiles repo) into ~/.config/cankan/config.yml is a normal
+    // workflow, and the global layer is not attacker-supplyable the way
+    // the repo layers are.
+    await withEnv(undefined, async () => {
+      const home = process.env.HOME as string;
+      const target = join(home, "real-config.yml");
+      await writeFile(target, "editor: vim\n");
+      const linkPath = join(home, ".config", "cankan", "config.yml");
+      await mkdir(join(home, ".config", "cankan"), { recursive: true });
+      await symlink(target, linkPath);
+
+      const result = await loadConfig({ env: hermeticEnv() });
+      expect(result.resolved("editor")?.value).toBe("vim");
+      expect(result.resolved("editor")?.file).toBe(linkPath);
     });
   });
 });

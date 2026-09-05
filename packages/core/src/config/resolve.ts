@@ -667,13 +667,24 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
   // Review round 2 finding 1: `resolveGlobalConfigPath` now returns
   // `undefined` when no absolute path can be formed (HOME/XDG_CONFIG_HOME
   // both absent/relative) -- treated as R12's "missing layer", not loaded.
+  //
+  // Review round 2 finding 12: `rejectSymlink` is `true` for the repo and
+  // repo-local paths (attacker-supplyable via a committed symlink) and
+  // `false` for the global path (the user's own file -- see
+  // `assertNotSymlink` in layers.ts for why that asymmetry is deliberate).
   const globalPath = resolveGlobalConfigPath(env);
   const [globalLoaded, repoLoaded, repoLocalLoaded] = await Promise.all([
     globalPath
-      ? loadValidatedLayer("global", globalPath, globalConfigSchema, POLICY_TAGS)
+      ? loadValidatedLayer("global", globalPath, globalConfigSchema, POLICY_TAGS, false)
       : Promise.resolve(undefined),
     repoRoot
-      ? loadValidatedLayer("repo", resolveRepoConfigPath(repoRoot), repoConfigSchema, POLICY_TAGS)
+      ? loadValidatedLayer(
+          "repo",
+          resolveRepoConfigPath(repoRoot),
+          repoConfigSchema,
+          POLICY_TAGS,
+          true,
+        )
       : Promise.resolve(undefined),
     repoRoot
       ? loadValidatedLayer(
@@ -681,6 +692,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
           resolveRepoLocalConfigPath(repoRoot),
           localConfigSchema,
           POLICY_TAGS,
+          true,
         )
       : Promise.resolve(undefined),
   ]);

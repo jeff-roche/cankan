@@ -154,14 +154,25 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, type Stats } from "node:fs";
-import { link, lstat, mkdir, open, rm, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
-import { CanKanError } from "../errors";
+import { CanKanError, isCanKanError } from "../errors";
 import type { GitAdapter } from "../git/index";
 import { EventErrorCodes } from "./errors";
 import { validateNowForDateFormatting } from "./log";
 import { type EventId, isValidEventId } from "./schema";
+
+/**
+ * Mirrors `log.ts`'s own `MAX_DATE_MS` (not exported, and not imported here
+ * — `log.ts` is frozen and out of this dispatch's authority to edit; this
+ * is the same literal, `Date`'s own representable-range bound). Used only
+ * to bound a *read-back* `firstSeenAtMs` (fix round 2) — the write side
+ * already bounds `now` to this same range via `validateNowForDateFormatting`
+ * before it is ever stored, so a value outside it on read is never one this
+ * module wrote itself.
+ */
+const MAX_DATE_MS = 8_640_000_000_000_000;
 
 /**
  * `sha256`, hex-encoded: collision resistance well beyond anything this
@@ -298,7 +309,23 @@ interface StoredObservation {
   readonly firstSeenAtMs: number;
 }
 
-/** `undefined` for anything that isn't a well-formed record — corrupt content is treated the same as "no record" (see `firstSeen`/`observe`'s doc comments). */
+/**
+ * `undefined` for anything that isn't a well-formed record — corrupt
+ * content is treated the same as "no record" (see `firstSeen`/`observe`'s
+ * doc comments).
+ *
+ * **Bounded to `[-MAX_DATE_MS, MAX_DATE_MS]` — fix round 2, read-side
+ * hygiene.** The write side already bounds `now` to exactly this range via
+ * `validateNowForDateFormatting` before `observe()` ever stores it, so any
+ * value outside it was never legitimately written by this module — it can
+ * only be a planted or corrupted record. `Number.isFinite` alone rejects
+ * `NaN`/`Infinity` but not an in-range-for-`isFinite`, absurd-for-a-Date
+ * value (e.g. `Number.MAX_SAFE_INTEGER`, which exceeds `MAX_DATE_MS`).
+ * Mirroring the write side's own bound removes that degree of freedom from
+ * whatever reads this value next, without this module needing to reason
+ * about which specific downstream computation an out-of-range value might
+ * corrupt.
+ */
 function parseStoredObservation(content: string): number | undefined {
   try {
     const parsed: unknown = JSON.parse(content);
@@ -307,7 +334,9 @@ function parseStoredObservation(content: string): number | undefined {
       parsed !== null &&
       "firstSeenAtMs" in parsed &&
       typeof (parsed as StoredObservation).firstSeenAtMs === "number" &&
-      Number.isFinite((parsed as StoredObservation).firstSeenAtMs)
+      Number.isFinite((parsed as StoredObservation).firstSeenAtMs) &&
+      (parsed as StoredObservation).firstSeenAtMs >= -MAX_DATE_MS &&
+      (parsed as StoredObservation).firstSeenAtMs <= MAX_DATE_MS
     ) {
       return (parsed as StoredObservation).firstSeenAtMs;
     }
@@ -331,6 +360,42 @@ export async function boardKeyFor(adapter: GitAdapter): Promise<string> {
  * ceremony around it.
  */
 const MAX_OBSERVE_ATTEMPTS = 5;
+
+/**
+ * `link()` failed for a reason other than "something is already there"
+ * (`EEXIST`) — fix round 2, L3 (Ruling R38). `EPERM`/`ENOTSUP` (exFAT/FAT,
+ * some FUSE and network mounts don't support hard links at all) and
+ * `EXDEV` (confirmed directly reachable — cross-device, which can occur
+ * even for two names inside what looks like one directory, on some overlay
+ * or bind-mount setups) all mean this store's placement mechanism cannot
+ * work on this filesystem at all, not that this one call failed. Named
+ * explicitly, with the remedy, rather than folded into the generic
+ * unwritable-store message: a silent `EACCES`-shaped failure here would
+ * read as "permissions," when the actual fix is "this filesystem," which a
+ * permissions fix cannot touch.
+ *
+ * **Deliberately not a fallback to a non-atomic write.** Falling back to
+ * `writeFile(path, payload, { flag: "wx" })` on these filesystems would
+ * reintroduce fix round 1's Critical C1 race (a torn read misclassified as
+ * corrupt and overwritten) on exactly the filesystems that hit this branch
+ * — trading a loud, actionable failure for a silent double-claim. Ruling
+ * R38 is explicit that this must diagnose, not degrade.
+ */
+// Exported (module-internal — not re-exported from `events/index.ts`) so a
+// test can verify this error-shape mapping directly. Reproducing the real
+// `link()` failure end to end needs a filesystem without hard-link support
+// (exFAT/FAT) or a genuine cross-device setup mounted — both need root in
+// this environment (Ruling R38's own note); this is the part of the fix
+// that can be verified without one.
+export function hardLinkUnsupportedError(cause: NodeJS.ErrnoException): CanKanError {
+  return new CanKanError(
+    EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+    "the lease-observation store's filesystem does not support hard links, which this store requires to place records atomically -- set $XDG_STATE_HOME to a filesystem that does",
+    { cause, details: { operation: "link observation record into place" } },
+  );
+}
+
+export const HARD_LINK_UNSUPPORTED_CODES = new Set(["EPERM", "ENOTSUP", "EXDEV"]);
 
 /**
  * Attempts to atomically place `payload` at `path` **without ever
@@ -357,9 +422,17 @@ const MAX_OBSERVE_ATTEMPTS = 5;
  *   symlink *at `path`* is refused the same way a real prior record is:
  *   this call learns only "something is there," never what.
  * - The temp file is always unlinked afterward regardless of outcome
- *   (`finally`) — `link()` creates a *second* name for the same inode, so
- *   removing the temp name never removes the data now reachable at `path`
- *   when this call won.
+ *   (`finally`, wrapping *both* steps — fix round 2, L1) — `link()` creates
+ *   a *second* name for the same inode, so removing the temp name never
+ *   removes the data now reachable at `path` when this call won. **The
+ *   `finally` covers the `writeFile` step too**, not only `link`: an
+ *   earlier version cleaned up only around the `link()` attempt, leaking
+ *   the temp file whenever `writeFile`'s own `write()` half failed after
+ *   its `open()` half (via `O_CREAT|O_EXCL`) had already created the
+ *   entry — confirmed directly under `ulimit -f` (`EFBIG`): the temp name
+ *   was left behind, non-empty, with no code path that would ever sweep it
+ *   (`discard()` only ever removes the hashed record name, never a stray
+ *   `.tmp-*` sibling).
  *
  * This closes the gap `writeFile(path, payload, { flag: "wx" })` alone left
  * once a *second* write needs to replace something already at `path` (the
@@ -367,26 +440,40 @@ const MAX_OBSERVE_ATTEMPTS = 5;
  * only ever a *create*, and this module has no analogous *replace*
  * primitive that stays symlink-safe without going through a temp file.
  */
-async function tryPlaceAtomically(path: string, payload: string): Promise<boolean> {
+// Exported (module-internal — not re-exported from `events/index.ts`, the
+// same pattern as `recordPath`) so a test can reproduce the fix round 2 L1
+// leak scenario directly: calling this with a large `payload` inside a
+// process whose `ulimit -f` is tightened lets a test trigger a genuine
+// `write()`-half failure (`EFBIG`) after the `open()` half (`O_CREAT|O_EXCL`)
+// has already created the temp file, without needing the full `observe()`
+// payload (a small fixed-size JSON object) to happen to exceed any
+// reasonable resource limit on its own.
+export async function tryPlaceAtomically(path: string, payload: string): Promise<boolean> {
   const tempPath = `${path}.tmp-${randomBytes(16).toString("hex")}`;
   try {
-    await writeFile(tempPath, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
-  } catch (cause) {
-    throw storeUnavailableError("write temporary observation record", cause);
-  }
-  try {
-    await link(tempPath, path);
-    return true;
-  } catch (linkError) {
-    if (!isNodeError(linkError) || linkError.code !== "EEXIST") {
+    try {
+      await writeFile(tempPath, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    } catch (cause) {
+      throw storeUnavailableError("write temporary observation record", cause);
+    }
+
+    try {
+      await link(tempPath, path);
+      return true;
+    } catch (linkError) {
+      if (isNodeError(linkError) && linkError.code === "EEXIST") {
+        return false;
+      }
+      if (isNodeError(linkError) && linkError.code !== undefined && HARD_LINK_UNSUPPORTED_CODES.has(linkError.code)) {
+        throw hardLinkUnsupportedError(linkError);
+      }
       throw storeUnavailableError("link observation record into place", linkError);
     }
-    return false;
   } finally {
-    // Best-effort cleanup: the temp name is unguessable, so a stray one
-    // left behind by a crash between `writeFile` and `link` is inert, not
-    // a security concern, and cleaning it up is not this call's
-    // correctness requirement.
+    // Best-effort cleanup, covering every exit path above (fix round 2,
+    // L1): `rm` on a name that was never created at all (the `writeFile`
+    // failed before `open()` ever succeeded) is a harmless no-op via
+    // `force: true`.
     await rm(tempPath, { force: true }).catch(() => {});
   }
 }
@@ -445,6 +532,125 @@ async function readPlainFile(path: string): Promise<string> {
   } catch (error) {
     throw storeUnavailableError("read observation record", error);
   }
+}
+
+/**
+ * `ensurePrivateDir`'s outcome when `create: false` and `dir` does not
+ * exist — the ordinary "nothing recorded here yet" case, distinct from
+ * every other outcome, which either succeeds silently or throws.
+ */
+const DIR_ABSENT = Symbol("absent");
+
+/**
+ * Confirms `dir` is a plain directory, owned by the current user, with no
+ * group/other access — **fix round 2, Ruling R37 (High H1 / Medium M1)**.
+ * Creates it (`mode: 0o700`) when `create` is `true` and it does not exist
+ * yet; with `create: false`, an absent `dir` returns {@link DIR_ABSENT}
+ * rather than creating anything (this is what lets `firstSeen()` keep
+ * reporting "no record" gracefully for a store that was never written to,
+ * per Ruling R7, while still verifying whatever *does* exist).
+ *
+ * **Why this checks ownership and permission bits, not merely "is it a
+ * directory" — the M1 finding.** Fix round 1's directory check
+ * (`lstat(dir).isDirectory()`) closed a *symlinked* `dir`, but a `dir` that
+ * is a **genuine directory the attacker owns**, containing a plain file at
+ * the correctly-hashed record name, satisfies every shape check fix round
+ * 1 added: `mkdir(recursive)` no-ops (it already exists), `isDirectory()`
+ * is `true`, the record inside it is a plain file, `O_NOFOLLOW` opens it
+ * without incident. No amount of shape-checking closes this — the missing
+ * property is *ownership*, checked here via `stat.uid`, and *exclusivity*,
+ * checked via `(stat.mode & 0o077) === 0` (no group or other access bit
+ * set at all; the owner's own bits are not constrained further). A
+ * directory this module previously created under a permissive `umask` (fix
+ * round 1's own gap, per the orchestrator: "`mkdir` never chmods an
+ * existing directory, so a store created by the vulnerable build under
+ * umask 000 stays 777 forever") is tightened in place via `chmod` rather
+ * than trusted or rejected outright — the failure mode this guards against
+ * is *another user* writing into a directory this user owns, which a
+ * same-user `chmod` fully remedies; a directory this user does not own at
+ * all cannot be remedied and hard-errors instead.
+ *
+ * Applied to every path component this module itself owns and creates —
+ * the `cankan` directory, `cankan/observations`, and each board's hashed
+ * subdirectory — in both `observe()` and `firstSeen()`. **Not applied
+ * inside `$XDG_STATE_HOME` itself**, which this module does not create and
+ * shares with whatever else the XDG spec's `$XDG_STATE_HOME` reservation
+ * covers — enforcing ownership there is outside this module's remit.
+ *
+ * No-op (skips the ownership/mode check entirely, verifying only
+ * directory-ness) where `process.getuid` does not exist (Windows has no
+ * POSIX uid/mode model to check).
+ */
+async function ensurePrivateDir(dir: string, options: { create: boolean }): Promise<typeof DIR_ABSENT | undefined> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let stat: Stats;
+    try {
+      stat = await lstat(dir);
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") {
+        if (!options.create) {
+          return DIR_ABSENT;
+        }
+        try {
+          // `recursive: true` so the first-ever call (creating the
+          // `cankan` directory) also creates whatever XDG-conventional
+          // parents don't exist yet (e.g. `~/.local/state`) -- those
+          // parents are outside this module's ownership remit (see this
+          // function's doc comment) and are not separately verified, but
+          // recursive `mkdir` applying the same `mode` to them as a side
+          // effect of one syscall is harmless, not a scope violation.
+          //
+          // **`mode: 0o700` here is narrower than it looks, disclosed
+          // honestly**: the ownership+mode check just below (`uid`/`0o077`)
+          // already `chmod`s *any* directory this call reaches back to
+          // `0o700` regardless of what `mkdir` created it as (confirmed
+          // directly: deleting this `mode` option alone, with that check
+          // left in place, does not change the mode `observe()` leaves
+          // behind — the `chmod` step already fixes it up on the very same
+          // call). What this option alone still buys, which the
+          // fixed-mode `mkdir` versus separate `chmod` do not, is
+          // *atomicity*: without it, a freshly-created directory exists
+          // briefly at its unmasked default before the `chmod` below runs,
+          // a narrow window a local attacker racing this exact call could
+          // in principle use. Untested (isolating a single-syscall race
+          // window from outside this function isn't practical), kept as
+          // defense in depth, not claimed as independently guarded by a
+          // test the way the `chmod` step is.
+          await mkdir(dir, { recursive: true, mode: 0o700 });
+        } catch (mkdirError) {
+          if (isNodeError(mkdirError) && mkdirError.code === "EEXIST") {
+            continue; // a concurrent creator won -- re-lstat and validate it.
+          }
+          throw storeUnavailableError("create state directory", mkdirError);
+        }
+        continue; // just created -- re-lstat to validate it below.
+      }
+      throw storeUnavailableError("stat state directory", error);
+    }
+
+    if (!stat.isDirectory()) {
+      // Never a symlink, even a symlink-to-directory (fix round 1, sink 3)
+      // -- `lstat` reports the entry itself, so a symlink here reports
+      // `isDirectory() === false` regardless of its target.
+      throw storeUnavailableError("state directory is not a plain directory", undefined);
+    }
+
+    const uid = process.getuid?.();
+    if (uid !== undefined) {
+      if (stat.uid !== uid) {
+        throw storeUnavailableError("state directory is not owned by the current user", undefined);
+      }
+      if ((stat.mode & 0o077) !== 0) {
+        try {
+          await chmod(dir, 0o700);
+        } catch (cause) {
+          throw storeUnavailableError("restrict state directory permissions", cause);
+        }
+      }
+    }
+    return undefined;
+  }
+  throw storeUnavailableError("state directory contention exceeded retry bound", undefined);
 }
 
 export interface ObserveOptions {
@@ -507,6 +713,13 @@ export interface ObserveOptions {
  * present) and this function loops back to place a fresh record. This is a
  * strictly safer failure than the alternative (a store stuck forever, or
  * a hard error on ordinary local corruption) and only ever costs liveness.
+ *
+ * **Every directory level this module owns is ownership-and-permission
+ * checked, not merely shape-checked — fix round 2, Ruling R37.** See
+ * {@link ensurePrivateDir}'s own doc comment for the full reasoning (a
+ * *genuine* directory a different user owns defeats every shape check fix
+ * round 1 added, and closing it needs an ownership/mode check, not a
+ * deeper symlink check).
  */
 export async function observe(
   boardKey: string,
@@ -520,28 +733,13 @@ export async function observe(
   validateNowForDateFormatting(now);
 
   const path = recordPath(boardKey, eventId);
-  const dir = dirname(path);
+  const boardHashDir = dirname(path);
+  const observationsDir = dirname(boardHashDir);
+  const cankanDir = dirname(observationsDir);
 
-  try {
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-  } catch (cause) {
-    throw storeUnavailableError("create state directory", cause);
-  }
-
-  // Fix round 1, High S1, sink 3: `mkdir(..., { recursive: true })`
-  // silently tolerates `dir` already existing as a symlink-to-directory —
-  // it never distinguishes "already a real directory" from "already
-  // resolves to one." Confirmed via `lstat` (not the dereferencing `stat`)
-  // before this function ever writes into `dir`.
-  let dirStat: Stats;
-  try {
-    dirStat = await lstat(dir);
-  } catch (cause) {
-    throw storeUnavailableError("verify state directory", cause);
-  }
-  if (!dirStat.isDirectory()) {
-    throw storeUnavailableError("state directory is not a plain directory", undefined);
-  }
+  await ensurePrivateDir(cankanDir, { create: true });
+  await ensurePrivateDir(observationsDir, { create: true });
+  await ensurePrivateDir(boardHashDir, { create: true });
 
   const payload = JSON.stringify({ firstSeenAtMs: now } satisfies StoredObservation);
 
@@ -557,7 +755,24 @@ export async function observe(
       continue;
     }
 
-    const existingContent = await readPlainFile(path);
+    let existingContent: string;
+    try {
+      existingContent = await readPlainFile(path);
+    } catch (error) {
+      // Fix round 2, L2: the occupant can *also* vanish in the narrower
+      // window between the `lstat` above and this `open` (the identical
+      // concurrent-`discard()` race, one syscall later) — `readPlainFile`
+      // wraps every failure into a `CanKanError`, so the original `ENOENT`
+      // survives only as `error.cause`. Retrying here is the same
+      // response as the `lstat`-level race above; a real (not raced)
+      // read failure is anything whose `cause` isn't `ENOENT`, and that
+      // still propagates as a hard error, unchanged.
+      if (isCanKanError(error) && isNodeError(error.cause) && error.cause.code === "ENOENT") {
+        continue;
+      }
+      throw error;
+    }
+
     const existing = parseStoredObservation(existingContent);
     if (existing !== undefined) {
       return existing;
@@ -603,12 +818,37 @@ export async function observe(
  * would follow a symlink an attacker planted at this hashed path and let
  * it control the value this call returns, which M2.10 trusts as the
  * lease's first-observation time.
+ *
+ * **Every existing directory level is ownership-and-permission checked,
+ * the same as `observe()` — fix round 2, Ruling R37 (High H1).** Fix
+ * round 1 applied its directory check only inside `observe()`, at only the
+ * leaf `<boardhash>` level — this function had no directory check at all,
+ * so a symlinked `observations/` (not just a symlinked `<boardhash>`)
+ * reached `lstatPlainFileOrNull`/`readPlainFile` by resolving *through*
+ * the symlink before either guard ever ran, since neither guard inspects
+ * any path component but the leaf. Unlike `observe()`, this function never
+ * creates a missing directory (`ensurePrivateDir(..., { create: false })`)
+ * — an absent directory at any level is still the ordinary "no record"
+ * case (Ruling R7), not an error.
  */
 export async function firstSeen(boardKey: string, eventId: EventId): Promise<number | null> {
   assertValidBoardKey(boardKey);
   assertValidEventId(eventId);
 
   const path = recordPath(boardKey, eventId);
+  const boardHashDir = dirname(path);
+  const observationsDir = dirname(boardHashDir);
+  const cankanDir = dirname(observationsDir);
+
+  if ((await ensurePrivateDir(cankanDir, { create: false })) === DIR_ABSENT) {
+    return null;
+  }
+  if ((await ensurePrivateDir(observationsDir, { create: false })) === DIR_ABSENT) {
+    return null;
+  }
+  if ((await ensurePrivateDir(boardHashDir, { create: false })) === DIR_ABSENT) {
+    return null;
+  }
 
   const stat = await lstatPlainFileOrNull(path);
   if (stat === null) {

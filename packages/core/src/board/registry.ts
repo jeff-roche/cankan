@@ -47,15 +47,13 @@ import { ConfigErrorCodes } from "../config/index";
 import { loadValidatedLayer } from "../config/layers";
 import { CanKanError, isCanKanError } from "../errors";
 import { BoardErrorCodes } from "./errors";
-import { resolvePersonalBoardPath } from "./personal";
+import { canonicalPersonalPath, resolvePersonalBoardPath } from "./personal";
 // The personal-board checks below (`register()`, `listRegisteredBoards()`)
 // need the same "equal to, or beneath" containment test ADR 0002's
 // `tickets_dir` check already uses -- an exact-string `===` only refused
 // the personal board's exact root, not a registered *subdirectory* of it.
-// `realpathExistingPrefix` is `listRegisteredBoards`'s three-tier
-// canonicalization fallback (see `resolveCanonicalOrExistingPersonalPath`
-// below). Both reused from `ref.ts` rather than re-derived, same module.
-import { isContained, realpathExistingPrefix } from "./ref";
+// Reused from `ref.ts` rather than re-derived, same module.
+import { isContained } from "./ref";
 import { resolveDataHome } from "./xdg";
 
 // ---------------------------------------------------------------------------
@@ -184,9 +182,9 @@ async function ensureRegistryDir(registryPath: string): Promise<void> {
  * which is what makes the plain `undefined`-on-failure form safe to keep
  * using there.
  *
- * `listRegisteredBoards` does **not** use this function -- see
- * `resolveCanonicalOrExistingPersonalPath` below for why it needs a
- * stronger fallback.
+ * `listRegisteredBoards` does **not** use this function -- it needs the
+ * stronger, shared `canonicalPersonalPath` (`./personal`) instead; see
+ * that function's own doc comment for why.
  */
 async function resolveCanonicalPersonalPath(
   env: Readonly<Record<string, string | undefined>>,
@@ -200,37 +198,16 @@ async function resolveCanonicalPersonalPath(
   }
 }
 
-/**
- * The personal board's own path, resolved the same three-tier way
- * `resolve.ts`'s `canonicalPersonalPath` is: `realpath` first, then
- * `realpathExistingPrefix` (the deepest already-existing ancestor,
- * re-appending the rest verbatim), then the raw path as a last resort.
- * `undefined` only when no data home can be resolved at all.
- *
- * Used by `listRegisteredBoards`'s "is this registry entry the personal
- * board" check, which -- unlike `register()` -- compares against a
- * registry entry's *stored* path, not something already guaranteed to
- * exist: with the personal board never created, `resolveCanonicalPersonalPath`
- * (the plain form) returns `undefined`, which made the "is the personal
- * board" skip never fire at all -- exactly the fresh-install hole
- * `resolve.ts`'s `canonicalPersonalPath` closes on the resolver side,
- * closed here on the registry-read side too (security review).
- */
-async function resolveCanonicalOrExistingPersonalPath(
-  env: Readonly<Record<string, string | undefined>>,
-): Promise<string | undefined> {
-  const raw = resolvePersonalBoardPath(env);
-  if (!raw) return undefined;
-  try {
-    return await realpath(raw);
-  } catch {
-    try {
-      return await realpathExistingPrefix(raw);
-    } catch {
-      return raw;
-    }
-  }
-}
+// `canonicalPersonalPath` (imported from `./personal`, above) is
+// `listRegisteredBoards`'s "is this registry entry the personal board"
+// comparison -- unlike `register()`, it compares against a registry
+// entry's *stored* path, not something already guaranteed to exist, so it
+// needs the stronger three-tier fallback rather than
+// `resolveCanonicalPersonalPath`'s plain form. Shared with `resolve.ts`
+// (fix round 5, H1: this file and `resolve.ts` each held a
+// byte-for-byte-identical copy of the same fallback chain, which no test
+// could ever catch diverging) -- see that function's own doc comment in
+// `personal.ts` for the full three-tier explanation.
 
 // ---------------------------------------------------------------------------
 // Reading (R16-style guard reuse -- see the note on `readRegistryRaw` below)
@@ -332,6 +309,18 @@ function toEntry(raw: RawRegistryEntry): RegistryEntry {
  *
  * Returns an empty listing (never throws) when no registry file exists,
  * or when no data directory can even be located.
+ *
+ * **`boards[]` are raw registry rows, not vetted `BoardRef`s -- do not
+ * build a `BoardRef` from one, or treat it as safe to read, without going
+ * through `resolveBoard`/`resolveAllBoards` first (`resolve.ts`).** This
+ * function can only check what a registry entry's *root* looks like on
+ * disk; it has no way to see what that entry's own `tickets_dir` resolves
+ * to, so a registered *ancestor* of the personal board with `tickets_dir`
+ * steered into it (CONCEPT.md §6c's privacy boundary) passes every check
+ * here and appears in `boards` with `skipped` empty. `resolveBoard`/
+ * `resolveAllBoards` both build the full `BoardRef` and apply
+ * `aliasesPersonalBoard` before ever returning such an entry, which is
+ * what actually closes that boundary -- nothing in this function does.
  */
 export async function listRegisteredBoards(
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -341,7 +330,7 @@ export async function listRegisteredBoards(
     return { boards: [], skipped: [] };
   }
   const raw = await readRegistryRaw(registryPath);
-  const personalPath = await resolveCanonicalOrExistingPersonalPath(env);
+  const personalPath = await canonicalPersonalPath(env);
 
   const boards: RegistryEntry[] = [];
   const skipped: SkippedRegistryEntry[] = [];
@@ -363,8 +352,16 @@ export async function listRegisteredBoards(
         skipped.push({ name: entry.name, path: entry.path, reason: "registered path is not a directory" });
         continue;
       }
-    } catch {
-      skipped.push({ name: entry.name, path: entry.path, reason: "registered directory no longer exists" });
+    } catch (err) {
+      // Distinguish "gone" from "merely inaccessible" (security review,
+      // H2): the skip behavior is identical either way, but a permission
+      // failure (`EACCES` on an ancestor, most commonly) is not evidence
+      // the directory doesn't exist, and reporting it as such is
+      // misleading to whoever reads `skipped`.
+      const reason = isEnoent(err)
+        ? "registered directory no longer exists"
+        : "registered directory could not be accessed";
+      skipped.push({ name: entry.name, path: entry.path, reason });
       continue;
     }
     boards.push(toEntry(entry));

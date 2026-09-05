@@ -205,6 +205,34 @@ describe("registry -- entry whose directory no longer exists", () => {
       }
     });
   });
+
+  // Security review (H2): the catch above collapsed every `stat` failure
+  // -- including a permission error -- into the same "no longer exists"
+  // reason. The skip behavior is right either way, but the human-readable
+  // reason was wrong for this shape, and `stat`'s error code was already
+  // in hand at the catch site to tell them apart.
+  test("H2: a registered directory blocked by a permission failure gets a distinct reason from 'no longer exists'", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const parent = await mkdtemp(join(tmpdir(), "cankan-registry-perm-"));
+      const boardDir = join(parent, "board");
+      await mkdir(boardDir, { recursive: true });
+      try {
+        await register("blocked", boardDir, env);
+        await chmod(parent, 0o000);
+        try {
+          const listing = await listRegisteredBoards(env);
+          expect(listing.boards).toHaveLength(0);
+          expect(listing.skipped).toHaveLength(1);
+          expect(listing.skipped[0]?.reason).toBe("registered directory could not be accessed");
+        } finally {
+          await chmod(parent, 0o700);
+        }
+      } finally {
+        await rm(parent, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 describe("registry -- atomic writes", () => {
@@ -343,6 +371,17 @@ describe("registry -- stale lock breaking", () => {
   });
 });
 
+// Both tests below are FIFO rendezvous points keyed to `withRegistryLock`'s
+// *exact* sequence of reads around its staleness check -- not just how many
+// times it calls `readLockToken`, but the *order* of that read relative to
+// the age check (`lstat`, then the age comparison). Confirmed by mutation
+// (fix round 5, H1 verification): a mutation that keeps the read count
+// identical but moves a `readLockToken` call to *before* the age gate still
+// desyncs one of these tests, because a non-stale loop iteration then
+// consumes a FIFO write these tests never intended a non-stale iteration to
+// consume. If `withRegistryLock`'s own read/check ordering ever changes,
+// re-verify these two tests by mutation before trusting them again -- don't
+// assume "the read count is the same" is sufficient.
 describe("registry -- N3: a stale lock stolen mid-break is restored, preserving identity", () => {
   test("a fresh lock stolen by a naive stale-break is put back (preserving its FIFO identity) and leaves no orphaned .stale-* file", async () => {
     // Note: this test alone does not discriminate `link` from `rename` --

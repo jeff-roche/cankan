@@ -42,12 +42,12 @@
  * on its own.
  */
 
-import { lstat, mkdir } from "node:fs/promises";
+import { lstat, mkdir, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { CanKanError } from "../errors";
 import type { BoardRef } from "../types";
 import { BoardErrorCodes } from "./errors";
-import { buildBoardRef } from "./ref";
+import { buildBoardRef, realpathExistingPrefix } from "./ref";
 import { resolveDataHome } from "./xdg";
 
 /**
@@ -64,6 +64,66 @@ export function resolvePersonalBoardPath(
 ): string | undefined {
   const dataHome = resolveDataHome(env);
   return dataHome ? join(dataHome, "cankan", "personal") : undefined;
+}
+
+/**
+ * The personal board's own path, for comparison against something that is
+ * already canonical (a `BoardRef`'s `root`/`ticketsDir`, both `realpath`'d
+ * by `buildBoardRef`). Shared by `resolve.ts` and `registry.ts` -- both
+ * need the identical fallback chain, and a second, independently-drifting
+ * copy of a security-relevant comparison is exactly the risk this file's
+ * own `isContained`/`realpathExistingPrefix` reuse already avoids one
+ * layer down (security review, fix round 5, H1: a first version of this
+ * had two byte-for-byte-identical copies, one per file, that no test could
+ * ever catch diverging, since each file's tests only exercised its own
+ * copy).
+ *
+ * Resolved in three tiers, each a fallback for the last:
+ *
+ * 1. `realpath(raw)` -- the board exists; fully canonical.
+ * 2. `realpathExistingPrefix(raw)` (`ref.ts`'s own technique for a
+ *    `tickets_dir` that doesn't fully exist yet) -- the board (or some
+ *    ancestor of it) does not exist yet, but everything that *does* exist
+ *    along the path is still resolved canonically and the missing suffix
+ *    is re-appended verbatim. This is what keeps the comparison correct
+ *    when `$XDG_DATA_HOME` itself sits behind a symlink (FreeBSD ships
+ *    `/home -> /usr/home` by default) and the personal board has never
+ *    been created: a raw, un-resolved path here would disagree with the
+ *    already-`realpath`'d value it gets compared against on exactly the
+ *    symlinked prefix, defeating the comparison the same way an
+ *    unresolved `BoardRef.root` would.
+ * 3. The raw path itself -- only if even that fails (an ancestor is
+ *    unreadable, say). A guard comparing a possibly non-canonical path is
+ *    still better than one skipped entirely: every caller of this function
+ *    treats `undefined` as "nothing to compare against, skip the check,"
+ *    and a personal board that has never been created (the *ordinary*
+ *    state of a fresh `cankan` install) is not evidence that no alias
+ *    check is needed -- it is the single most common state a fresh
+ *    install is in.
+ *
+ * `undefined` only when no data home can be resolved at all.
+ *
+ * **Not** used by `registry.ts`'s `register()`: that function's own
+ * `targetPath` is already `realpath`'d before this comparison runs, so it
+ * can never equal a personal path that does not exist, and this stronger
+ * (and more expensive) fallback would buy it nothing. `register()` keeps
+ * its own plain, two-tier `resolveCanonicalPersonalPath` (`realpath`, or
+ * `undefined`) for that reason.
+ */
+export async function canonicalPersonalPath(
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<string | undefined> {
+  const raw = resolvePersonalBoardPath(env);
+  if (!raw) return undefined;
+  try {
+    return await realpath(raw);
+  } catch {
+    try {
+      return await realpathExistingPrefix(raw);
+    } catch {
+      return raw;
+    }
+  }
 }
 
 export interface EnsurePersonalBoardOptions {

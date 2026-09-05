@@ -37,6 +37,18 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * `JSON.stringify` of a thrown `CanKanError`'s `details`, for asserting
+ * what does or doesn't appear there specifically (fix round 2, F7) --
+ * `details`, not `message`, is the channel `toJSON`/`--json` output
+ * actually publishes, so a message-only assertion does not discriminate a
+ * fix that scrubs the message but leaves `details.path` intact.
+ */
+function detailsAsString(thrown: unknown): string {
+  const details = (thrown as { details?: unknown }).details;
+  return JSON.stringify(details ?? {});
+}
+
+/**
  * Creates a FIFO (named pipe) at `path` via the real `mkfifo(1)` -- Node
  * has no `fs.mkfifo`. Used only by the lock-race tests below: a FIFO's
  * `open()`/read/write calls are real blocking rendezvous points, which is
@@ -718,6 +730,9 @@ describe("registry -- F7: the personal board can never be registered as a repo b
       }
       expect(isCanKanError(thrown)).toBe(true);
       expect((thrown as { code: string }).code).toBe("CANNOT_REGISTER_PERSONAL_BOARD");
+      // F5/F7 (fix round 2): `details`, not just `message`, must not
+      // publish the personal board's path.
+      expect(detailsAsString(thrown)).not.toContain(personal.board.root);
 
       const listing = await listRegisteredBoards(env);
       expect(listing.boards).toHaveLength(0);
@@ -768,6 +783,8 @@ describe("registry -- F7: the personal board can never be registered as a repo b
       }
       expect(isCanKanError(thrown)).toBe(true);
       expect((thrown as { code: string }).code).toBe("CANNOT_REGISTER_PERSONAL_BOARD");
+      expect(detailsAsString(thrown)).not.toContain(personal.board.root);
+      expect(detailsAsString(thrown)).not.toContain(subdir);
 
       const listing = await listRegisteredBoards(env);
       expect(listing.boards).toHaveLength(0);
@@ -822,6 +839,7 @@ describe("registry -- F7: the personal board can never be registered as a repo b
       expect(isCanKanError(thrown)).toBe(true);
       expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
       expect((thrown as Error).message).not.toContain(personal.board.root);
+      expect(detailsAsString(thrown)).not.toContain(personal.board.root);
     });
   });
 });

@@ -39,6 +39,7 @@ const PATH_SEPARATOR_RE = /[/\\]/;
 
 function assertSafeBasename(basename: string, unsafeValue: string): void {
   if (
+    basename.length === 0 ||
     PATH_SEPARATOR_RE.test(basename) ||
     basename.includes("\0") ||
     basename === "." ||

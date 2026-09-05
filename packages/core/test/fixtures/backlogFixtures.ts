@@ -47,9 +47,10 @@ export const PROBE2_AFTER_EDIT = "---\nid: ck-a1b2c3\ntitle: Some title\nstatus:
  * `backlog/tasks/ck-1 - New-task-after-hash-id-present.md` (~line 328-338)
  * after a real `backlog task create`, lifted verbatim — note the uppercase
  * `id: CK-1` against the lowercase filename prefix. The ADR does not show
- * this file's body text (the shown `cat` output ends at the closing `---`),
- * so this fixture's body is a single trailing newline, the minimal
- * placeholder consistent with what was actually shown.
+ * this file's body text (the shown `cat` output ends right at the closing
+ * `---`, with no trailing newline shown after it either), so this fixture's
+ * body is empty — the closing delimiter's own trailing newline is the last
+ * byte, consistent with what was actually shown.
  */
 export const PROBE3_MISMATCH_TICKET = "---\nid: CK-1\ntitle: New task after hash id present\nstatus: To Do\nassignee: []\ncreated_date: '2026-09-04 22:20'\nlabels: []\ndependencies: []\nordinal: 2000\n---\n";
 

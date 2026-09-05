@@ -17,7 +17,7 @@ export interface FixtureTicketOverrides {
 
 /**
  * Generates plain fixture ticket objects. Deliberately independent of
- * `@cankan/core`'s ticket schema (not created until M2.2) - just enough
+ * `@jeff-roche/cankan-core`'s ticket schema (not created until M2.2) - just enough
  * shape for tests that need *some* tickets to exist.
  */
 export function makeFixtureTickets(

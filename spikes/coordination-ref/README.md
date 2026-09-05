@@ -19,7 +19,7 @@ bun install --frozen-lockfile   # if you haven't already
 bun spikes/coordination-ref/run.ts
 ```
 
-It creates its own temp repos (via `@cankan/test-utils`'s `makeTempRepo()`),
+It creates its own temp repos (via `@jeff-roche/cankan-test-utils`'s `makeTempRepo()`),
 runs the six survivability scenarios from the task brief against real git
 processes and real spawned OS processes, and overwrites
 `spikes/coordination-ref/RESULTS.md` with what happened: exact commands,

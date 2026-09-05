@@ -7,6 +7,6 @@
   "access": "public",
   "baseBranch": "main",
   "updateInternalDependencies": "patch",
-  "ignore": ["@cankan/test-utils"],
+  "ignore": ["@jeff-roche/cankan-test-utils"],
   "privatePackages": { "version": true, "tag": false }
 }

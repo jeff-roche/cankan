@@ -38,7 +38,7 @@ Every piece of the system and the single task that creates it. If a piece isn't 
 | Coordination-ref spike (throwaway) | M1.1 | — |
 | Spike findings + go/no-go decision doc | M1.2 | — |
 | Backlog.md ID-tolerance finding | M1.3 | — |
-| `@cankan/core` package shell + public `index.ts` | M2.1 | M2.1 |
+| `@jeff-roche/cankan-core` package shell + public `index.ts` | M2.1 | M2.1 |
 | Ticket schema (zod) + frontmatter parse/serialize | M2.2 | M2.5 (store) |
 | Config schema + layer loader + policy resolution | M2.3 | M2.4 (board resolver), M3.1 (CLI context) |
 | Board resolver (which directory is the board) + repo registry | M2.4 | M3.1 (CLI context) |
@@ -69,7 +69,7 @@ Every piece of the system and the single task that creates it. If a piece isn't 
 | `doctor` | M3.9 | — |
 | Exit-code map + error formatting | M3.10 | M3.1 |
 | CLI end-to-end test: `init` → `create` → `claim --next` → `close` in a temp repo | **M3.11 [wire]** | — |
-| `@cankan/mcp` package shell + stdio server | M4.1 | M4.1 |
+| `@jeff-roche/cankan-mcp` package shell + stdio server | M4.1 | M4.1 |
 | Tool definitions generated from CLI command specs | **M4.2 [wire]** | — |
 | MCP `--board` scoping + roots handling | M4.3 | — |
 | MCP smoke test via SDK client | **M4.4 [wire]** | — |
@@ -106,7 +106,7 @@ Every piece of the system and the single task that creates it. If a piece isn't 
 
 ### M0.2 Monorepo skeleton
 - **Creates:** root `package.json` with Bun workspaces; `packages/core`, `packages/cli`, `packages/mcp`, `packages/backers/` (empty index), `packages/test-utils`; root `tsconfig.base.json` and per-package `tsconfig.json` extending it; `bunfig.toml`; each package has a `package.json`, `src/index.ts` exporting nothing, and builds.
-- **Wires:** package cross-references (`@jeff-roche/cankan-cli` depends on `@cankan/core`, etc.) via workspace protocol.
+- **Wires:** package cross-references (`@jeff-roche/cankan-cli` depends on `@jeff-roche/cankan-core`, etc.) via workspace protocol.
 - **Depends on:** M0.1
 - **Done when:** `bun install && bun run --filter '*' build` succeeds with empty packages.
 
@@ -121,7 +121,7 @@ Every piece of the system and the single task that creates it. If a piece isn't 
 - **Done when:** a sample test creates a temp repo with two worktrees and a bare remote, pushes between them, and cleans up.
 
 ### M0.5 Versioning and publish config
-- **Creates:** changesets config, `publishConfig` in each publishable package, `bun run release:version` and `release:publish` scripts, `@cankan` npm scope reserved via a placeholder `@jeff-roche/cankan-cli@0.0.0` publish (the unscoped `cankan` name is blocked by npm's name-similarity policy - "too similar to canvas" - so distribution is scoped from here on; see M5.1).
+- **Creates:** changesets config, `publishConfig` in each publishable package, `bun run release:version` and `release:publish` scripts, the `@jeff-roche` npm scope reserved via a placeholder `@jeff-roche/cankan-cli@0.0.0` publish (the unscoped `cankan` name is blocked by npm's name-similarity policy - "too similar to canvas" - so distribution is scoped from here on; see M5.1). **Every** workspace package publishes under `@jeff-roche/cankan-*`; the `@cankan` scope is not owned and is never used, so a published package can never depend on it.
 - **Depends on:** M0.2
 - **Done when:** `bun run release:version` produces a changelog from a sample changeset.
 
@@ -217,7 +217,7 @@ All M2 tasks live in `packages/core`. **M2.1 owns the package's public surface**
 - **Creates:** `packages/core/src/index.ts` as the single public entry; `src/errors.ts` (typed `CanKanError` with `code`); `src/types.ts` for shared IDs (`TicketId`, `ActorId`, `BoardRef`); module folders `ticket/ config/ board/ store/ git/ events/ state/ claims/ deps/ order/ index/ hooks/ actor/` each with an empty `index.ts` re-exported from the root.
 - **Wires:** the export map. Every later M2 task adds to it here.
 - **Depends on:** M0.2
-- **Done when:** `import * as core from "@cankan/core"` typechecks and exposes the folders.
+- **Done when:** `import * as core from "@jeff-roche/cankan-core"` typechecks and exposes the folders.
 
 ### M2.2 Ticket schema and frontmatter
 - **Creates:** `ticket/schema.ts` (zod schema matching Backlog.md fields + `cankan:` block), `ticket/frontmatter.ts` (parse/serialize via `gray-matter`, round-trip stable), `ticket/id.ts` (`ck-` hash generation), `ticket/filename.ts` (`<id> - <slug>.md`).

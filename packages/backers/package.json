@@ -1,5 +1,5 @@
 {
-  "name": "@cankan/backers",
+  "name": "@jeff-roche/cankan-backers",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cankan/core": "workspace:*"
+    "@jeff-roche/cankan-core": "workspace:*"
   },
   "publishConfig": {
     "access": "public"

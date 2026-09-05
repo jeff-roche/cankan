@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cankan/core": "workspace:*"
+    "@jeff-roche/cankan-core": "workspace:*"
   },
   "publishConfig": {
     "access": "public"

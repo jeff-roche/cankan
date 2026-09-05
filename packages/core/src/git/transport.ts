@@ -94,11 +94,16 @@ export async function runGitRaw(
     stdin: options.stdin === undefined ? "ignore" : "pipe",
     stdout: "pipe",
     stderr: "pipe",
-    // R7, restored: the real `process.env`, spread whole, plus `LC_ALL: "C"`
-    // (git localizes stderr through gettext otherwise, and every stderr-text
-    // discrimination this module makes depends on the C locale) and any
-    // caller-supplied extra vars (e.g. `GIT_INDEX_FILE`).
-    env: { ...process.env, LC_ALL: "C", ...options.env },
+    // R7, restored: the real `process.env`, spread whole, plus any
+    // caller-supplied extra vars (e.g. `GIT_INDEX_FILE`), with `LC_ALL: "C"`
+    // applied *last* so no caller-supplied `options.env` can override it —
+    // git localizes stderr through gettext otherwise, and every stderr-text
+    // discrimination this module makes (CAS rejection, non-fast-forward
+    // push/fetch) depends on the C locale. Not currently reachable (the only
+    // internal caller passing `env` is `buildTree`'s `GIT_INDEX_FILE`, which
+    // never touches `LC_ALL`), but the pin is load-bearing enough that it
+    // should not be overridable by construction.
+    env: { ...process.env, ...options.env, LC_ALL: "C" },
   });
 
   if (options.stdin !== undefined) {

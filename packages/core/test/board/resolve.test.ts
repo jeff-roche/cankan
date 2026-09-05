@@ -293,11 +293,19 @@ describe("resolveBoard -- flag semantics", () => {
         const linkPath = join(linkParent, "personal-alias");
         await symlink(personal.board.root, linkPath);
 
-        // A hand-edited repos.yml: register()'s own F7 check only catches
-        // an *exact* stored-path match against the personal board, so a
-        // symlink alias like this reaches listRegisteredBoards()'s `boards`
-        // list undetected -- only buildBoardRef's canonicalization reveals
-        // it, which is exactly what this test is for.
+        // A hand-edited repos.yml. Historical note (R60, fix round 6):
+        // this comment used to say a symlink alias like this reached
+        // `listRegisteredBoards()`'s `boards` list undetected, with only
+        // `buildBoardRef`'s canonicalization catching it downstream. That
+        // is no longer true -- `listRegisteredBoards` now canonicalizes
+        // `entry.path` itself (`isPersonalBoardPath`, `personal.ts`), so
+        // `findRegisteredBoard` throws `REGISTERED_BOARD_IS_PERSONAL`
+        // directly, before `resolveBoard` even reaches its own pre-check
+        // or `buildBoardRef`. This test's own assertion (below) is
+        // unaffected either way -- it only checks `resolveBoard`'s final
+        // result -- but it is now exercising a strictly earlier catch than
+        // when it was written, which is a genuine improvement (registry-
+        // level rejection, not merely resolver-level), not a fluke.
         const registryPath = resolveRegistryPath(env);
         if (!registryPath) throw new Error("test setup: registry path did not resolve");
         await writeFileEnsuringDir(

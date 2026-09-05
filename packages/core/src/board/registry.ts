@@ -47,7 +47,7 @@ import { ConfigErrorCodes } from "../config/index";
 import { loadValidatedLayer } from "../config/layers";
 import { CanKanError, isCanKanError } from "../errors";
 import { BoardErrorCodes } from "./errors";
-import { canonicalPersonalPath, resolvePersonalBoardPath } from "./personal";
+import { isPersonalBoardPath, resolvePersonalBoardPath } from "./personal";
 // The personal-board checks below (`register()`, `listRegisteredBoards()`)
 // need the same "equal to, or beneath" containment test ADR 0002's
 // `tickets_dir` check already uses -- an exact-string `===` only refused
@@ -182,9 +182,11 @@ async function ensureRegistryDir(registryPath: string): Promise<void> {
  * which is what makes the plain `undefined`-on-failure form safe to keep
  * using there.
  *
- * `listRegisteredBoards` does **not** use this function -- it needs the
- * stronger, shared `canonicalPersonalPath` (`./personal`) instead; see
- * that function's own doc comment for why.
+ * `listRegisteredBoards` does **not** use this function -- it needs
+ * `./personal`'s shared `isPersonalBoardPath` predicate instead, which
+ * canonicalizes *both* sides of the comparison the same existence-tolerant
+ * way; see that function's own doc comment for why (fix round 6, security
+ * review).
  */
 async function resolveCanonicalPersonalPath(
   env: Readonly<Record<string, string | undefined>>,
@@ -198,16 +200,18 @@ async function resolveCanonicalPersonalPath(
   }
 }
 
-// `canonicalPersonalPath` (imported from `./personal`, above) is
+// `isPersonalBoardPath` (imported from `./personal`, above) is
 // `listRegisteredBoards`'s "is this registry entry the personal board"
 // comparison -- unlike `register()`, it compares against a registry
-// entry's *stored* path, not something already guaranteed to exist, so it
-// needs the stronger three-tier fallback rather than
-// `resolveCanonicalPersonalPath`'s plain form. Shared with `resolve.ts`
-// (fix round 5, H1: this file and `resolve.ts` each held a
-// byte-for-byte-identical copy of the same fallback chain, which no test
-// could ever catch diverging) -- see that function's own doc comment in
-// `personal.ts` for the full three-tier explanation.
+// entry's *raw, stored* path, not something already guaranteed to exist
+// or already canonical, so it needs the shared predicate that
+// canonicalizes both sides of the comparison identically (existence-
+// tolerant, same as `resolve.ts` uses), rather than
+// `resolveCanonicalPersonalPath`'s plain form. Fix round 6, security
+// review: comparing only the personal-board side canonically, against a
+// raw `entry.path`, missed even an *exact* alias whenever an ancestor of
+// the data home sits behind a symlink -- see `isPersonalBoardPath`'s own
+// doc comment in `personal.ts` for the full explanation.
 
 // ---------------------------------------------------------------------------
 // Reading (R16-style guard reuse -- see the note on `readRegistryRaw` below)
@@ -330,19 +334,23 @@ export async function listRegisteredBoards(
     return { boards: [], skipped: [] };
   }
   const raw = await readRegistryRaw(registryPath);
-  const personalPath = await canonicalPersonalPath(env);
 
   const boards: RegistryEntry[] = [];
   const skipped: SkippedRegistryEntry[] = [];
   for (const entry of raw.repos) {
-    // F1: containment, not equality -- a hand-edited entry registering a
+    // Containment, not equality -- a hand-edited entry registering a
     // *subdirectory* of the personal board (e.g. its own tickets
     // directory) is just as much "the personal board" as an exact-root
-    // match. Still a raw-string comparison against the *stored* path, not
-    // a canonical one -- a symlink alias reaching the personal board this
-    // way is not caught here; that requires `buildBoardRef`'s
-    // canonicalization and is caught downstream in `resolve.ts` instead.
-    if (personalPath !== undefined && isContained(personalPath, entry.path)) {
+    // match. `isPersonalBoardPath` canonicalizes `entry.path` (a raw,
+    // user-editable string) the same existence-tolerant way it
+    // canonicalizes the personal board's own path before comparing --
+    // fix round 6, security review: an *uncanonicalized* comparison here
+    // missed even an *exact* alias on a host where an ancestor of the
+    // data home sits behind a symlink (macOS's `$TMPDIR` under
+    // `/var/folders/...`, itself a symlink to `/private/var/folders/...`),
+    // not merely a deliberate symlink alias as an earlier version of this
+    // comment claimed.
+    if (await isPersonalBoardPath(entry.path, env)) {
       skipped.push({ name: entry.name, path: entry.path, reason: "is the personal board" });
       continue;
     }

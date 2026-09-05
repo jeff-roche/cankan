@@ -1,0 +1,536 @@
+/**
+ * `hooks/runner.ts` -- M2.16 (task brief, PLAN.md M2.16, CONCEPT.md §8
+ * ~line 207): resolves the hooks configured for one event across all three
+ * config layers and runs every one of them, spawning `$TICKET $ACTOR $FROM
+ * $TO $TITLE` into the environment, with a timeout that kills the whole
+ * process group (not just the direct child), output captured and handed to
+ * an injected sink.
+ *
+ * **Depends on M2.3 only** (`../config/index`) -- this file does not import
+ * `../events/`, `../git/`, or `../store/`. Obligation 4's event log is M2.7,
+ * built concurrently in a sibling worktree and outside this task's
+ * dependency list; the inversion is the `HookSink` type below, which
+ * `runHooks` calls but never constructs. M2.17 (round 6) supplies the
+ * event-log-backed adapter.
+ *
+ * **Trust (issue #86, deliberate and owner-decided -- see the task brief
+ * §3):** repo-layer hooks are shell commands that ship inside a
+ * repo-controlled, checked-in config file, and this module runs them
+ * unconditionally, on every layer, with no trust gate. That is not an
+ * oversight -- PLAN.md M2.16 and the project owner require exactly this
+ * until #86 lands a gate. The seam for that gate is `spawnHook` below, the
+ * single chokepoint every hook passes through before a process is spawned;
+ * see its doc comment.
+ */
+
+import type { Subprocess } from "bun";
+import type { ConfigResult, LoadedLayer } from "../config/index";
+import { CanKanError, ErrorCodes } from "../errors";
+import { HooksErrorCodes } from "./errors";
+
+// ---------------------------------------------------------------------------
+// Events (CONCEPT.md §8) and layers (Controller Ruling 3).
+// ---------------------------------------------------------------------------
+
+/** The six events CONCEPT.md §8 names, verbatim and in that order. */
+export const HOOK_EVENTS = ["claim", "release", "expire", "move", "close", "create"] as const;
+
+/** One of the six events a hook can fire on. */
+export type HookEvent = (typeof HOOK_EVENTS)[number];
+
+/**
+ * The order hooks run in when more than one layer configures the same
+ * event: **repo, then repo-local, then global** -- descending config
+ * precedence, matching every other ordering in the config module
+ * (Controller Ruling 3, binding). Declared explicitly and iterated by name
+ * rather than relied on as `ConfigResult.layers`'s own incidental array
+ * order, which `config/resolve.ts` documents as "highest first" but does
+ * not contractually guarantee matches this constant forever.
+ */
+export const HOOK_LAYER_ORDER = ["repo", "repo-local", "global"] as const satisfies readonly LoadedLayer["layer"][];
+
+/** One of the three file layers a hook command can come from. */
+export type HookLayer = (typeof HOOK_LAYER_ORDER)[number];
+
+/** Default hook timeout (Controller Ruling 4, binding): a runner option, not a config key. */
+export const DEFAULT_HOOK_TIMEOUT_MS = 30_000;
+
+/**
+ * Grace period between the group SIGTERM and the escalation SIGKILL
+ * (task brief §6, "escalate properly ... document the grace period").
+ * 200ms: long enough that a well-behaved hook exits cleanly on SIGTERM
+ * before escalation ever fires (the common case), short enough that a
+ * hook which ignores SIGTERM entirely (task report probe 3) is still
+ * killed promptly.
+ */
+const KILL_GRACE_PERIOD_MS = 200;
+
+/** Each captured stream (stdout, stderr) is capped at 64 KiB (task brief §7). */
+const OUTPUT_CAP_BYTES = 65_536;
+
+const TRUNCATION_MARKER = "\n[cankan: output truncated at 65536 bytes]";
+
+// ---------------------------------------------------------------------------
+// Resolving hooks from all three layers (obligation 1).
+// ---------------------------------------------------------------------------
+
+/** One hook command found in one layer, with its provenance. */
+export interface ResolvedHook {
+  layer: HookLayer;
+  /** Absolute path of the config file this command came from. */
+  file: string;
+  /** The resolved shell command, exactly as written in config. */
+  command: string;
+}
+
+/**
+ * Narrows `data.hooks?.[event]` to a `string` defensively.
+ * `LoadedLayer.data` is typed `Readonly<Record<string, unknown>>`; the
+ * value has already passed the layer's `hooksSchema = z.record(z.string(),
+ * z.string())` (`config/schema.ts:221`), so a present value is a string --
+ * this still narrows rather than casting blindly, per the task brief.
+ */
+function readHookCommand(data: Readonly<Record<string, unknown>>, event: HookEvent): string | undefined {
+  const hooks = data.hooks;
+  if (hooks === null || typeof hooks !== "object" || Array.isArray(hooks)) {
+    return undefined;
+  }
+  const value = (hooks as Record<string, unknown>)[event];
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * Every hook configured for `event`, across all three layers, in
+ * `HOOK_LAYER_ORDER`. **Hooks accumulate rather than override** -- this is
+ * deliberately unlike the rest of config resolution: a repo hook and a
+ * user's own personal (global) hook both fire, so a fully-populated event
+ * yields up to three entries here, not one winner.
+ *
+ * This reads `ConfigResult.layers` directly (Controller Ruling 2, binding),
+ * never `ConfigResult.value.hooks` and never `ConfigResult.resolved(...)`:
+ * `config/keys.ts:63` classifies `hooks.*` as `policy`, so the resolved
+ * channel would hand back the repo layer's command *alone* (or, absent a
+ * repo hook, whichever single layer wins by policy precedence) -- exactly
+ * the opposite of what this task requires. Reading `layers` is also what
+ * preserves provenance (`layer`, `file`) all the way to the spawn
+ * chokepoint -- see `spawnHook` below.
+ */
+export function resolveHooksForEvent(cfg: ConfigResult, event: HookEvent): readonly ResolvedHook[] {
+  const resolved: ResolvedHook[] = [];
+  for (const layerName of HOOK_LAYER_ORDER) {
+    const loaded = cfg.layers.find((l) => l.layer === layerName);
+    if (!loaded) {
+      continue;
+    }
+    const command = readHookCommand(loaded.data, event);
+    if (command !== undefined) {
+      resolved.push({ layer: layerName, file: loaded.file, command });
+    }
+  }
+  return resolved;
+}
+
+// ---------------------------------------------------------------------------
+// The sink (obligation 4, Controller Ruling 1 -- inversion, no M2.7 import).
+// ---------------------------------------------------------------------------
+
+/**
+ * One hook's outcome. Returned from `runHooks` (one entry per hook that
+ * ran) and, with the four run-level fields below added, the shape handed to
+ * the sink as `HookEventRecord`.
+ *
+ * Deliberately **not** a superset of CONCEPT.md's event-record shape (no
+ * `id`, no `ts`): M2.7 owns ULID minting and the `ts` format (task brief
+ * §7) -- a value invented here is one M2.17 would have to strip back out.
+ */
+export interface HookOutcome {
+  layer: HookLayer;
+  file: string;
+  command: string;
+  /** `null` when the hook was killed at timeout or never started. */
+  exitCode: number | null;
+  /** The signal that ended the process, if any (e.g. after a timeout kill). */
+  signal: string | null;
+  timedOut: boolean;
+  /** Present only for a hook that failed in a way `HooksErrorCodes` names. */
+  errorCode?: string;
+  durationMs: number;
+  /** Captured stdout, capped at 64 KiB with `TRUNCATION_MARKER` appended when cut. */
+  stdout: string;
+  stdoutTruncated: boolean;
+  /** Captured stderr, capped at 64 KiB with `TRUNCATION_MARKER` appended when cut. */
+  stderr: string;
+  stderrTruncated: boolean;
+}
+
+/**
+ * The record handed to the sink -- `HookOutcome` plus the four facts that
+ * are the same for every hook run by one `runHooks` call (the triggering
+ * event and the four ticket-context env values), so the sink alone can
+ * reconstruct CONCEPT.md's event-record shape (~line 477) without needing
+ * anything else from the caller.
+ */
+export interface HookEventRecord extends HookOutcome {
+  event: HookEvent;
+  ticket: string;
+  actor: string;
+  from: string;
+  to: string;
+}
+
+/**
+ * Receives one call per hook that actually ran (never one per event).
+ * Awaited by `runHooks`. Optional: an omitted sink means results are still
+ * returned from `runHooks`, nothing is emitted anywhere.
+ *
+ * **A throwing sink propagates out of `runHooks`, aborting any hooks still
+ * queued for this event.** That is deliberate (Controller Ruling on
+ * obligation 4): a sink failure is the caller's own infrastructure
+ * breaking, not a hook failing -- see `HooksErrorCodes` / Ruling 5 for why
+ * *those* failures are captured instead of thrown.
+ */
+export type HookSink = (record: HookEventRecord) => void | Promise<void>;
+
+// ---------------------------------------------------------------------------
+// The spawn chokepoint (obligation 2 + issue #86's seam).
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything `spawnHook` needs to run one hook. Carries provenance
+ * (`layer`, `file`) alongside the resolved `command` itself -- this is the
+ * task's single most important structural requirement (task brief §3.2):
+ * a reviewer confirms provenance survives to the spawn chokepoint by
+ * reading this one interface, not by tracing data flow across functions.
+ */
+export interface HookSpawnRequest {
+  /** Which config layer this command came from. #86 will need this to
+   *  decide whether a repo-controlled command may run at all. */
+  layer: HookLayer;
+  /** Absolute path of the config file this command came from. #86 will
+   *  need this to name the file a gate refuses. */
+  file: string;
+  /** The resolved shell command, exactly as written in config. Never built
+   *  by concatenating a ticket value -- see `runHooks`'s env-only rule. */
+  command: string;
+  /** Explicit cwd for the spawned process -- the caller's repo root, never
+   *  `process.cwd()`. Also the board identity #86's gate will need. */
+  cwd: string;
+  /** Merged environment (the five CanKan vars already applied). */
+  env: Readonly<Record<string, string | undefined>>;
+  /** Milliseconds before the hook (and its whole process group) is killed. */
+  timeoutMs: number;
+}
+
+type HookExecutionResult = Omit<HookOutcome, "layer" | "file" | "command">;
+
+type HookSubprocess = Subprocess<"ignore", "pipe", "pipe">;
+
+/**
+ * Sends `signal` to the whole process group led by `pid` (POSIX `kill(2)`
+ * with a negative pid). Never throws: `pid` is only ever a group leader
+ * here (see `spawnHook`'s `detached: true`), so the one expected failure is
+ * `ESRCH` -- the group has already exited, which a bare `SIGTERM` with no
+ * trap can already achieve before the grace-period `SIGKILL` below even
+ * runs (verified empirically, task report probe 2). Any other failure is
+ * equally not this hook's fault to escalate: Ruling 5 requires that a
+ * failure here must not become an uncaught exception aborting every other
+ * hook still queued to run.
+ */
+function killGroupSafely(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // See doc comment above -- deliberately swallowed.
+  }
+}
+
+/**
+ * Runs `proc` to completion, killing its whole process group if it is
+ * still alive after `timeoutMs`. Escalates SIGTERM -> `KILL_GRACE_PERIOD_MS`
+ * -> SIGKILL, per the task brief's "escalate properly" (§6). Resolves once
+ * `proc` has actually exited (whether on its own, or because this function
+ * killed it), so the caller never reads `proc.exitCode`/`signalCode` before
+ * they are final.
+ */
+async function killAfterTimeout(proc: HookSubprocess, timeoutMs: number): Promise<boolean> {
+  let timedOut = false;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true;
+    killGroupSafely(proc.pid, "SIGTERM");
+    graceTimer = setTimeout(() => {
+      killGroupSafely(proc.pid, "SIGKILL");
+    }, KILL_GRACE_PERIOD_MS);
+  }, timeoutMs);
+
+  await proc.exited;
+
+  clearTimeout(timeoutTimer);
+  if (graceTimer !== undefined) {
+    clearTimeout(graceTimer);
+  }
+  return timedOut;
+}
+
+function concatUint8Arrays(parts: readonly Uint8Array[], totalLength: number): Uint8Array {
+  const out = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+/**
+ * Reads `stream` to completion, retaining at most `capBytes` bytes
+ * (task brief §7's 64 KiB cap) and appending `TRUNCATION_MARKER` when more
+ * arrived. Keeps draining past the cap rather than stopping there: the cap
+ * bounds *retained* bytes, not *consumed* bytes -- stopping early would
+ * leave the pipe full and the writer (a hook, or a grandchild that
+ * inherited the fd) blocked on a write that never drains, which would
+ * itself masquerade as a hang.
+ */
+async function readCapped(
+  stream: ReadableStream<Uint8Array> | null,
+  capBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
+  if (!stream) {
+    return { text: "", truncated: false };
+  }
+  const reader = stream.getReader();
+  const kept: Uint8Array[] = [];
+  let keptBytes = 0;
+  let truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!value || value.length === 0) {
+        continue;
+      }
+      if (keptBytes >= capBytes) {
+        truncated = true;
+        continue;
+      }
+      const room = capBytes - keptBytes;
+      if (value.length > room) {
+        kept.push(value.subarray(0, room));
+        keptBytes += room;
+        truncated = true;
+      } else {
+        kept.push(value);
+        keptBytes += value.length;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const text = new TextDecoder().decode(concatUint8Arrays(kept, keptBytes));
+  return { text: truncated ? `${text}${TRUNCATION_MARKER}` : text, truncated };
+}
+
+/**
+ * The single chokepoint between "a hook is configured" and "a process is
+ * spawned" (task brief §3, obligation 1). Every hook, from every layer,
+ * passes through here -- this is the only `Bun.spawn` call in this module.
+ *
+ * **Issue #86 (deliberate, owner-decided gap -- do not fill it in here):**
+ * there is no trust check in this function. Repo-layer hooks are
+ * attacker-controlled shell commands (`git clone <hostile-repo> && cankan
+ * close ck-1` runs whatever `.cankan/config.yml` says), and this function
+ * runs `request.command` regardless of `request.layer`. PLAN.md M2.16 and
+ * the project owner require exactly that until #86 lands a gate. A future
+ * gate belongs at the top of this function, before the `Bun.spawn` call
+ * below -- it will need `request.layer` (repo-controlled vs. the user's
+ * own config), the board identity (`request.cwd`), and `request.command`,
+ * all three of which this function's parameter type already carries. Do
+ * not add a gate, flag, prompt, or partial trust model here or anywhere
+ * else in this file.
+ */
+export async function spawnHook(request: HookSpawnRequest): Promise<HookExecutionResult> {
+  const startedAt = performance.now();
+
+  let proc: HookSubprocess;
+  try {
+    proc = Bun.spawn<"ignore", "pipe", "pipe">({
+      // Array form only -- never a concatenated shell string, and no
+      // ticket value is ever interpolated into it (task brief §5).
+      cmd: ["/bin/sh", "-c", request.command],
+      cwd: request.cwd,
+      env: request.env,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      // Process-group leader (task brief §6, obligation 3): `detached:
+      // true` calls POSIX `setsid()` on the child, making its pgid equal
+      // to its own pid. Verified empirically (task report probe 1) --
+      // without this, the child inherits *this* process's group, and the
+      // negative-pid kill below would signal `bun test`'s own group
+      // instead of the hook's (task report probe 4).
+      detached: true,
+    });
+  } catch {
+    // `Bun.spawn()` itself threw before any process started -- e.g. a NUL
+    // byte in `request.command` or in an env value (verified empirically,
+    // task report's NUL-byte probe: Bun 1.4.0 rejects both synchronously).
+    // Ruling 5: captured as a typed outcome, never thrown.
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorCode: HooksErrorCodes.HOOK_SPAWN_FAILED,
+      durationMs: Math.round(performance.now() - startedAt),
+      stdout: "",
+      stdoutTruncated: false,
+      stderr: "",
+      stderrTruncated: false,
+    };
+  }
+
+  // Start draining both streams *before* waiting on exit/timeout: a hook
+  // that fills one pipe while this function is still waiting on the other
+  // would otherwise deadlock on backpressure and never reach the timeout.
+  const stdoutPromise = readCapped(proc.stdout, OUTPUT_CAP_BYTES);
+  const stderrPromise = readCapped(proc.stderr, OUTPUT_CAP_BYTES);
+
+  const timedOut = await killAfterTimeout(proc, request.timeoutMs);
+  const [stdoutResult, stderrResult] = await Promise.all([stdoutPromise, stderrPromise]);
+
+  const exitCode = proc.exitCode;
+  const signal = proc.signalCode as string | null;
+
+  return {
+    exitCode,
+    signal,
+    timedOut,
+    // POSIX.1-2017 §2.8.2: 127 is the shell's own "command not found" exit
+    // status -- see `HooksErrorCodes.HOOK_COMMAND_NOT_FOUND`'s doc comment
+    // for the one documented ambiguity this carries.
+    ...(exitCode === 127 ? { errorCode: HooksErrorCodes.HOOK_COMMAND_NOT_FOUND } : {}),
+    durationMs: Math.round(performance.now() - startedAt),
+    stdout: stdoutResult.text,
+    stdoutTruncated: stdoutResult.truncated,
+    stderr: stderrResult.text,
+    stderrTruncated: stderrResult.truncated,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The public entry point.
+// ---------------------------------------------------------------------------
+
+export interface RunHooksOptions {
+  /** Already-loaded config to accumulate hooks from. Load it with M2.3's
+   *  `loadConfig` first. */
+  cfg: ConfigResult;
+  /** One of the six events CONCEPT.md §8 names. */
+  event: HookEvent;
+  /** Explicit cwd for every spawned hook -- never `process.cwd()`. */
+  repoRoot: string;
+  /** The five env values a hook receives. Each defaults to `""` when
+   *  omitted -- `FROM`/`TO`/etc. must always be *present* in the child's
+   *  environment (task brief §5), even for an event with no natural
+   *  from/to (`create`), so a hook running under `set -u` never dies on an
+   *  absent var. */
+  ticket?: string;
+  actor?: string;
+  from?: string;
+  to?: string;
+  title?: string;
+  /** Base environment merged under the five CanKan vars, which always win.
+   *  Defaults to `process.env`. Never replaces the whole environment. */
+  env?: Readonly<Record<string, string | undefined>>;
+  /** Called once per hook that ran. See `HookSink`'s doc comment. */
+  sink?: HookSink;
+  /** Milliseconds before a hook (and its process group) is killed.
+   *  Defaults to `DEFAULT_HOOK_TIMEOUT_MS` (Controller Ruling 4). */
+  timeoutMs?: number;
+}
+
+/**
+ * Resolves and runs every hook configured for `event`, across all three
+ * config layers, sequentially in `HOOK_LAYER_ORDER`. See
+ * `resolveHooksForEvent` for why all matching layers run rather than one
+ * winning by precedence.
+ *
+ * No hook configured for `event` is a no-op: an empty array, no sink calls,
+ * nothing spawned.
+ *
+ * A hook's own failure (non-zero exit, killed at timeout, or unspawnable)
+ * never aborts the others and is never thrown -- it is captured in that
+ * hook's `HookOutcome` (Controller Ruling 5). This function itself throws
+ * only for a programmer error: `event` outside the six named in
+ * `HOOK_EVENTS`.
+ */
+export async function runHooks(options: RunHooksOptions): Promise<HookOutcome[]> {
+  if (!(HOOK_EVENTS as readonly string[]).includes(options.event)) {
+    throw new CanKanError(
+      ErrorCodes.USAGE,
+      `runHooks: "${String(options.event)}" is not one of the six hook events`,
+      { details: { event: String(options.event) } },
+    );
+  }
+
+  const resolved = resolveHooksForEvent(options.cfg, options.event);
+  if (resolved.length === 0) {
+    return [];
+  }
+
+  const timeoutMs = options.timeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS;
+  const ticket = options.ticket ?? "";
+  const actor = options.actor ?? "";
+  const from = options.from ?? "";
+  const to = options.to ?? "";
+  const title = options.title ?? "";
+
+  // Merged, never replaced (task brief §5) -- the five CanKan vars win over
+  // whatever the base environment already set for those names.
+  const env: Record<string, string | undefined> = {
+    ...(options.env ?? process.env),
+    TICKET: ticket,
+    ACTOR: actor,
+    FROM: from,
+    TO: to,
+    TITLE: title,
+  };
+
+  const outcomes: HookOutcome[] = [];
+  for (const hook of resolved) {
+    const execution = await spawnHook({
+      layer: hook.layer,
+      file: hook.file,
+      command: hook.command,
+      cwd: options.repoRoot,
+      env,
+      timeoutMs,
+    });
+
+    const outcome: HookOutcome = {
+      layer: hook.layer,
+      file: hook.file,
+      command: hook.command,
+      ...execution,
+    };
+    outcomes.push(outcome);
+
+    if (options.sink) {
+      const record: HookEventRecord = {
+        event: options.event,
+        ticket,
+        actor,
+        from,
+        to,
+        ...outcome,
+      };
+      // Awaited; a throw here propagates out of `runHooks` (infra failure,
+      // not a hook failure -- see `HookSink`'s doc comment).
+      await options.sink(record);
+    }
+  }
+
+  return outcomes;
+}

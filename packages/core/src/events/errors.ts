@@ -29,6 +29,16 @@ export const EventErrorCodes = {
    */
   EVENT_APPEND_REJECTED: "EVENT_APPEND_REJECTED",
   /**
+   * An `AppendOptions` field was shaped wrong (fix round 2, Low). Currently
+   * only `maxExistingBlobBytes`: `NaN` would silently disable the size cap
+   * (`existingBytes > NaN` is always `false`), and a negative value would
+   * refuse even an empty month. Must be `>= 0` (`Number.POSITIVE_INFINITY`
+   * — the documented recovery-write bypass — is explicitly allowed; only
+   * `NaN` and negative values are rejected). Raised before any git
+   * invocation.
+   */
+  EVENT_APPEND_INVALID_OPTION: "EVENT_APPEND_INVALID_OPTION",
+  /**
    * `append()`'s own read-check step found the current month file did not
    * end with a trailing newline (ADR 0001:696-699's "check" step,
    * generalized). Appending onto an un-terminated tail would fuse this
@@ -70,15 +80,24 @@ export const EventErrorCodes = {
    */
   EVENT_LOG_AGGREGATE_TOO_LARGE: "EVENT_LOG_AGGREGATE_TOO_LARGE",
   /**
-   * `read()`'s or `append()`'s `trailingMonths`/window parameter was not a
-   * finite integer in the accepted range (fix round 1, S1). Degenerate
-   * values (`0`, a negative number, `NaN`) previously produced an empty
-   * month-key list and made `read()` resolve `[]` with no error — a
-   * fail-open in the one module whose whole disposition is fail-closed. A
-   * pathologically large value (a hostile, unbounded-digit config-derived
-   * lease producing `Infinity`, say) previously drove a synchronous,
-   * unbounded loop. Both are rejected here, before either failure mode can
-   * occur.
+   * One of `read`'s two window-shaping inputs was invalid — either
+   * `read()`'s own `trailingMonths` was not a finite integer in the
+   * accepted range (fix round 1, S1; **`append` has no `trailingMonths`
+   * parameter** — an earlier version of this comment wrongly implied it
+   * did, a fix-round-2 correction), or `read`'s/`append`'s shared `now`
+   * clock reading was not finite (fix round 2, NEW-2).
+   *
+   * Degenerate `trailingMonths` values (`0`, a negative number, `NaN`)
+   * previously produced an empty month-key list and made `read()` resolve
+   * `[]` with no error — a fail-open in the one module whose whole
+   * disposition is fail-closed. A pathologically large value (a hostile,
+   * unbounded-digit config-derived lease producing `Infinity`, say)
+   * previously drove a synchronous, unbounded loop. `now: NaN`/`Infinity`
+   * has the identical fail-open effect in `read()` (a month-key window of
+   * months that cannot exist) via a different, sibling parameter — not
+   * peer-reachable, but reachable from an upstream `Date.parse` failure
+   * with no attacker at all. All are rejected here, before either failure
+   * mode can occur.
    */
   EVENT_LOG_INVALID_WINDOW: "EVENT_LOG_INVALID_WINDOW",
   /**

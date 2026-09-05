@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { decodeTime } from "ulid";
 import { isCanKanError } from "../../src/errors";
 import { createGitAdapter, GitErrorCodes, type GitAdapter } from "../../src/git/index";
 import { EventErrorCodes } from "../../src/events/errors";
@@ -656,6 +657,96 @@ describe("read — fix round 1, S1: trailingMonths must be a bounded integer", (
 });
 
 // ============================================================================
+// Fix round 2, NEW-2 — `now` is `trailingMonths`'s sibling, and was unguarded
+// ============================================================================
+
+describe("read/append — fix round 2, NEW-2: now must be a finite number", () => {
+  test("read({ now: NaN }) rejects rather than silently hiding a real event", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    // Before the fix: this resolved `[]` — S1's exact fail-open shape,
+    // reached through `now` instead of `trailingMonths`, since
+    // `monthKeyUtc(NaN)` produces the literal string `"NaN-NaN"`.
+    await expectCode(read(adapter, COORD_REF, { now: Number.NaN }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+  });
+
+  test("read({ now: Infinity }) rejects", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    await expectCode(read(adapter, COORD_REF, { now: Number.POSITIVE_INFINITY }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+  });
+
+  test("read({ now: -Infinity }) rejects", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    await expectCode(read(adapter, COORD_REF, { now: Number.NEGATIVE_INFINITY }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+  });
+
+  test("append({ now: NaN }) rejects rather than minting against an undefined month", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await expectCode(append(adapter, COORD_REF, claim("ck-1"), { now: Number.NaN }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+  });
+
+  test("append({ now: Infinity }) rejects, and does not poison the injected-clock ULID lane for later calls", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { now: Number.POSITIVE_INFINITY }),
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+    );
+
+    // A subsequent, legitimate injected-`now` append must still mint
+    // normally — the rejected call must never have reached `mint(now)`.
+    const appended = await append(adapter, COORD_REF, claim("ck-2"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    expect(appended.event.ticket as string).toBe("ck-2");
+  });
+});
+
+// ============================================================================
+// Fix round 2, Ruling R23 — S6's two-lane design was correct but unguarded:
+// the suite stayed green even with the fix reverted to a single shared factory
+// ============================================================================
+
+describe("append — Ruling R23: an injected far-future now must not pin the real-clock ULID lane", () => {
+  test("a real-clock append after a far-future injected-now append still mints near Date.now()", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // Mint via the injected-clock lane, seeded decades in the future.
+    const farFuture = Date.parse("2100-01-01T00:00:00Z");
+    await append(adapter, COORD_REF, claim("ck-future", { ts: "2026-09-04T10:12:00Z" }), {
+      now: farFuture,
+      casRetry: FAST_RETRY,
+    });
+
+    // A later, real-clock append (no `now` override) must mint an id whose
+    // decoded timestamp reflects *real* time, not the far-future value the
+    // previous call injected. Under the original bug (one shared factory
+    // for both lanes), this id's timestamp would be clamped to on-or-after
+    // `farFuture` instead — `ulid`'s monotonic factory never rolls its
+    // internal clock backward for a smaller seed time than it has already
+    // seen (fix round 1's own probe, task-2-report.md).
+    const before = Date.now();
+    const realAppended = await append(adapter, COORD_REF, claim("ck-real"), { casRetry: FAST_RETRY });
+    const after = Date.now();
+
+    const mintedTime = decodeTime(realAppended.event.id as string);
+    // A generous window tolerates real test-execution latency; it is not
+    // remotely wide enough to also tolerate landing in the year 2100.
+    expect(mintedTime).toBeGreaterThanOrEqual(before - 2_000);
+    expect(mintedTime).toBeLessThanOrEqual(after + 2_000);
+  });
+});
+
+// ============================================================================
 // Fix round 1, S2 — append's own blob-size bound, and read's aggregate cap
 // ============================================================================
 
@@ -698,6 +789,71 @@ describe("append — fix round 1, S2: the existing-blob-size bound", () => {
     });
     expect(appended.event.ticket as string).toBe("ck-recovery");
   }, 20_000);
+
+  test("fix round 2 (Low): maxExistingBlobBytes: NaN is rejected rather than silently disabling the cap", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const oversized = `${"x".repeat(65 * 1024 * 1024)}\n`;
+    await seedMonthFile(adapter, oversized);
+
+    // Before the fix: `existingBytes > NaN` is always `false` in
+    // JavaScript, so this silently applied the write onto an oversized
+    // month exactly as if the cap did not exist.
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY, maxExistingBlobBytes: Number.NaN }),
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+    );
+  }, 20_000);
+
+  test("fix round 2 (Low): a negative maxExistingBlobBytes is rejected rather than refusing even an empty month", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY, maxExistingBlobBytes: -1 }),
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+    );
+  });
+});
+
+// ============================================================================
+// Fix round 2, NEW-3 — append's own fm8-class errors were missing `commit`
+// ============================================================================
+
+describe("append — fix round 2, NEW-3: fm8-class errors carry the offending commit sha", () => {
+  test("EVENT_LOG_BLOB_TOO_LARGE names the commit it read", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const oversized = "x".repeat(65 * 1024 * 1024);
+    await seedMonthFile(adapter, oversized);
+    const seededSha = await adapter.readRef(COORD_REF);
+
+    try {
+      await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+      throw new Error("expected append() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_LOG_BLOB_TOO_LARGE);
+      expect(error.details?.commit as string | undefined).toBe((seededSha as string | null) ?? undefined);
+    }
+  }, 20_000);
+
+  test("EVENT_LOG_MALFORMED_BLOB names the commit it read", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const truncated = '{"ts":"2026-09-04T10:12:00Z","id":"01M1RRC3FBMZYZS4SNMYZHJV6R","actor":"a","ticket":"ck-1","event":"clai';
+    await seedMonthFile(adapter, truncated);
+    const seededSha = await adapter.readRef(COORD_REF);
+
+    try {
+      await append(adapter, COORD_REF, claim("ck-2"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+      throw new Error("expected append() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_LOG_MALFORMED_BLOB);
+      expect(error.details?.commit as string | undefined).toBe((seededSha as string | null) ?? undefined);
+    }
+  });
 });
 
 describe("read — fix round 1, S2/S4: the per-month and aggregate size bounds", () => {
@@ -751,7 +907,22 @@ describe("read — fix round 1, S2/S4: the per-month and aggregate size bounds",
 });
 
 // ============================================================================
-// Fix round 1, S4/Ruling R20 — the fm10 ref gate, tested at every entry point
+// Fix round 1, S4/Ruling R20 — end-to-end fm10 coverage at every entry point
+//
+// Fix round 2, Ruling R24 (framing correction): these are end-to-end
+// assertions that `append`/`read` surface `GIT_REF_INVALID` for a bad ref —
+// they are **not** guards on `log.ts`'s own `validateCoordinationRef(ref)`
+// call specifically. `GitAdapter.readRef`/`commitTreeToRef`/`readBlobFromRef`
+// each internally call `ensureValidRef` (`git/adapter.ts:90-99`), which
+// re-runs the identical `validateCoordinationRef` check before touching git —
+// so deleting `log.ts`'s own call is an *equivalent* mutant (the adapter's
+// own gate still rejects the ref, the observable behavior these tests check
+// is unchanged) rather than a coverage gap these tests close. The events-side
+// call is defense-in-depth (fail fast without a git invocation, and stay
+// correct if a future edit ever bypasses the adapter for some call), not the
+// thing solely responsible for the security property. Stated plainly here
+// because an earlier version of this comment (and the report) implied
+// stronger coverage of `log.ts`'s own call than these tests actually provide.
 // ============================================================================
 
 /** Raw plumbing for test setup only — never the adapter under test. Mirrors `git.test.ts`'s own helper. */

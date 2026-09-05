@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createGitAdapter } from "../../src/git/index";
+import { isCanKanError } from "../../src/errors";
+import { createGitAdapter, GitErrorCodes, type ObjectSha } from "../../src/git/index";
+import { EventErrorCodes } from "../../src/events/errors";
 import { initRef, initRefCore, type InitRefHooks } from "../../src/events/ref";
 import { append, type EventCandidate, read } from "../../src/events/log";
 // See `git.test.ts`'s own comment on why this is a relative import.
@@ -21,6 +23,33 @@ afterEach(async () => {
     if (repo) await repo.cleanup();
   }
 });
+
+async function expectCode(promise: Promise<unknown>, code: string): Promise<void> {
+  try {
+    await promise;
+  } catch (error) {
+    if (!isCanKanError(error)) {
+      throw new Error(`expected a CanKanError, got ${String(error)}`);
+    }
+    expect(error.code).toBe(code);
+    return;
+  }
+  throw new Error(`expected rejection with code ${code}, but the promise resolved`);
+}
+
+/** Raw plumbing for test setup only — never the adapter under test. Mirrors `git.test.ts`'s own helper. */
+function rawGit(cwd: string, args: string[], stdin?: string): string {
+  const result = Bun.spawnSync(["git", ...args], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: stdin !== undefined ? Buffer.from(stdin) : undefined,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} (cwd=${cwd}) failed:\n${result.stderr.toString()}`);
+  }
+  return result.stdout.toString();
+}
 
 describe("initRef", () => {
   test("creates the ref, empty, when it does not exist yet", async () => {
@@ -112,5 +141,66 @@ describe("append's implicit lazy init vs. initRef — they converge, not collide
     expect(appended.month).toBe("2026-09");
     const records = await read(adapter, COORD_REF, { now: NOW });
     expect(records).toHaveLength(1);
+  });
+});
+
+// ============================================================================
+// Fix round 1, S3 — initRef must not report success on an unusable ref
+// ============================================================================
+
+describe("initRef — fix round 1, S3: refuses to report success on a ref that isn't a usable coordination ref", () => {
+  test("a ref planted directly at a blob is rejected, not silently accepted", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // Plant refs/cankan/coordination pointing straight at a blob object —
+    // `updateRefCAS` accepts any 40-hex object id (it type-checks a `Sha`
+    // shape, not an object *type*), so this is reachable through the
+    // adapter's own public surface, the way a bug or a hostile push could
+    // produce it.
+    const blobSha = rawGit(repo.dir, ["hash-object", "-w", "--stdin"], "not a tree or a commit").trim() as ObjectSha;
+    const planted = await adapter.updateRefCAS(COORD_REF, blobSha, null);
+    if (planted.outcome !== "applied") throw new Error("setup failed");
+
+    // Before the fix: this resolved successfully, and every later `append`
+    // would fail forever with an opaque GIT_COMMAND_FAILED.
+    await expectCode(initRef(adapter, COORD_REF, { now: NOW }), EventErrorCodes.EVENT_REF_UNUSABLE);
+
+    // And the ref itself is left exactly as planted — this is detection,
+    // not an attempted repair.
+    const refAfter = await adapter.readRef(COORD_REF);
+    expect(refAfter as string | null).toBe(blobSha as string);
+  });
+
+  test("known residual gap (Orchestrator Ruling R19): a ref planted at a raw tree is NOT caught by this fix", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // `git mktree` from empty input is the canonical way to produce the
+    // (always-available, zero-entry) empty tree object id.
+    const emptyTreeSha = rawGit(repo.dir, ["mktree"], "").trim();
+    const planted = await adapter.updateRefCAS(COORD_REF, emptyTreeSha as ObjectSha, null);
+    if (planted.outcome !== "applied") throw new Error("setup failed");
+
+    // Documents the known gap: `initRefCore`'s usability probe cannot tell
+    // a bare tree apart from a commit (both are tree-ish, so `ls-tree`
+    // succeeds against either) without a new adapter primitive (an
+    // object-type query) that R19 scopes out of this dispatch. This test
+    // exists so the gap is tracked, not silently forgotten — if this ever
+    // starts throwing, `ref.ts`'s doc comment on `assertRefIsUsable` should
+    // be updated to say the gap is closed.
+    await expect(initRef(adapter, COORD_REF, { now: NOW })).resolves.toBeUndefined();
+  });
+});
+
+// ============================================================================
+// Fix round 1, S4/Ruling R20 — the fm10 ref gate, exercised on initRef too
+// ============================================================================
+
+describe("initRef — the fm10 ref gate", () => {
+  test("rejects refs/heads/main", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await expectCode(initRef(adapter, "refs/heads/main", { now: NOW }), GitErrorCodes.GIT_REF_INVALID);
   });
 });

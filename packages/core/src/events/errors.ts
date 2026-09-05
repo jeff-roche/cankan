@@ -78,4 +78,17 @@ export const EventErrorCodes = {
    * rather than silently looping.
    */
   EVENT_REF_INIT_RACE_UNRESOLVED: "EVENT_REF_INIT_RACE_UNRESOLVED",
+  /**
+   * `initRef()` found the ref already pointing at *something* (`readRef`
+   * returned non-null), but that something does not behave like a usable
+   * coordination ref (fix round 1, S3) — e.g. a ref planted directly at a
+   * blob, which fails the tree-ish check every later `append`/`read`
+   * ultimately depends on. Raised instead of `initRef` silently reporting
+   * success. **Known residual gap** (Orchestrator Ruling R19): a ref
+   * planted at a raw tree or an annotated tag peeling to one is *also*
+   * unusable but is not detected by this code — see `ref.ts`'s
+   * `assertRefIsUsable` doc comment for why, and for the M2.6 addition
+   * (an object-type query) that would close it.
+   */
+  EVENT_REF_UNUSABLE: "EVENT_REF_UNUSABLE",
 } as const;

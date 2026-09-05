@@ -96,7 +96,7 @@ import { CanKanError, isCanKanError } from "../errors";
 import type { BoardRef } from "../types";
 import { BoardErrorCodes } from "./errors";
 import { ensurePersonalBoard, resolvePersonalBoardPath } from "./personal";
-import { buildBoardRef } from "./ref";
+import { buildBoardRef, isContained } from "./ref";
 import { findRegisteredBoard, listRegisteredBoards } from "./registry";
 
 /**
@@ -120,9 +120,31 @@ import { findRegisteredBoard, listRegisteredBoards } from "./registry";
  * this function exists to close, one level over from where F11 first
  * found it. Every candidate has already passed `listRegisteredBoards`'s
  * own `stat` check, so `realpath` on it cannot fail with ENOENT here.
+ *
+ * **F3 (fix round 1):** catches only `REGISTRY_INVALID` from
+ * `listRegisteredBoards` and falls back to `undefined` (caller uses
+ * `basename(root)`) rather than letting it propagate. Before this fix,
+ * decision 4 made *every* no-flag and `--board repo` resolution depend on
+ * `repos.yml` parsing cleanly -- a single malformed byte in the user's
+ * global registry broke `cd repo && cankan status`, a command that never
+ * touched the registry before this dispatch. `--board all` is unaffected:
+ * it calls `listRegisteredBoards` directly (not through this function) and
+ * still throws on the same malformed file, so the loud path survives; only
+ * a single-repo session's *display name* degrades to `basename(root)`.
+ * Every other error from `listRegisteredBoards` (a data-home resolution
+ * failure, an unexpected filesystem error) still propagates -- this is
+ * narrowly about a malformed *file*, not "swallow anything registry-shaped."
  */
 async function registeredNameFor(root: string, env: Env): Promise<string | undefined> {
-  const { boards } = await listRegisteredBoards(env);
+  let boards: Awaited<ReturnType<typeof listRegisteredBoards>>["boards"];
+  try {
+    ({ boards } = await listRegisteredBoards(env));
+  } catch (err) {
+    if (isCanKanError(err) && err.code === BoardErrorCodes.REGISTRY_INVALID) {
+      return undefined;
+    }
+    throw err;
+  }
   for (const entry of boards) {
     const canonical = await realpath(entry.path).catch(() => undefined);
     if (canonical === root) {
@@ -133,6 +155,34 @@ async function registeredNameFor(root: string, env: Env): Promise<string | undef
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
+
+/**
+ * F1 (fix round 1, the phase's most serious finding): true when a
+ * candidate repo board `ref` actually reaches into the personal board --
+ * checked by **containment**, on **both** halves, never by equality on
+ * `root` alone:
+ *
+ * - `isContained(personalPath, ref.root)` -- `ref.root` is the personal
+ *   board's own directory, or a subdirectory of it (registering the
+ *   personal board's tickets directory, say, or a nested `.cankan/`
+ *   somewhere inside the personal tree that an ordinary `cd` can reach).
+ * - `isContained(personalPath, ref.ticketsDir)` -- `ref.root` is instead
+ *   an *ancestor* of the personal board (an umbrella directory containing
+ *   both), with `tickets_dir` steered to point at the personal board's own
+ *   tickets directory. ADR 0002's own containment check (`ref.ts`)
+ *   permits this legitimately -- `ticketsDir` truly is beneath such a
+ *   `root` -- so only a check against the personal board specifically,
+ *   run *after* `buildBoardRef` has resolved `ticketsDir`, can catch it.
+ *
+ * Refusing a root that instead *contains* the personal board (the reverse
+ * relationship) is not an option -- `$HOME` is a legitimate dotfiles-board
+ * root that happens to be an ancestor of `$XDG_DATA_HOME/cankan/personal/`
+ * on many systems. `ticketsDir` is the precise cut for that shape; `root`
+ * alone cannot be.
+ */
+function aliasesPersonalBoard(ref: Pick<BoardRef, "root" | "ticketsDir">, personalPath: string): boolean {
+  return isContained(personalPath, ref.root) || isContained(personalPath, ref.ticketsDir);
+}
 
 /**
  * What `resolveBoard` accepts for `--board`: the two selectors, or a
@@ -161,10 +211,21 @@ function isEnoent(err: unknown): boolean {
 }
 
 /**
- * `fs.realpath(cwd)`, rethrown as a typed, path-naming error on `ENOENT`.
- * Doubles as the mandatory symlink-canonicalization step: a `cwd` reached
- * through a symlink resolves to the same canonical directory the rest of
- * this module (and `buildBoardRef`) compares against.
+ * `fs.realpath(cwd)`, rethrown as a typed, path-naming error on `ENOENT`
+ * (or on anything else -- F4, fix round 1: a symlink cycle, `ELOOP`, or an
+ * unreadable ancestor, `EACCES`, must not reach a caller as a raw platform
+ * error either, the same taxonomy discipline `TICKETS_DIR_INVALID` and the
+ * internal `LockLostError` already apply elsewhere in this module).
+ *
+ * This `realpath` is **load-bearing**, not merely a nicety: `buildBoardRef`
+ * independently realpaths `root` as its own first statement, so a bug here
+ * would still produce a canonical `BoardRef.root` and hide behind that
+ * safety net -- but `walkForBoard`'s personal-tree comparison and
+ * `registeredNameFor`'s canonical-name lookup both compare *this*
+ * function's return value directly, before `buildBoardRef` ever runs, and
+ * neither has a safety net of its own. A `cwd` reached through a symlink
+ * to the personal board's own root must classify as `kind: "personal"`,
+ * not `"repo"` -- that only holds if this function actually canonicalizes.
  *
  * **Never falls through to personal on failure** -- ruling: an
  * unresolvable `cwd` must be a visible error, the same reasoning as the
@@ -177,7 +238,10 @@ async function canonicalCwd(cwd: string): Promise<string> {
     if (isEnoent(err)) {
       throw new CanKanError(BoardErrorCodes.CWD_NOT_FOUND, `cwd does not exist: ${cwd}`, { details: { cwd } });
     }
-    throw err;
+    throw new CanKanError(BoardErrorCodes.CWD_UNRESOLVABLE, `cwd could not be resolved: ${cwd}`, {
+      cause: err,
+      details: { cwd },
+    });
   }
 }
 
@@ -221,17 +285,31 @@ type WalkResult = { readonly kind: "repo"; readonly root: string } | { readonly 
  * board's own canonical path (addendum 2, this file's header) -- a path
  * comparison only, never a read of the personal board's config or
  * tickets, so this does not violate the privacy default even though it
- * runs on every no-flag and `--board repo` resolution. A match reports
- * `"personal-tree"` instead of `"repo"` so both callers below can treat
- * "inside the personal board's own directory" as "not a repo," each
- * according to its own precedence rule.
+ * runs on every no-flag and `--board repo` resolution. **By containment,
+ * not equality** (F1, fix round 1): a nested `.cankan/` somewhere *inside*
+ * the personal tree (`mkdir -p <personal>/proj/.cankan`, then `cd` there)
+ * is exactly as much "the personal board" as its own root is -- an
+ * exact-`===` check only caught a `cwd` at the personal board's literal
+ * root and let this shape through as an ordinary repo board, basename
+ * name and all. A match reports `"personal-tree"` instead of `"repo"` so
+ * both callers below can treat "inside the personal board's own
+ * directory" as "not a repo," each according to its own precedence rule.
+ *
+ * This closes the *root* half of F1's alias check for every cwd-based
+ * resolution. It does not (and cannot) see the *`tickets_dir`* half --
+ * a `.cankan/` found here whose own config steers `tickets_dir` into the
+ * personal board (this walk's `root` an *ancestor* of the personal board)
+ * looks perfectly ordinary at this stage, since nothing about `current`
+ * itself is contained in `personalPath`. `resolveBoard` re-checks that
+ * half itself, after `buildBoardRef` has resolved `ticketsDir` -- see
+ * `aliasesPersonalBoard`.
  */
 async function walkForBoard(startDir: string, env: Env): Promise<WalkResult | undefined> {
   let current = startDir;
   for (;;) {
     if (await isDirectory(join(current, ".cankan"))) {
       const personalPath = await canonicalPersonalPath(env);
-      if (personalPath !== undefined && current === personalPath) {
+      if (personalPath !== undefined && isContained(personalPath, current)) {
         return { kind: "personal-tree" };
       }
       return { kind: "repo", root: current };
@@ -270,20 +348,23 @@ export async function resolveBoard(options: ResolveBoardOptions): Promise<BoardR
       });
     }
     const ref = await buildBoardRef({ kind: "repo", name: entry.name, root: entry.path, env });
-    // `register()`/`listRegisteredBoards()` refuse an *exact* stored-path
-    // match against the personal board (registry.ts's F7), but a
-    // hand-edited `repos.yml` entry reaching the personal board through a
-    // symlink alias passes that string check and only becomes visible once
-    // `buildBoardRef` has canonicalized it -- the same class of gap
-    // addendum 2 closes for the cwd walk, here for the `--board <name>`
-    // path instead. Caught here rather than left to leak an explicit repo
-    // selector into the personal board.
+    // `register()`/`listRegisteredBoards()` refuse a registry entry whose
+    // *root* is contained in the personal board (registry.ts's F7, now
+    // containment-based -- F1), but neither of those checks can see a
+    // symlink alias to the personal board (only `buildBoardRef`'s
+    // canonicalization reveals it) or a `tickets_dir`-based alias from a
+    // registered *ancestor* of the personal board (only knowable once
+    // `buildBoardRef` has resolved `ticketsDir`) -- both closed here,
+    // after building, rather than left to leak an explicit repo selector
+    // into the personal board.
     const personalPath = await canonicalPersonalPath(env);
-    if (personalPath !== undefined && ref.root === personalPath) {
+    if (personalPath !== undefined && aliasesPersonalBoard(ref, personalPath)) {
       throw new CanKanError(
         BoardErrorCodes.REGISTERED_BOARD_IS_PERSONAL,
-        `board "${flag.name}" resolves to the personal board (${ref.root}); a registry entry cannot alias it -- use "--board personal" instead`,
-        { details: { name: flag.name, path: ref.root } },
+        `board "${flag.name}" resolves into the personal board; a registry entry cannot alias it -- use "--board personal" instead`,
+        // F5: no path in details -- the path in question is the personal
+        // board's own location, which this error must not publish.
+        { details: { name: flag.name } },
       );
     }
     return ref;
@@ -304,13 +385,38 @@ export async function resolveBoard(options: ResolveBoardOptions): Promise<BoardR
       );
     }
     const name = (await registeredNameFor(walked.root, env)) ?? basename(walked.root);
-    return buildBoardRef({ kind: "repo", name, root: walked.root, env });
+    const ref = await buildBoardRef({ kind: "repo", name, root: walked.root, env });
+    // F1: `walked.kind === "repo"` only ruled out the *root* half of the
+    // alias check (walkForBoard's own containment test, above) -- this
+    // repo's own `tickets_dir` can still be steered into the personal
+    // board when `walked.root` is an ancestor of it. Same disposition as
+    // "not inside a repo board at all": an explicit `--board repo` request
+    // must fail loudly, never silently substitute the personal board.
+    const personalPath = await canonicalPersonalPath(env);
+    if (personalPath !== undefined && aliasesPersonalBoard(ref, personalPath)) {
+      throw new CanKanError(
+        BoardErrorCodes.NOT_INSIDE_REPO_BOARD,
+        `"--board repo" requires an inited repo board; ${cwd} is not inside one`,
+        { details: { cwd } },
+      );
+    }
+    return ref;
   }
 
   // No flag: inside an inited repo > personal.
   if (walked?.kind === "repo") {
     const name = (await registeredNameFor(walked.root, env)) ?? basename(walked.root);
-    return buildBoardRef({ kind: "repo", name, root: walked.root, env });
+    const ref = await buildBoardRef({ kind: "repo", name, root: walked.root, env });
+    // F1: same `tickets_dir`-ancestor shape as the `--board repo` branch
+    // above, but for the no-flag path a disqualified "repo" simply isn't
+    // usable as one -- precedence falls through to personal, the same
+    // disposition `walkForBoard`'s own personal-tree classification
+    // already gets for the root-level shape.
+    const personalPath = await canonicalPersonalPath(env);
+    if (personalPath !== undefined && aliasesPersonalBoard(ref, personalPath)) {
+      return (await ensurePersonalBoard({ env })).board;
+    }
+    return ref;
   }
   return (await ensurePersonalBoard({ env })).board;
 }
@@ -377,14 +483,16 @@ function describeFailure(err: unknown): string {
  * reported in `skipped` with the underlying error's own message as the
  * reason; it never aborts the rest of the aggregation.
  *
- * **Deduped by canonical root**, seeded with the personal board's own
- * root before any registry entry is examined: two registry entries
- * reaching one directory through different paths (a symlink alias) are one
- * board, and this also catches a hand-edited registry entry that reaches
- * the personal board's directory through a path `registry.ts`'s own
- * string-equality check did not recognize as such (`listRegisteredBoards`
- * only skips an *exact* stored-path match; a symlinked alias is caught
- * here instead, once `buildBoardRef` has canonicalized it).
+ * **Every entry is checked against the personal board by containment
+ * (`aliasesPersonalBoard`, F1) before the plain canonical-root dedupe
+ * runs** -- a registered subdirectory of the personal board, a symlink
+ * alias to it, or a registered ancestor with `tickets_dir` steered into it
+ * would not collide with the personal board's own *exact* root the way a
+ * plain `seenRoots` check alone would need. **Deduped by canonical root**
+ * otherwise, seeded with the personal board's own root before any registry
+ * entry is examined: two registry entries reaching one *other* directory
+ * through different paths (a symlink alias between two ordinary repo
+ * boards) are one board.
  */
 export async function resolveAllBoards(options: ResolveAllBoardsOptions = {}): Promise<AllBoardsResult> {
   const env = options.env ?? process.env;
@@ -407,16 +515,25 @@ export async function resolveAllBoards(options: ResolveAllBoardsOptions = {}): P
       skipped.push({ name: entry.name, path: entry.path, reason: describeFailure(err) });
       continue;
     }
+    // F1 (fix round 1): checked by containment on both `root` and
+    // `ticketsDir` (`aliasesPersonalBoard`), not by `ref.root ===
+    // personal.board.root` -- a registered *subdirectory* of the personal
+    // board, a symlink alias to it, or a registered *ancestor* with
+    // `tickets_dir` steered into it all reach the personal board without
+    // `ref.root` ever equaling it exactly. Checked before the dedupe check
+    // below, since none of those shapes would otherwise collide with
+    // `seenRoots` (which is seeded only with the personal board's own
+    // exact root).
+    if (aliasesPersonalBoard(ref, personal.board.root)) {
+      skipped.push({ name: entry.name, path: entry.path, reason: "is the personal board" });
+      continue;
+    }
     if (seenRoots.has(ref.root)) {
-      // Distinguish "aliases the personal board" from "aliases another
-      // repo board already in this result" -- same wording registry.ts's
-      // own F7 skip uses, so the reason means the same thing wherever a
-      // caller sees it.
-      const reason =
-        ref.root === personal.board.root
-          ? "is the personal board"
-          : `duplicate of another board already at this canonical root (${ref.root})`;
-      skipped.push({ name: entry.name, path: entry.path, reason });
+      skipped.push({
+        name: entry.name,
+        path: entry.path,
+        reason: `duplicate of another board already at this canonical root (${ref.root})`,
+      });
       continue;
     }
     seenRoots.add(ref.root);

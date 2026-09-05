@@ -48,6 +48,13 @@ import { loadValidatedLayer } from "../config/layers";
 import { CanKanError, isCanKanError } from "../errors";
 import { BoardErrorCodes } from "./errors";
 import { resolvePersonalBoardPath } from "./personal";
+// F1 (dispatch B security review, fix round 1): the personal-board checks
+// below (`register()`, `listRegisteredBoards()`) need the same "equal to,
+// or beneath" containment test ADR 0002's `tickets_dir` check already
+// uses -- an exact-string `===` only refused the personal board's exact
+// root, not a registered *subdirectory* of it. Reused from `ref.ts` rather
+// than re-derived, same module.
+import { isContained } from "./ref";
 import { resolveDataHome } from "./xdg";
 
 // ---------------------------------------------------------------------------
@@ -270,7 +277,14 @@ export async function listRegisteredBoards(
   const boards: RegistryEntry[] = [];
   const skipped: SkippedRegistryEntry[] = [];
   for (const entry of raw.repos) {
-    if (personalPath !== undefined && entry.path === personalPath) {
+    // F1: containment, not equality -- a hand-edited entry registering a
+    // *subdirectory* of the personal board (e.g. its own tickets
+    // directory) is just as much "the personal board" as an exact-root
+    // match. Still a raw-string comparison against the *stored* path, not
+    // a canonical one -- a symlink alias reaching the personal board this
+    // way is not caught here; that requires `buildBoardRef`'s
+    // canonicalization and is caught downstream in `resolve.ts` instead.
+    if (personalPath !== undefined && isContained(personalPath, entry.path)) {
       skipped.push({ name: entry.name, path: entry.path, reason: "is the personal board" });
       continue;
     }
@@ -301,10 +315,19 @@ export async function listRegisteredBoards(
  * personal board) is **not** treated the same as "never registered":
  * returning `undefined` for it would be exactly the silent-drop the
  * brief's robustness requirements forbid, on the one read path
- * `--board <name>` actually uses. Instead this throws a typed
- * `BOARD_DIRECTORY_MISSING` error naming the path and the reason, so a
- * caller can tell "api is registered but its directory vanished" apart
- * from "api was never registered."
+ * `--board <name>` actually uses. Instead this throws a typed error naming
+ * the reason, so a caller can tell "api is registered but its directory
+ * vanished" apart from "api was never registered" apart from "api aliases
+ * the personal board" -- three different answers, not one.
+ *
+ * The last of those (`reason === "is the personal board"`) is deliberately
+ * **not** folded into `BOARD_DIRECTORY_MISSING` (fix round 1, F1/F5): that
+ * code's own message names the registered *path*, and for this reason the
+ * path is the personal board's own location -- exactly what
+ * `REGISTERED_BOARD_IS_PERSONAL` exists to report without publishing (see
+ * that throw below, and `resolve.ts`'s matching one for the symlink-alias
+ * and `tickets_dir`-alias shapes this function's own containment check
+ * cannot see).
  */
 export async function findRegisteredBoard(
   name: string,
@@ -320,6 +343,13 @@ export async function findRegisteredBoard(
   }
   const missing = skipped.find((entry) => entry.name === name);
   if (missing) {
+    if (missing.reason === "is the personal board") {
+      throw new CanKanError(
+        BoardErrorCodes.REGISTERED_BOARD_IS_PERSONAL,
+        `board "${name}" resolves into the personal board; a registry entry cannot alias it -- use "--board personal" instead`,
+        { details: { name } },
+      );
+    }
     throw new CanKanError(
       BoardErrorCodes.BOARD_DIRECTORY_MISSING,
       `board "${name}" is registered at ${missing.path}, but ${missing.reason}`,
@@ -561,11 +591,18 @@ export async function register(
   }
   const canonicalPath = await realpath(targetPath);
   const personalPath = await resolveCanonicalPersonalPath(env);
-  if (personalPath !== undefined && canonicalPath === personalPath) {
+  // F1: containment, not equality -- `register("leak", "<personal>/backlog")`
+  // must be refused too, not only an exact match on the personal board's
+  // own root. (F5: the message/details deliberately omit `canonicalPath`
+  // here -- once this also catches a *subdirectory* of the personal board,
+  // publishing it back is publishing part of the personal board's own
+  // layout, the same class of leak fixed at this function's other
+  // personal-board-facing throw below.)
+  if (personalPath !== undefined && isContained(personalPath, canonicalPath)) {
     throw new CanKanError(
       BoardErrorCodes.CANNOT_REGISTER_PERSONAL_BOARD,
-      `cannot register the personal board (${canonicalPath}) as a repo board`,
-      { details: { path: canonicalPath } },
+      `cannot register the personal board, or a location inside it, as a repo board`,
+      { details: { name } },
     );
   }
   const registryPath = requireRegistryPath(env);

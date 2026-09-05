@@ -743,6 +743,87 @@ describe("registry -- F7: the personal board can never be registered as a repo b
       expect(listing.skipped[0]?.reason).toBe("is the personal board");
     });
   });
+
+  // Fix round 1, F1 (security review): the two tests above only caught an
+  // *exact* match against the personal board's root. `register()` itself
+  // would happily register a *subdirectory* of it (its own tickets
+  // directory, say), and `listRegisteredBoards` would list a hand-edited
+  // entry naming one as an ordinary board -- both now fixed to compare by
+  // containment (`isContained`, reused from `ref.ts`), not equality.
+  //
+  // Mutation-verified (see task-B-report.md, "Fix round 1"): reverting
+  // either check back to `===` makes the corresponding test below fail;
+  // restored before committing.
+  test("F1: register() refuses a subdirectory of the personal board too, not only its exact root", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+      const subdir = join(personal.board.root, "backlog"); // exists: ensurePersonalBoard creates backlog/tasks
+
+      let thrown: unknown;
+      try {
+        await register("leak", subdir, env);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("CANNOT_REGISTER_PERSONAL_BOARD");
+
+      const listing = await listRegisteredBoards(env);
+      expect(listing.boards).toHaveLength(0);
+    });
+  });
+
+  test("F1: listRegisteredBoards skips a hand-edited entry naming a subdirectory of the personal board, not only its exact root", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+      const subdir = join(personal.board.root, "backlog");
+
+      const registryPath = resolveRegistryPath(env);
+      if (!registryPath) throw new Error("test setup: registry path did not resolve");
+      await mkdir(join(registryPath, ".."), { recursive: true });
+      await writeFile(
+        registryPath,
+        `version: 1\nrepos:\n  - name: leak\n    path: ${subdir}\n    last_seen: 2026-09-05T08:00:00.000Z\n`,
+      );
+
+      // The discriminating assertion: a caller that reads the registry
+      // directly (never building a `BoardRef` at all -- a future `cankan
+      // repo list`, say) must see this entry flagged right here. Nothing
+      // downstream of `listRegisteredBoards` would otherwise catch it for
+      // such a caller.
+      const listing = await listRegisteredBoards(env);
+      expect(listing.boards).toHaveLength(0);
+      expect(listing.skipped).toHaveLength(1);
+      expect(listing.skipped[0]?.reason).toBe("is the personal board");
+    });
+  });
+
+  test("F5: findRegisteredBoard throws REGISTERED_BOARD_IS_PERSONAL (not BOARD_DIRECTORY_MISSING) for a skip reason of 'is the personal board', without publishing the path", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+
+      const registryPath = resolveRegistryPath(env);
+      if (!registryPath) throw new Error("test setup: registry path did not resolve");
+      await mkdir(join(registryPath, ".."), { recursive: true });
+      await writeFile(
+        registryPath,
+        `version: 1\nrepos:\n  - name: sneaky\n    path: ${personal.board.root}\n    last_seen: 2026-09-05T08:00:00.000Z\n`,
+      );
+
+      let thrown: unknown;
+      try {
+        await findRegisteredBoard("sneaky", env);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+      expect((thrown as Error).message).not.toContain(personal.board.root);
+    });
+  });
 });
 
 describe("registry -- F8: reserved-name matching folds case and rejects padding whitespace", () => {

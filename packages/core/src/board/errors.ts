@@ -51,10 +51,11 @@ export const BoardErrorCodes = {
    */
   TICKETS_DIR_INVALID: "TICKETS_DIR_INVALID",
   /**
-   * `register()` refused to register the personal board's own directory
-   * as a repo board -- doing so would let `--board <name>` resolve a repo
-   * selector to the personal board, defeating CONCEPT.md §6c's privacy
-   * default.
+   * `register()` refused to register the personal board's own directory,
+   * or a subdirectory of it (fix round 1, F1 -- containment, not just
+   * exact-root equality), as a repo board -- doing so would let
+   * `--board <name>` resolve a repo selector to (or into) the personal
+   * board, defeating CONCEPT.md §6c's privacy default.
    */
   CANNOT_REGISTER_PERSONAL_BOARD: "CANNOT_REGISTER_PERSONAL_BOARD",
   /**
@@ -74,6 +75,17 @@ export const BoardErrorCodes = {
    */
   CWD_NOT_FOUND: "CWD_NOT_FOUND",
   /**
+   * `resolveBoard()`'s `cwd` exists but `fs.realpath` still failed for
+   * some other reason (a symlink cycle -- `ELOOP` -- or a permission
+   * failure on an ancestor -- `EACCES`, say). Distinct from
+   * `CWD_NOT_FOUND` (fix round 1, F4): without this, either raw platform
+   * error reaches a caller untyped, `isCanKanError` false, invisible to
+   * M3.10's exit-code map -- the same taxonomy hole already closed for
+   * `TICKETS_DIR_INVALID` (`ref.ts`) and the internal `LockLostError`
+   * (`registry.ts`).
+   */
+  CWD_UNRESOLVABLE: "CWD_UNRESOLVABLE",
+  /**
    * `resolveBoard({ flag: { kind: "repo" } })` was called from a `cwd` that
    * is not inside an inited repo board -- including a `cwd` inside the
    * personal board's own tree, which the addendum-2 privacy fix excludes
@@ -92,12 +104,17 @@ export const BoardErrorCodes = {
   BOARD_NOT_REGISTERED: "BOARD_NOT_REGISTERED",
   /**
    * `resolveBoard({ flag: { kind: "name", name } })` found a registered
-   * entry whose canonical directory *is* the personal board. `register()`
-   * refuses this at write time (`CANNOT_REGISTER_PERSONAL_BOARD`) for a
-   * path matching exactly, but a hand-edited `repos.yml` entry can still
-   * reach the personal board through a symlink alias that only
-   * `buildBoardRef`'s canonicalization reveals -- caught here instead of
-   * letting an explicit repo selector resolve to the personal board.
+   * entry that reaches into the personal board -- either its root does, or
+   * (fix round 1, F1) its `tickets_dir` does, which ADR 0002's own
+   * containment check permits legitimately when the registered root is an
+   * *ancestor* of the personal board and `tickets_dir` is steered to point
+   * inside it. `register()`/`listRegisteredBoards()` refuse the root-level
+   * shape at write/list time by containment (`CANNOT_REGISTER_PERSONAL_BOARD`,
+   * `registry.ts`'s "is the personal board" skip -> this same code via
+   * `findRegisteredBoard`), but neither of those checks can see a symlink
+   * alias (only `buildBoardRef`'s canonicalization reveals it) or a
+   * `tickets_dir`-based alias (only knowable after `buildBoardRef` builds
+   * the ref) -- both caught in `resolve.ts` instead, after building.
    */
   REGISTERED_BOARD_IS_PERSONAL: "REGISTERED_BOARD_IS_PERSONAL",
 } as const;

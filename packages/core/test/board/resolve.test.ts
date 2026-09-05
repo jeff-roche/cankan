@@ -1,12 +1,12 @@
 import { mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { makeTempRepo } from "../../../test-utils/src/tempRepo";
 import { withEnv } from "../../../test-utils/src/withEnv";
 import { isCanKanError } from "../../src/errors";
 import { ensurePersonalBoard, resolvePersonalBoardPath } from "../../src/board/personal";
-import { register, resolveRegistryPath } from "../../src/board/registry";
+import { listRegisteredBoards, register, resolveRegistryPath } from "../../src/board/registry";
 import type { BoardFlag } from "../../src/board/resolve";
 import { resolveAllBoards, resolveBoard } from "../../src/board/resolve";
 import { hermeticEnv, makeTempRepoRoot, writeFileEnsuringDir, writeRepoConfigFile } from "../config/testHelpers";
@@ -342,6 +342,310 @@ describe("resolveBoard -- addendum 2: the personal board's own tree is never mis
       }
       expect(isCanKanError(thrown)).toBe(true);
       expect((thrown as { code: string }).code).toBe("NOT_INSIDE_REPO_BOARD");
+    });
+  });
+});
+
+describe("fix round 1 -- F1: personal-board guards are containment, not equality (three reproduced shapes)", () => {
+  test("F1(a): register() refuses a subdirectory of the personal board, not only its exact root", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+      const subdir = join(personal.board.root, "backlog"); // exists: ensurePersonalBoard creates backlog/tasks
+      let thrown: unknown;
+      try {
+        await register("leak", subdir, env);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("CANNOT_REGISTER_PERSONAL_BOARD");
+
+      const listing = await listRegisteredBoards(env);
+      expect(listing.boards).toHaveLength(0);
+    });
+  });
+
+  test("F1(a), reachability: a hand-edited entry registering a subdirectory of the personal board surfaces REGISTERED_BOARD_IS_PERSONAL through --board <name>, not BOARD_DIRECTORY_MISSING", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+      const subdir = join(personal.board.root, "backlog");
+      const outsider = await makeTempRepo();
+      try {
+        const registryPath = resolveRegistryPath(env);
+        if (!registryPath) throw new Error("test setup: registry path did not resolve");
+        await writeFileEnsuringDir(
+          registryPath,
+          `version: 1\nrepos:\n  - name: leak\n    path: ${subdir}\n    last_seen: 2026-01-01T00:00:00.000Z\n`,
+        );
+
+        let thrown: unknown;
+        try {
+          await resolveBoard({ cwd: outsider.dir, flag: { kind: "name", name: "leak" }, env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+        // F5: the personal board's own path must not appear in the message.
+        expect((thrown as Error).message).not.toContain(personal.board.root);
+      } finally {
+        await outsider.cleanup();
+      }
+    });
+  });
+
+  test("F1(b): a registered ancestor of the personal board with tickets_dir steered into it is refused, not returned as an ordinary repo -- the literal §6c violation", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+      const umbrella = dirname(personal.board.root); // <xdg_data_home>/cankan, an ancestor of personal
+      const outsider = await makeTempRepo();
+      try {
+        // tickets_dir steered to be *exactly* the personal board's own
+        // tickets directory. ADR 0002's own containment check passes
+        // honestly here -- it really is beneath `umbrella`.
+        await writeRepoConfigFile(umbrella, "config.yml", "tickets_dir: personal/backlog/tasks\n");
+        // register() only sees the ROOT half (registry.ts) -- an ancestor
+        // is not "contained in" the personal board, so this succeeds.
+        // That is the point: only resolution time, after buildBoardRef
+        // resolves ticketsDir, can catch this shape.
+        await register("umbrella", umbrella, env);
+
+        let thrown: unknown;
+        try {
+          await resolveBoard({ cwd: outsider.dir, flag: { kind: "name", name: "umbrella" }, env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+      } finally {
+        await outsider.cleanup();
+      }
+    });
+  });
+
+  test("F1(b) via --board all: the same steered-ancestor shape is skipped as 'is the personal board', not listed as a repo board", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+      const umbrella = dirname(personal.board.root);
+      await writeRepoConfigFile(umbrella, "config.yml", "tickets_dir: personal/backlog/tasks\n");
+      await register("umbrella", umbrella, env);
+
+      const result = await resolveAllBoards({ env });
+      expect(result.boards.map((b) => b.name)).not.toContain("umbrella");
+      const skip = result.skipped.find((s) => s.name === "umbrella");
+      expect(skip?.reason).toBe("is the personal board");
+    });
+  });
+
+  test("F1(b), a further ancestor: a registered $XDG_DATA_HOME itself, several segments above the personal board, with a matching multi-segment tickets_dir, is still caught -- only the ticketsDir half of the rule can", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      await ensurePersonalBoard({ env }); // materializes $XDG_DATA_HOME/cankan/personal, and $XDG_DATA_HOME itself along the way
+      const dataHome = env.XDG_DATA_HOME;
+      if (!dataHome) throw new Error("test setup: XDG_DATA_HOME not set by hermeticEnv()");
+      const outsider = await makeTempRepo();
+      try {
+        // Several segments above `personal.board.root`
+        // ($XDG_DATA_HOME/cankan/personal) -- `isContained(personalPath,
+        // ref.root)` is false here by a wide margin (root is an ancestor,
+        // not a descendant); only the ticketsDir half can catch this.
+        await writeRepoConfigFile(dataHome, "config.yml", "tickets_dir: cankan/personal/backlog/tasks\n");
+        await register("data-home", dataHome, env);
+
+        let thrown: unknown;
+        try {
+          await resolveBoard({ cwd: outsider.dir, flag: { kind: "name", name: "data-home" }, env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("REGISTERED_BOARD_IS_PERSONAL");
+
+        const all = await resolveAllBoards({ env });
+        expect(all.boards.map((b) => b.name)).not.toContain("data-home");
+        expect(all.skipped.find((s) => s.name === "data-home")?.reason).toBe("is the personal board");
+      } finally {
+        await outsider.cleanup();
+      }
+    });
+  });
+
+  // Mutation note (see task-B-report.md, fix round 1): this test verifies
+  // the *observable outcome*, not one specific line. Reverting
+  // walkForBoard's own `isContained` back to `===` alone does NOT fail
+  // this test -- the post-build `aliasesPersonalBoard` check (root half)
+  // independently catches the same shape after `buildBoardRef` runs, so
+  // the two checks are redundant for this particular shape today.
+  // Reverting `aliasesPersonalBoard` itself (both halves, tested above in
+  // F1(b)) is what actually discriminates the outcome this test protects.
+  test("F1(c): a nested .cankan/ inside the personal board's own tree is never treated as an ordinary repo, no-flag or --board repo", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+      const nestedRepo = join(personal.board.root, "proj");
+      await mkdir(join(nestedRepo, ".cankan"), { recursive: true });
+
+      const noFlag = await resolveBoard({ cwd: nestedRepo, env });
+      expect(noFlag.kind).toBe("personal");
+      expect(noFlag.name).not.toBe("proj");
+
+      let thrown: unknown;
+      try {
+        await resolveBoard({ cwd: nestedRepo, flag: { kind: "repo" }, env });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("NOT_INSIDE_REPO_BOARD");
+    });
+  });
+
+  test("F1(c) reachable via repos.yml auto_register: a repo nested in the personal tree, once registered, is caught by shape (a) too", async () => {
+    // The dispatch note's own connective tissue: "cankan init" under
+    // repos.auto_register would register a nested repo like F1(c)'s,
+    // which then reduces to F1(a) (a registered subdirectory of the
+    // personal board). Exercised directly against register(), since
+    // `init` itself is a later lane's module.
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+      const nestedRepo = join(personal.board.root, "proj");
+      await mkdir(join(nestedRepo, ".cankan"), { recursive: true });
+
+      let thrown: unknown;
+      try {
+        await register("proj", nestedRepo, env);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("CANNOT_REGISTER_PERSONAL_BOARD");
+    });
+  });
+});
+
+describe("fix round 1 -- F2: canonicalCwd's realpath is load-bearing for comparisons buildBoardRef's own safety net never reaches", () => {
+  // Mutation note (see task-B-report.md, fix round 1): de-fanging
+  // `canonicalCwd` (existence check only, no `realpath`) and rerunning
+  // this file showed only the *second* test below fails. This one keeps
+  // passing even de-fanged: `walkForBoard`'s own comparison then
+  // misclassifies the symlinked personal-tree cwd as an ordinary "repo",
+  // but `buildBoardRef` still realpaths that "repo"'s root as its own
+  // first statement, and the F1 post-build `aliasesPersonalBoard` check
+  // (added earlier in this same fix round) catches the now-canonical
+  // result anyway before it can be returned. So this specific guarantee
+  // ends up double-protected by F1's own fix, not solely by this one --
+  // asserting it is still correct and worth keeping, just not, on its
+  // own, proof that `canonicalCwd`'s `realpath` is doing anything here.
+  test("a cwd reached through a symlink to the personal board's own root still resolves to personal", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const personal = await ensurePersonalBoard({ env });
+      const linkParent = await mkdtemp(join(tmpdir(), "cankan-resolve-f2-personal-"));
+      try {
+        const linkPath = join(linkParent, "personal-link");
+        await symlink(personal.board.root, linkPath);
+        const board = await resolveBoard({ cwd: linkPath, env });
+        expect(board.kind).toBe("personal");
+      } finally {
+        await rm(linkParent, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // This is the test that actually discriminates: `registeredNameFor` runs
+  // *before* `buildBoardRef`, comparing the raw walked root against each
+  // registry entry's own canonical path -- there is no downstream safety
+  // net for this comparison specifically. De-fanging `canonicalCwd` makes
+  // this fail (`board.name` comes back `"totally-different-name"`, the
+  // symlink's own basename, instead of `"api"`); restored afterward.
+  test("a cwd reached through a symlink to a registered repo's root still gets the registry name, not a basename derived from the symlink", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const repo = await initedRepo();
+      const linkParent = await mkdtemp(join(tmpdir(), "cankan-resolve-f2-repo-"));
+      try {
+        await register("api", repo.dir, env);
+        const linkPath = join(linkParent, "totally-different-name");
+        await symlink(repo.dir, linkPath);
+        const board = await resolveBoard({ cwd: linkPath, env });
+        expect(board.name).toBe("api");
+        expect(board.root).toBe(await realpath(repo.dir));
+      } finally {
+        await repo.cleanup();
+        await rm(linkParent, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+describe("fix round 1 -- F3: registeredNameFor degrades gracefully on a malformed registry, but --board all still throws", () => {
+  const MALFORMED_YAML = "version: 1\nrepos: [\n";
+
+  test("a no-flag resolution still succeeds against a malformed repos.yml, falling back to basename", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const repo = await initedRepo();
+      try {
+        const registryPath = resolveRegistryPath(env);
+        if (!registryPath) throw new Error("test setup: registry path did not resolve");
+        await writeFileEnsuringDir(registryPath, MALFORMED_YAML);
+
+        const board = await resolveBoard({ cwd: repo.dir, env });
+        expect(board.kind).toBe("repo");
+        expect(board.name).toBe(basename(await realpath(repo.dir)));
+      } finally {
+        await repo.cleanup();
+      }
+    });
+  });
+
+  test("--board all still throws REGISTRY_INVALID on that same malformed file -- the loud path survives", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const registryPath = resolveRegistryPath(env);
+      if (!registryPath) throw new Error("test setup: registry path did not resolve");
+      await writeFileEnsuringDir(registryPath, MALFORMED_YAML);
+
+      let thrown: unknown;
+      try {
+        await resolveAllBoards({ env });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("REGISTRY_INVALID");
+    });
+  });
+});
+
+describe("fix round 1 -- F4: canonicalCwd wraps a non-ENOENT realpath failure too", () => {
+  test("a cwd that is a symlink cycle is a typed CWD_UNRESOLVABLE error, never a raw ELOOP", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const linkParent = await mkdtemp(join(tmpdir(), "cankan-resolve-eloop-"));
+      try {
+        const a = join(linkParent, "a");
+        const b = join(linkParent, "b");
+        await symlink(b, a);
+        await symlink(a, b);
+
+        let thrown: unknown;
+        try {
+          await resolveBoard({ cwd: a, env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("CWD_UNRESOLVABLE");
+      } finally {
+        await rm(linkParent, { recursive: true, force: true });
+      }
     });
   });
 });

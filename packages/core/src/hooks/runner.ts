@@ -74,10 +74,41 @@ export const DEFAULT_HOOK_TIMEOUT_MS = 30_000;
  */
 const KILL_GRACE_PERIOD_MS = 200;
 
+/**
+ * Poll interval for `waitForGroupEmpty` (fix round 1, finding 1): how often
+ * to re-check `isGroupAlive` while waiting for a process group to empty.
+ * Small enough not to meaningfully inflate a hook's observed duration,
+ * large enough not to busy-loop.
+ */
+const GROUP_POLL_INTERVAL_MS = 20;
+
+/**
+ * Backstop bound on how long to keep polling for a process group to empty
+ * *after* the escalation `SIGKILL` (fix round 1, finding 1). `SIGKILL` is
+ * unblockable, so this is not an expected wait in practice -- it exists so
+ * a pathological environment (an uninterruptible-sleep process, or a
+ * platform that recycles the group id unusually early) can never make this
+ * module hang indefinitely; see the task brief's own "reaping lags the
+ * signal by a tick, poll briefly" note, applied at a longer, one-time-only
+ * horizon here.
+ */
+const GROUP_EMPTY_HARD_BOUND_MS = 2_000;
+
 /** Each captured stream (stdout, stderr) is capped at 64 KiB (task brief §7). */
 const OUTPUT_CAP_BYTES = 65_536;
 
 const TRUNCATION_MARKER = "\n[cankan: output truncated at 65536 bytes]";
+
+/**
+ * Cap on each of the five CanKan env values (fix round 1, finding 2 /
+ * Controller Ruling 13). Well under Linux's `MAX_ARG_STRLEN` (128 KiB per
+ * `argv`/`environ` string) with headroom to spare, and far more than any
+ * of these five values needs in practice -- this exists purely as a
+ * defensive ceiling against a pathologically large attacker-influenced
+ * value (`$TITLE` above all), not as a realistic limit any legitimate
+ * value should ever approach.
+ */
+const ENV_VALUE_MAX_BYTES = 4096;
 
 // ---------------------------------------------------------------------------
 // Resolving hooks from all three layers (obligation 1).
@@ -244,6 +275,16 @@ type HookSubprocess = Subprocess<"ignore", "pipe", "pipe">;
  * equally not this hook's fault to escalate: Ruling 5 requires that a
  * failure here must not become an uncaught exception aborting every other
  * hook still queued to run.
+ *
+ * **Fix round 1, finding note on pid reuse (recorded, not fixed here):**
+ * once every member of the original group has exited, the OS is free to
+ * reuse that numeric id for an unrelated process's pid (which, if *that*
+ * process happens to also be its own group leader, would make it an
+ * unrelated victim of a stray signal here). This is a pre-existing,
+ * accepted risk class, not something this round changes -- the fix below
+ * calls this function exactly as many times as before (one `SIGTERM`, at
+ * most one `SIGKILL`); it does not add repeated kill attempts, which would
+ * widen this exposure window rather than merely inherit it.
  */
 function killGroupSafely(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
   try {
@@ -254,31 +295,127 @@ function killGroupSafely(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
 }
 
 /**
- * Runs `proc` to completion, killing its whole process group if it is
- * still alive after `timeoutMs`. Escalates SIGTERM -> `KILL_GRACE_PERIOD_MS`
- * -> SIGKILL, per the task brief's "escalate properly" (§6). Resolves once
- * `proc` has actually exited (whether on its own, or because this function
- * killed it), so the caller never reads `proc.exitCode`/`signalCode` before
- * they are final.
+ * `true` iff at least one process still belongs to the group led by `pid`
+ * (POSIX `kill(pgid, 0)`: sends no signal, just checks). Deliberately
+ * **not** the same question as "has `proc` (the direct child / group
+ * leader) exited" -- a process group persists under POSIX as long as any
+ * member remains, independent of whether the original leader specifically
+ * is still alive (verified empirically for this runtime -- task report's
+ * fix-round-1 probe: `isGroupAlive` stayed `true` for ~2s after the direct
+ * child had already exited with code 0, while a backgrounded, non-detached
+ * grandchild was still running). This is what makes it safe to use even
+ * after the leader is gone, without assuming anything Linux-specific about
+ * `kill(-pgid)` continuing to "work" post-leader-exit (fix round 1 finding
+ * 1's portability constraint) -- it is the POSIX process-group model
+ * itself, not an implementation quirk of one kernel.
  */
-async function killAfterTimeout(proc: HookSubprocess, timeoutMs: number): Promise<boolean> {
-  let timedOut = false;
-  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+function isGroupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  const timeoutTimer = setTimeout(() => {
-    timedOut = true;
-    killGroupSafely(proc.pid, "SIGTERM");
-    graceTimer = setTimeout(() => {
-      killGroupSafely(proc.pid, "SIGKILL");
-    }, KILL_GRACE_PERIOD_MS);
-  }, timeoutMs);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
+/**
+ * Polls (every `GROUP_POLL_INTERVAL_MS`) until `isGroupAlive(pid)` is
+ * `false`, or `boundMs` elapses -- whichever first. Returns whether the
+ * group was actually confirmed empty. There is no OS/JS primitive to
+ * *await* an arbitrary, untracked grandchild's exit (we only ever hold a
+ * handle to the direct child), so this is deliberately poll-based rather
+ * than event-driven; `GROUP_POLL_INTERVAL_MS` trades a small worst-case
+ * detection delay for not depending on anything more elaborate.
+ */
+async function waitForGroupEmpty(pid: number, boundMs: number): Promise<boolean> {
+  const deadline = performance.now() + boundMs;
+  while (isGroupAlive(pid)) {
+    if (performance.now() >= deadline) {
+      return false;
+    }
+    await sleep(GROUP_POLL_INTERVAL_MS);
+  }
+  return true;
+}
+
+/**
+ * Runs `proc`'s **whole process group** to completion within `timeoutMs`,
+ * escalating a group kill if it is not naturally empty in time. Resolves
+ * once `proc` has actually exited (so the caller can safely read
+ * `proc.exitCode`/`signalCode` afterward) and returns whether a timeout
+ * was declared.
+ *
+ * **Fix round 1, finding 1.** The previous version declared "done" the
+ * instant the *direct child* (`proc`) exited, and cleared the
+ * already-armed SIGKILL escalation timer at that same instant. Two bugs
+ * followed from that one design error, both reproduced with real pids in
+ * the fix-round-1 findings: (a) a hook whose direct child honours SIGTERM
+ * but whose backgrounded grandchild traps it never got the SIGKILL
+ * escalation, because the direct child's own death (from the SIGTERM)
+ * disarmed it first; (b) a hook whose direct child exits promptly while a
+ * backgrounded, non-detached grandchild keeps running (CONCEPT.md §8's own
+ * "dispatcher spawns agents" shape, done without properly detaching the
+ * spawned process into its own session) was never bounded by `timeoutMs`
+ * at all -- `spawnHook` would go on to block on that grandchild's inherited
+ * stdout/stderr pipe for its entire natural lifetime, or leak it entirely
+ * if its stdio was redirected away from the pipe.
+ *
+ * The fix: "done" means the **group** has no members left (`!isGroupAlive`),
+ * not merely that the direct child has exited -- checked with `kill(-pgid,
+ * 0)`, which stays meaningful for as long as *any* member remains,
+ * regardless of the original leader's fate (see `isGroupAlive`'s doc
+ * comment; this is what avoids assuming Linux-only behaviour about
+ * `kill(-pgid)` post-leader-exit). The escalation (`SIGTERM` -> grace ->
+ * `SIGKILL`) is sent exactly once each, never repeated -- see
+ * `killGroupSafely`'s note on not widening the pid-reuse window.
+ */
+async function runGroupToCompletion(proc: HookSubprocess, timeoutMs: number): Promise<boolean> {
+  const pid = proc.pid;
+  const deadline = performance.now() + timeoutMs;
+
+  // Fast path: an event-driven wait for the direct child specifically,
+  // bounded by the deadline -- avoids polling at all for the overwhelmingly
+  // common case (a hook with no backgrounded descendant). Whether or not
+  // this settles via `proc.exited` or the deadline, the group might still
+  // have members afterward (a lingering grandchild) -- that is checked
+  // next, not assumed away by the direct child having exited.
+  let deadlineHitBeforeExit = false;
+  await Promise.race([
+    proc.exited,
+    sleep(Math.max(0, deadline - performance.now())).then(() => {
+      deadlineHitBeforeExit = true;
+    }),
+  ]);
+
+  let timedOut = deadlineHitBeforeExit;
+  if (!deadlineHitBeforeExit) {
+    const remaining = Math.max(0, deadline - performance.now());
+    const emptyInTime = await waitForGroupEmpty(pid, remaining);
+    timedOut = !emptyInTime;
+  }
+
+  if (timedOut) {
+    killGroupSafely(pid, "SIGTERM");
+    const emptyAfterTerm = await waitForGroupEmpty(pid, KILL_GRACE_PERIOD_MS);
+    if (!emptyAfterTerm) {
+      killGroupSafely(pid, "SIGKILL");
+      // `SIGKILL` is unblockable, so this bound is a backstop against
+      // reaping lag (and, in principle, a pathological environment) rather
+      // than an expected wait -- never hang past it regardless.
+      await waitForGroupEmpty(pid, GROUP_EMPTY_HARD_BOUND_MS);
+    }
+  }
+
+  // `proc.exited` may still be pending if the direct child itself was one
+  // of the processes just killed (or if it exited exactly as the deadline
+  // hit) -- await it unconditionally so `exitCode`/`signalCode` are safe
+  // to read the moment this function returns.
   await proc.exited;
 
-  clearTimeout(timeoutTimer);
-  if (graceTimer !== undefined) {
-    clearTimeout(graceTimer);
-  }
   return timedOut;
 }
 
@@ -380,6 +517,20 @@ export async function spawnHook(request: HookSpawnRequest): Promise<HookExecutio
       // without this, the child inherits *this* process's group, and the
       // negative-pid kill below would signal `bun test`'s own group
       // instead of the hook's (task report probe 4).
+      //
+      // `setsid()` is stronger than a bare `setpgid()`: the child also
+      // leaves this process's *session*, not just its process group (fix
+      // round 1, finding 3). Concretely, an interactive `SIGINT`
+      // (Ctrl-C on `cankan close`) delivered to the terminal's foreground
+      // process group will NOT reach a hanging hook's group -- only this
+      // module's own `timeoutMs` bounds it, and that JS timer dies with
+      // the CLI process itself if the CLI exits early for any other
+      // reason. Accepted (Controller Ruling 9): `setsid()` via
+      // `detached: true` is the only portable route to group-leader status
+      // Bun 1.4.0 exposes (Ruling 7 already rules out shelling out to the
+      // external `setsid` binary, absent on macOS). Signal forwarding for
+      // an interactive session is M3's CLI-signal-boundary concern, outside
+      // this task's `Creates` list.
       detached: true,
     });
   } catch {
@@ -406,7 +557,7 @@ export async function spawnHook(request: HookSpawnRequest): Promise<HookExecutio
   const stdoutPromise = readCapped(proc.stdout, OUTPUT_CAP_BYTES);
   const stderrPromise = readCapped(proc.stderr, OUTPUT_CAP_BYTES);
 
-  const timedOut = await killAfterTimeout(proc, request.timeoutMs);
+  const timedOut = await runGroupToCompletion(proc, request.timeoutMs);
   const [stdoutResult, stderrResult] = await Promise.all([stdoutPromise, stderrPromise]);
 
   const exitCode = proc.exitCode;
@@ -461,6 +612,44 @@ export interface RunHooksOptions {
 }
 
 /**
+ * Sanitizes one of the five CanKan env values before it is merged into the
+ * environment (fix round 1, finding 2 / Controller Ruling 13).
+ *
+ * Two independent defenses, both defending `runHooks`'s own boundary
+ * (never `packages/core/src/ticket/schema.ts` -- that is M2.2's module and
+ * has no maximum length or NUL rejection of its own on `title`):
+ *
+ * - **Strips every NUL byte.** Verified empirically (task report's
+ *   NUL-byte probe): Bun 1.4.0 rejects *any* env value containing one,
+ *   synchronously and unrecoverably (`Bun.spawn` throws before spawning
+ *   anything). Before this fix, a ticket title containing a single NUL
+ *   byte suppressed **every hook configured for that event, across all
+ *   three layers** -- including the user's own trusted `global` hook, via
+ *   the exact same `HOOK_SPAWN_FAILED` outcome as a genuine environment
+ *   failure, indistinguishable from it in the result. Stripping the NUL
+ *   here means the hook still runs; availability of the user's own hook
+ *   matters more than an untruncated attacker-influenced value reaching
+ *   it.
+ * - **Caps the byte length at `ENV_VALUE_MAX_BYTES`.** A pathologically
+ *   large value (probed at 300 KB and 2 MB) hits the same
+ *   `Bun.spawn`-fails-before-anything-starts failure mode, for the same
+ *   reason -- same fix, same rationale.
+ *
+ * A truncated `$TITLE` is strictly better than a hook that never fires at
+ * all. Cutting at an arbitrary byte boundary inside a multi-byte UTF-8
+ * sequence is fine here -- `TextDecoder`'s default (non-fatal) mode
+ * replaces a broken tail sequence with U+FFFD rather than throwing.
+ */
+function sanitizeEnvValue(value: string): string {
+  const withoutNuls = value.replaceAll("\0", "");
+  const bytes = new TextEncoder().encode(withoutNuls);
+  if (bytes.length <= ENV_VALUE_MAX_BYTES) {
+    return withoutNuls;
+  }
+  return new TextDecoder().decode(bytes.subarray(0, ENV_VALUE_MAX_BYTES));
+}
+
+/**
  * Resolves and runs every hook configured for `event`, across all three
  * config layers, sequentially in `HOOK_LAYER_ORDER`. See
  * `resolveHooksForEvent` for why all matching layers run rather than one
@@ -490,11 +679,15 @@ export async function runHooks(options: RunHooksOptions): Promise<HookOutcome[]>
   }
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS;
-  const ticket = options.ticket ?? "";
-  const actor = options.actor ?? "";
-  const from = options.from ?? "";
-  const to = options.to ?? "";
-  const title = options.title ?? "";
+  // Sanitized (fix round 1, finding 2) before ever reaching env or the sink
+  // record -- see `sanitizeEnvValue`'s doc comment. Ticket content
+  // ($TITLE above all) is attacker-influenced; a caller-supplied value here
+  // is not otherwise trusted.
+  const ticket = sanitizeEnvValue(options.ticket ?? "");
+  const actor = sanitizeEnvValue(options.actor ?? "");
+  const from = sanitizeEnvValue(options.from ?? "");
+  const to = sanitizeEnvValue(options.to ?? "");
+  const title = sanitizeEnvValue(options.title ?? "");
 
   // Merged, never replaced (task brief §5) -- the five CanKan vars win over
   // whatever the base environment already set for those names.

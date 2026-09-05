@@ -1,0 +1,553 @@
+/**
+ * events/schema.ts — the CanKan event union and its runtime validator.
+ *
+ * This is the schema half of M2.7 only. `events/log.ts` (append/read),
+ * `events/ref.ts` (ref init), the lease-observation store, and the
+ * poisoned-ref recovery path are later dispatches; nothing here builds or
+ * stubs them.
+ *
+ * **Why this file exists at all — ADR 0001:716-723 ("Validated at the
+ * boundary, not cast"), failure mode 11 (~line 1216).** The spike parsed
+ * events with `JSON.parse(line) as ClaimEvent` — a compile-time cast, not a
+ * runtime check, over a log anyone with push access to the coordination ref
+ * can write to. A cast believes whatever shape the peer chose to send.
+ * Every export below exists to replace that cast with a real check: `parseEvent`
+ * is the boundary every event — read off the ref, or about to be appended to
+ * it — must cross before anything downstream (a fold, a lease-expiry check,
+ * a CLI render) is allowed to touch it as a typed value.
+ *
+ * **Ordering authority is the event's position in the append-only chain,
+ * never `ts` (ADR 0001:723-725, obligation 6).** Nothing in this file sorts
+ * by `ts`, and no downstream consumer should either — `ts` is bounded below
+ * for hygiene only (see `PROJECT_EPOCH`'s comment), not because a bounded
+ * value becomes trustworthy enough to order or expire anything by.
+ */
+
+import { z } from "zod";
+import type { ActorId, TicketId } from "../types";
+
+// ============================================================================
+// Event ids — ULIDs, validated on read as well as on mint
+// ============================================================================
+
+/**
+ * A CanKan event id. **Ruling R9 (orchestrator):** a bare 26-character
+ * uppercase Crockford base32 ULID — no `evt-` prefix. ADR 0001:774-783
+ * requires validating "the fixed length that encoding implies," which a
+ * prefixed id does not have; CONCEPT.md's `"id":"evt-01J…"` is an
+ * illustrative elision in a JSON example, not the literal wire format (and
+ * its own `01J` fragment is itself a real ULID prefix, not part of a
+ * `evt-`-tagged scheme).
+ */
+export type EventId = string & { readonly __brand: "EventId" };
+
+/**
+ * Crockford base32, excluding `I`, `L`, `O`, `U` (never used, to avoid
+ * visual confusion with `1`, `1`, `0`, `V`). The first character is
+ * restricted to `0`-`7`: a ULID's first 10 characters encode a 48-bit
+ * millisecond timestamp, and the highest value that fits is `7ZZZZZZZZZ…`
+ * (`ulid` package's own `MAX_ULID` constant, confirmed by probe below) — a
+ * leading `8` or `9` (or a letter) names a timestamp beyond what a ULID can
+ * represent.
+ *
+ * **Probe (obligation 2), run against `ulid@3.0.2` in this worktree —
+ * `bun /tmp/.../ulid-regex-probe.ts` (see task-1-report.md for the full
+ * transcript):** `ulid()`'s own `isValid` export uppercases its input
+ * before checking the character set, so `isValid(realUlid.toLowerCase())`
+ * returns `true` — it does **not** reject lowercase. It also does not
+ * range-check the first character: `isValid("8ZZZZZZZZZZZZZZZZZZZZZZZZZ")`
+ * and `isValid("ZZZZZZZZZZZZZZZZZZZZZZZZZZ")` both return `true`, even
+ * though both encode a timestamp past `MAX_ULID`. Neither of those is
+ * acceptable for a peer-supplied id, so this module does **not** use
+ * `ulid`'s `isValid` — it defines its own pattern, below, verified against
+ * every case the brief named (real ULID, lowercased, 25/27-char, a char from
+ * each excluded letter, both overflow shapes) before being wired into the
+ * schema.
+ */
+const ULID_PATTERN = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
+
+/**
+ * Structural ULID check — Crockford base32, uppercase only, exactly the
+ * 26-character length the encoding implies, first character `0`-`7` so the
+ * encoded timestamp cannot overflow. Exported standalone (not only wired
+ * into `parseEvent`'s schema) so a caller — dispatch 4's recovery tooling,
+ * or a test — can ask "is this specific string a valid event id" without
+ * constructing a whole event.
+ */
+export function isValidEventId(value: string): value is EventId {
+  return ULID_PATTERN.test(value);
+}
+
+// ============================================================================
+// Ticket canonicalization — lowercase before use as a key
+// ============================================================================
+
+/**
+ * Canonicalizes a ticket id for use as an event-log key — a bare
+ * `.toLowerCase()`. ADR 0001:751-764: "A claim appended under `ck-1` and a
+ * lookup for `CK-1` (or vice versa) would silently fail to match — the same
+ * double-claim class as failure mode 9, via casing instead of a month
+ * boundary. M2.7's `append`/`read` must canonicalize the `ticket` field
+ * ... before using it as a key, on both write and read." Applied here to
+ * every ticket-id-shaped field: the envelope's `ticket`, and `alias`'s
+ * `from`/`to` (obligation 7 — a redirect gets the same rigor as a claim).
+ *
+ * **This mirrors `ticket/id.ts`'s `normalizeTicketIdForComparison` — same
+ * operation, and that function's entire body is the same bare
+ * `.toLowerCase()` (`ticket/id.ts:62-64`) — but is copied here, not
+ * imported.** M2.2 (`ticket/`) is not in M2.7's `Depends on` list, and
+ * PLAN.md rule 2 forbids importing from a module outside that list (Ruling
+ * R2). Copying is verified safe specifically because there is no logic in
+ * the mirrored function beyond that one call for the two copies to diverge
+ * on.
+ *
+ * **What breaks if the two ever diverge:** if `ticket/id.ts`'s
+ * canonicalization rule changes to something beyond a bare lowercase (a
+ * different Unicode normalization, say) and this copy is not updated to
+ * match, a ticket claimed under one canonical form via the ticket store and
+ * referenced under another via the event log would silently fail to match
+ * — reintroducing the exact double-claim class ADR 0001:751-764 exists to
+ * prevent, this time via the two canonicalizers disagreeing rather than via
+ * casing alone.
+ */
+export function canonicalizeTicketId(id: string): TicketId {
+  return id.toLowerCase() as TicketId;
+}
+
+// ============================================================================
+// `ts` — bounded as hygiene, never trusted, never an ordering or expiry input
+// ============================================================================
+
+/**
+ * A fixed lower bound for `ts` (**Ruling R10**, orchestrator): no event this
+ * project's schema will ever validate was written before this instant.
+ * Deliberately **not** relative to `Date.now()`. ADR 0001:723-736 asks for a
+ * "sane window" without specifying which kind; a `now - X` window would make
+ * a valid, already-written log rot into a poisoned one purely by the passage
+ * of time — every event older than the rolling window would start failing
+ * the fail-closed read, taking a board down with no push from anyone. A
+ * fixed epoch never does that: once an event is old enough to pass this
+ * bound, it stays old enough forever.
+ *
+ * **No bound makes a peer-supplied clock trustworthy.** This bound (and the
+ * `now + 24h` upper one, below) is schema hygiene — it keeps an absurd `ts`
+ * out of anything that displays or sorts by it — not a security control. A
+ * window wide enough to tolerate honest clock skew is wide enough for a
+ * hostile writer to backdate or postdate a `ts` well inside it. `ts` is
+ * therefore **never** an input to lease expiry (ADR 0001:730-736); expiry is
+ * measured against a reader-local first-observation clock (failure mode 7),
+ * a later dispatch's responsibility, not this file's.
+ */
+export const PROJECT_EPOCH = "2020-01-01T00:00:00Z";
+
+const PROJECT_EPOCH_MS = Date.parse(PROJECT_EPOCH);
+
+/** Upper `ts` bound: `now + 24h` (Ruling R10), tolerating honest clock skew. */
+const TS_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Shape check for `ts` and `lease_until`: an ISO-8601 UTC instant in the
+ * exact form `Date.prototype.toISOString()` produces (fractional seconds
+ * optional, to tolerate a hand-built value with none). Every worked example
+ * in CONCEPT.md's event log section (~line 477) is in this form.
+ */
+const ISO_8601_UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+
+/**
+ * Bounds-checks an already shape-valid `ts` against `[PROJECT_EPOCH, now +
+ * 24h]`. `now` is a parameter, not a call to `Date.now()` inside this
+ * function — obligation 4 requires it injectable so a caller (a later
+ * dispatch's UTC-month-rollover test, in particular) can test the boundary
+ * without waiting for real time to cross it.
+ */
+function isTsWithinBounds(ts: string, nowMs: number): boolean {
+  const tsMs = Date.parse(ts);
+  if (Number.isNaN(tsMs)) return false;
+  return tsMs >= PROJECT_EPOCH_MS && tsMs <= nowMs + TS_FUTURE_SKEW_MS;
+}
+
+// ============================================================================
+// The envelope — common to all twelve kinds
+// ============================================================================
+
+/**
+ * `actor` is **not an authenticated identity** (ADR 0001:743-750). It is
+ * whatever string the writer put in the event, bounded only by who has push
+ * access to the coordination ref — nothing here binds it to a git identity,
+ * a signed commit, or any other credential. `state/fold.ts` (M2.8) will be
+ * tempted to surface `actor` as though it identifies who made a claim; it
+ * does not, and M2.8's design must account for that rather than treating a
+ * claim's `actor` field as trustworthy attribution.
+ */
+const actorSchema = z
+  .string()
+  .min(1)
+  .transform((s) => s as ActorId);
+
+/** Same non-identity caveat as `actor` — CONCEPT.md §5: agents inherit a parent human. Optional: only carried when known. */
+const parentSchema = z
+  .string()
+  .min(1)
+  .transform((s) => s as ActorId)
+  .optional();
+
+const tsSchema = z.string().regex(ISO_8601_UTC_PATTERN, "ts must be an ISO-8601 UTC instant (YYYY-MM-DDTHH:mm:ss[.sss]Z)");
+
+const eventIdSchema = z
+  .string()
+  .regex(ULID_PATTERN, "event id must be a 26-character uppercase Crockford base32 ULID")
+  .transform((s) => s as EventId);
+
+/**
+ * `ticket` is canonicalized (lowercased) here, at the schema boundary, so
+ * every downstream consumer receives an already-canonical key — obligation
+ * 3. No shape/charset validation beyond "non-empty string": `TicketId`
+ * (`../types.ts`) deliberately carries none either, per ADR 0002, so a
+ * validator here would invent spec that ADR does not state.
+ */
+const ticketSchema = z
+  .string()
+  .min(1)
+  .transform((s) => canonicalizeTicketId(s));
+
+const envelopeShape = {
+  ts: tsSchema,
+  id: eventIdSchema,
+  actor: actorSchema,
+  parent: parentSchema,
+  ticket: ticketSchema,
+};
+
+// ============================================================================
+// Per-kind schemas
+// ============================================================================
+//
+// Twelve kinds, decided by the orchestrator (Ruling R1), not open for this
+// dispatch to renegotiate: create, claim, takeover, renew, release, expire,
+// move, close, alias, hook, comment, external-write.
+//
+// Every object schema below is `.strict()` — obligation 8. An event
+// carrying an unrecognized key is **rejected**, not silently stripped
+// (zod's un-annotated default) and not silently accepted (`.passthrough()`).
+// Justification (see task-1-report.md for the full argument): this log
+// crosses a trust boundary — "whoever has push access," per the ADR, not a
+// cooperative process — and the ADR's own stated trade for that boundary is
+// fail-closed ("a board that refuses to answer is safer than one that
+// grants a double-claim," ADR 0001:828-838). An unrecognized key is exactly
+// the kind of thing a hostile or buggy peer would send to smuggle data past
+// a validator that only checks the keys it expects, or to probe for a
+// consumer downstream that is careless enough to read a key this schema
+// never sanctioned. Forward compatibility for a genuinely new field is
+// handled by shipping a new schema version, not by this version silently
+// tolerating shapes it was never told about; there is only one schema
+// version in this codebase today, so there is no compatibility cost yet to
+// weigh against that.
+//
+// The discriminant (`event`) makes obligation 9 structural rather than a
+// separate check: `z.discriminatedUnion` fails closed on any `event` value
+// that does not match one of the twelve literals below (verified directly —
+// see task-1-report.md's zod probe), consistent with the same fail-closed
+// reasoning: a kind this version does not know is a kind whose shape this
+// version cannot vouch for, and nothing downstream should be handed a value
+// this schema could not validate.
+
+const createEventSchema = z.object({ ...envelopeShape, event: z.literal("create") }).strict();
+
+/**
+ * `lease_until` is carried for display only (CONCEPT.md's worked example,
+ * ~line 477) — it is **not** an input to lease-expiry logic. ADR 0001's
+ * failure mode 7 places the expiry clock outside the log entirely (a
+ * reader-local first-observation time, a later dispatch's responsibility);
+ * trusting a peer-supplied `lease_until` for expiry would reopen exactly the
+ * "far-future value defeats expiry" hole that clock design exists to close.
+ * Shape-validated the same way as `ts` (an ISO-8601 UTC instant) but
+ * deliberately **not** epoch/skew-bounded the way `ts` is: no source asks
+ * for that bound, and a legitimately long-configured lease could otherwise
+ * be rejected as "too far in the future" by a rule meant for `ts` alone.
+ *
+ * The regex alone would admit a calendar-invalid instant shaped like the
+ * pattern but meaningless as a date (`2026-13-45T00:00:00Z`) — `ts` never
+ * has this gap because `isTsWithinBounds` runs every `ts` through
+ * `Date.parse` regardless, but `lease_until` has no analogous downstream
+ * check, so the `.refine` below closes it directly here.
+ */
+const leaseUntilSchema = z
+  .string()
+  .regex(ISO_8601_UTC_PATTERN, "lease_until must be an ISO-8601 UTC instant (YYYY-MM-DDTHH:mm:ss[.sss]Z)")
+  .refine((s) => !Number.isNaN(Date.parse(s)), "lease_until must be a real calendar instant");
+
+const claimEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("claim"), lease_until: leaseUntilSchema })
+  .strict();
+
+/**
+ * `--force` writes `takeover` instead of `claim` (PLAN.md:267, M2.10). A
+ * takeover establishes a new lease exactly as a claim does — without
+ * `lease_until` here, `state/fold.ts` (M2.8) would have no way to know when
+ * the forced claim expires, silently defeating the feature `--force` exists
+ * to provide.
+ */
+const takeoverEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("takeover"), lease_until: leaseUntilSchema })
+  .strict();
+
+const renewEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("renew"), lease_until: leaseUntilSchema })
+  .strict();
+
+const releaseEventSchema = z.object({ ...envelopeShape, event: z.literal("release") }).strict();
+
+const expireEventSchema = z.object({ ...envelopeShape, event: z.literal("expire") }).strict();
+
+/**
+ * `move`'s `from`/`to` are column/status names (CONCEPT.md's worked
+ * example: `"from":"In Progress","to":"In Review"`) — plain, uncanonicalized
+ * strings. **Deliberately not the same type as `alias`'s `from`/`to`**
+ * (below), which are ticket ids: the brief calls this out explicitly, and
+ * conflating the two would let a column name silently satisfy a ticket-id
+ * shape check or vice versa.
+ */
+const moveEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("move"), from: z.string().min(1), to: z.string().min(1) })
+  .strict();
+
+/**
+ * `reason` sourced from CONCEPT.md's CLI reference: `cankan close <id>
+ * [--reason "…"]` (~line 529). Optional because the flag itself is
+ * optional.
+ */
+const closeEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("close"), reason: z.string().optional() })
+  .strict();
+
+/**
+ * `alias` gets the same rigor as `claim` (obligation 7, ADR 0001:709-715): a
+ * pushed `alias` from a legitimate ticket id to an attacker-chosen one would
+ * reroute `cankan show <id>` to the attacker's ticket. `from`/`to` are
+ * therefore run through the exact same `canonicalizeTicketId` transform as
+ * the envelope's `ticket` — not a lighter-weight check for "just a redirect
+ * primitive." Source: CONCEPT.md's worked example (`"from":"TASK-12",
+ * "to":"ck-7f3a9c"`) and ADR 0002 decision point 2 (`from: TASK-N, to:
+ * ck-<hash>`).
+ */
+const aliasEventSchema = z
+  .object({
+    ...envelopeShape,
+    event: z.literal("alias"),
+    from: z.string().min(1).transform((s) => canonicalizeTicketId(s)),
+    to: z.string().min(1).transform((s) => canonicalizeTicketId(s)),
+  })
+  .strict();
+
+/**
+ * `hook` fields are sourced directly from CONCEPT.md §8's named hook
+ * environment (`$TICKET, $ACTOR, $FROM, $TO, $TITLE`, ~line 207) and
+ * PLAN.md's M2.16 description ("capture output ... to the event log as hook
+ * events"). `$TICKET`/`$ACTOR` are already the envelope's `ticket`/`actor` —
+ * not duplicated here. `$FROM`/`$TO` are optional: CONCEPT.md's hookable
+ * event list (`claim, release, expire, move, close, create`) includes kinds
+ * that never set them (a `claim` hook has no "from column"), so they can
+ * only be present when the triggering event supplied them (a `move` hook).
+ * They are plain strings here, like `move`'s `from`/`to`, not ticket ids —
+ * a hook never fires on `alias`. `title` is required: every hookable kind
+ * fires on a real ticket, which always has a title. `output` is the
+ * captured hook output PLAN.md names.
+ *
+ * **Deliberately not captured:** which of the six hookable kinds fired.
+ * Neither source above names a field for it, and adding one would be the
+ * exact kind of speculative field the brief warns against. Flagged in
+ * task-1-report.md as a real gap for M2.16's dispatch to weigh — a hook
+ * event's cause may be reconstructable from its position in the log next to
+ * the event that fired it, but this schema does not build or assume that.
+ */
+const hookEventSchema = z
+  .object({
+    ...envelopeShape,
+    event: z.literal("hook"),
+    from: z.string().optional(),
+    to: z.string().optional(),
+    title: z.string().min(1),
+    output: z.string(),
+  })
+  .strict();
+
+/** `text` sourced from CONCEPT.md's CLI reference: `cankan comment <id> <text>` (~line 532). */
+const commentEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("comment"), text: z.string().min(1) })
+  .strict();
+
+/**
+ * No kind-specific fields. ADR 0002 decision point 3 names `external-write`
+ * only as an example of how a foreign (Backlog.md) write to a ticket file
+ * might be recorded ("e.g. an `external-write` event, or a mismatch between
+ * ... base_hash and the file's current content hash") — it does not specify
+ * a payload beyond identifying which ticket was foreign-written, which the
+ * envelope's `ticket` already carries. Left envelope-only rather than
+ * guessing at a content-hash or diff field no source asks for.
+ */
+const externalWriteEventSchema = z.object({ ...envelopeShape, event: z.literal("external-write") }).strict();
+
+// ============================================================================
+// The union
+// ============================================================================
+
+const eventUnionSchema = z.discriminatedUnion("event", [
+  createEventSchema,
+  claimEventSchema,
+  takeoverEventSchema,
+  renewEventSchema,
+  releaseEventSchema,
+  expireEventSchema,
+  moveEventSchema,
+  closeEventSchema,
+  aliasEventSchema,
+  hookEventSchema,
+  commentEventSchema,
+  externalWriteEventSchema,
+]);
+
+/** The twelve event kinds, in the order they appear in the union above. */
+export const EVENT_KINDS = [
+  "create",
+  "claim",
+  "takeover",
+  "renew",
+  "release",
+  "expire",
+  "move",
+  "close",
+  "alias",
+  "hook",
+  "comment",
+  "external-write",
+] as const;
+
+export type EventKind = (typeof EVENT_KINDS)[number];
+
+export type CreateEvent = z.infer<typeof createEventSchema>;
+export type ClaimEvent = z.infer<typeof claimEventSchema>;
+export type TakeoverEvent = z.infer<typeof takeoverEventSchema>;
+export type RenewEvent = z.infer<typeof renewEventSchema>;
+export type ReleaseEvent = z.infer<typeof releaseEventSchema>;
+export type ExpireEvent = z.infer<typeof expireEventSchema>;
+export type MoveEvent = z.infer<typeof moveEventSchema>;
+export type CloseEvent = z.infer<typeof closeEventSchema>;
+export type AliasEvent = z.infer<typeof aliasEventSchema>;
+export type HookEvent = z.infer<typeof hookEventSchema>;
+export type CommentEvent = z.infer<typeof commentEventSchema>;
+export type ExternalWriteEvent = z.infer<typeof externalWriteEventSchema>;
+
+/**
+ * The event union. **Ordering authority is chain position, never `ts`**
+ * (obligation 6) — nothing here, and nothing that should be built on top of
+ * it, may sort by `ts`.
+ */
+export type Event = z.infer<typeof eventUnionSchema>;
+
+// ============================================================================
+// The validator
+// ============================================================================
+
+export interface ParseEventOptions {
+  /**
+   * The clock reading `ts`'s upper bound is measured against. Defaults to
+   * `Date.now()`. Injectable per obligation 4, so a caller can test a UTC
+   * month-rollover boundary (or any other `ts`-bound edge) without waiting
+   * for real time to cross it.
+   */
+  readonly now?: number;
+}
+
+/** A single validation problem, projected from zod's own issue shape into a flat, serializable form (`errors.ts`'s "keep `details` flat" guidance applies equally to a value dispatch 4 will fold into an audit record). */
+export interface EventValidationIssue {
+  /** Dot-joined path into the event object; `""` for a whole-event problem (e.g. an unrecognized `event` kind). */
+  readonly path: string;
+  readonly message: string;
+  /** zod's own issue code (e.g. `"invalid_type"`, `"unrecognized_keys"`) or one of this module's own (`"ts_out_of_bounds"`, `"invalid_json"`). */
+  readonly code: string;
+}
+
+/**
+ * A line that failed to become a valid `Event`. `reason` distinguishes "this
+ * line was not even JSON" from "this JSON did not match the event schema" —
+ * dispatch 4's recovery path and dispatch 2's `read()` both need to report
+ * *why* a line failed, not just that it did (obligation 1).
+ */
+export interface EventValidationFailure {
+  readonly reason: "invalid-json" | "schema-invalid";
+  readonly message: string;
+  readonly issues: readonly EventValidationIssue[];
+}
+
+export type ParseEventResult =
+  | { readonly ok: true; readonly event: Event }
+  | { readonly ok: false; readonly error: EventValidationFailure };
+
+function projectIssues(issues: z.ZodError["issues"]): EventValidationIssue[] {
+  return issues.map((issue) => ({
+    path: issue.path.map(String).join("."),
+    message: issue.message,
+    code: issue.code,
+  }));
+}
+
+/**
+ * Validates one raw JSONL line against the event union — the sole
+ * replacement for the spike's `JSON.parse(line) as ClaimEvent` cast
+ * (obligation 1). Never throws: every failure mode (malformed JSON, wrong
+ * field types, an unrecognized key, a non-ULID id, a `ts` outside its
+ * bounds, an unrecognized `event` kind) comes back as a structured
+ * `ParseEventResult`, never a thrown exception and never a silently-cast
+ * value — so a caller (dispatch 2's `read()`, dispatch 4's recovery
+ * tooling) can report *why* a specific line failed without having to
+ * re-derive it.
+ *
+ * On success, the returned `event` has already had its ticket-id-shaped
+ * fields canonicalized (lowercased) — obligation 3 — so nothing downstream
+ * needs to canonicalize again before using `ticket` (or `alias`'s
+ * `from`/`to`) as a key.
+ */
+export function parseEvent(line: string, options: ParseEventOptions = {}): ParseEventResult {
+  const now = options.now ?? Date.now();
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(line);
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    return {
+      ok: false,
+      error: {
+        reason: "invalid-json",
+        message: `line is not valid JSON: ${message}`,
+        issues: [{ path: "", message, code: "invalid_json" }],
+      },
+    };
+  }
+
+  const parsed = eventUnionSchema.safeParse(raw);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: {
+        reason: "schema-invalid",
+        message: "event failed schema validation",
+        issues: projectIssues(parsed.error.issues),
+      },
+    };
+  }
+
+  const event = parsed.data;
+  if (!isTsWithinBounds(event.ts, now)) {
+    return {
+      ok: false,
+      error: {
+        reason: "schema-invalid",
+        message: `ts ${event.ts} is outside the allowed window [${PROJECT_EPOCH}, now+24h]`,
+        issues: [{ path: "ts", message: "ts is outside the allowed window", code: "ts_out_of_bounds" }],
+      },
+    };
+  }
+
+  return { ok: true, event };
+}

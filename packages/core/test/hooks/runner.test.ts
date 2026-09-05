@@ -349,6 +349,106 @@ describe("obligation 3: the timeout kills the whole process group, including gra
     expect(result.timedOut).toBe(true);
     expect(result.exitCode).toBeNull();
   });
+
+  // --- Fix round 1, finding 1: the three required regression cases -------
+  //
+  // Root cause: the previous `killAfterTimeout` declared "done" (and
+  // disarmed the escalation SIGKILL) the instant the *direct child*
+  // exited, not when the whole process group was empty. All three cases
+  // below were confirmed to REDDEN against the pre-fix implementation
+  // (git stash of this file's `runGroupToCompletion` back to the old
+  // `killAfterTimeout`) before being restored -- see the task report's
+  // "Fix round 1" section for the exact commands and failing output.
+
+  test("finding 1, case 1: leader honours SIGTERM but a group member traps it -- the escalation SIGKILL still reaches the member", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cankan-hooks-f1-trap-"));
+    const gcFile = join(dir, "gcpid");
+    try {
+      // The direct child (`sh`, via `wait`) has no trap and dies on the
+      // first SIGTERM. The grandchild traps and ignores it, so only the
+      // escalation SIGKILL can end it. Its stdio is redirected away from
+      // the pipe so this test isolates finding 1's case (a) from case (b)/(c).
+      const command = [
+        "( trap '' TERM; sleep 300 ) >/dev/null 2>&1 &",
+        `echo $! > '${gcFile}'`,
+        "wait",
+      ].join("\n");
+
+      const result = await spawnHook({
+        layer: "repo",
+        file: "/fake/.cankan/config.yml",
+        command,
+        cwd: dir,
+        env: { PATH: process.env.PATH ?? "" },
+        timeoutMs: 100,
+      });
+
+      expect(result.timedOut).toBe(true);
+
+      const grandchildPid = Number((await readFile(gcFile, "utf8")).trim());
+      leakedPids.push(grandchildPid);
+
+      // Before the fix: the direct child's own exit (from the SIGTERM it
+      // does NOT trap) cleared the pending SIGKILL escalation before it
+      // could fire, so the trapping grandchild was never touched and
+      // stayed alive indefinitely.
+      const dead = await pollUntil(() => !isPidAlive(grandchildPid), 2_000, 20);
+      expect(dead).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("finding 1, case 2: leader exits promptly while a backgrounded grandchild holds the pipes -- runHooks returns within the timeout, not the grandchild's lifetime", async () => {
+    const cfg = fakeConfigResult([fakeLayer("repo", "/fake/.cankan/config.yml", { expire: "sleep 2 & exit 0" })]);
+    const startedAt = Date.now();
+    const outcomes = await runHooks({ cfg, event: "expire", repoRoot: process.cwd(), timeoutMs: 100 });
+    const elapsedMs = Date.now() - startedAt;
+
+    // Before the fix: the direct child's prompt `exit 0` satisfied
+    // `killAfterTimeout` immediately, and the subsequent unbounded
+    // `Promise.all([stdoutPromise, stderrPromise])` then blocked on the
+    // backgrounded `sleep 2`'s inherited (non-redirected) stdout pipe for
+    // its full 2-second lifetime, reporting `timedOut: false`.
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.timedOut).toBe(true);
+    expect(elapsedMs).toBeLessThan(1_500);
+  });
+
+  test("finding 1, case 3: leader exits promptly, grandchild redirects its own stdio and survives -- the group is not leaked", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cankan-hooks-f1-leak-"));
+    const gcFile = join(dir, "gcpid");
+    try {
+      // Stdio redirected away from the pipe -- the OLD code's stream-drain
+      // step alone could never have detected this grandchild, since the
+      // pipe closes as soon as the direct child exits regardless of it.
+      const command = ["sleep 5 >/dev/null 2>&1 &", `echo $! > '${gcFile}'`, "exit 0"].join("\n");
+
+      const startedAt = Date.now();
+      const result = await spawnHook({
+        layer: "repo",
+        file: "/fake/.cankan/config.yml",
+        command,
+        cwd: dir,
+        env: { PATH: process.env.PATH ?? "" },
+        timeoutMs: 100,
+      });
+      const elapsedMs = Date.now() - startedAt;
+
+      const grandchildPid = Number((await readFile(gcFile, "utf8")).trim());
+      leakedPids.push(grandchildPid);
+
+      // Before the fix: this returned in ~2ms with `timedOut: false`,
+      // having never looked at the process group at all -- the
+      // grandchild ran unmanaged for its full natural lifetime.
+      expect(result.timedOut).toBe(true);
+      expect(elapsedMs).toBeLessThan(2_000);
+      const dead = await pollUntil(() => !isPidAlive(grandchildPid), 2_000, 20);
+      expect(dead).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("obligation 2: the five env vars, argv shape, and captured streams", () => {
@@ -478,16 +578,57 @@ describe("12. NUL-byte probe (task brief §5) -- Bun 1.4.0 rejects both cases sy
     expect(result.exitCode).toBeNull();
   });
 
-  test("runHooks itself never throws for a NUL byte in $TITLE -- it surfaces as a captured outcome", async () => {
-    const cfg = fakeConfigResult([fakeLayer("repo", "/fake/.cankan/config.yml", { close: "true" })]);
-    const outcomes = await runHooks({
-      cfg,
-      event: "close",
-      repoRoot: process.cwd(),
-      title: "bad\0title",
-    });
-    expect(outcomes).toHaveLength(1);
-    expect(outcomes[0]?.errorCode).toBe(HooksErrorCodes.HOOK_SPAWN_FAILED);
+  test("runHooks strips a NUL byte from $TITLE at the env-merge boundary (fix round 1, finding 2) -- the hook still runs, not HOOK_SPAWN_FAILED", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cankan-hooks-nul-title-"));
+    try {
+      const outFile = join(dir, "title.txt");
+      const cfg = fakeConfigResult([
+        fakeLayer("repo", join(dir, ".cankan", "config.yml"), { close: `printf '%s' "$TITLE" > '${outFile}'` }),
+      ]);
+      const outcomes = await runHooks({
+        cfg,
+        event: "close",
+        repoRoot: dir,
+        title: "bad\0title",
+      });
+      // Before the fix, a NUL byte anywhere in $TITLE made `Bun.spawn`
+      // throw before anything started, suppressing this hook (and every
+      // other layer's hook for the same event) with HOOK_SPAWN_FAILED --
+      // the user's own hook penalized for hostile ticket content it never
+      // asked to see. Now it runs, with the NUL simply stripped.
+      expect(outcomes).toHaveLength(1);
+      expect(outcomes[0]?.errorCode).toBeUndefined();
+      expect(outcomes[0]?.exitCode).toBe(0);
+      expect(await readFile(outFile, "utf8")).toBe("badtitle");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("runHooks caps an oversized $TITLE at ENV_VALUE_MAX_BYTES (fix round 1, finding 2) rather than failing the hook", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cankan-hooks-huge-title-"));
+    try {
+      const outFile = join(dir, "title-len.txt");
+      const cfg = fakeConfigResult([
+        fakeLayer("repo", join(dir, ".cankan", "config.yml"), {
+          close: `printf '%s' "$TITLE" | wc -c > '${outFile}'`,
+        }),
+      ]);
+      // 2 MB, well past any single-string exec limit and the module's own
+      // 4096-byte cap -- probed (task report / findings file) to make
+      // Bun.spawn fail outright before this fix.
+      const hugeTitle = "x".repeat(2 * 1024 * 1024);
+      const outcomes = await runHooks({ cfg, event: "close", repoRoot: dir, title: hugeTitle });
+
+      expect(outcomes).toHaveLength(1);
+      expect(outcomes[0]?.errorCode).toBeUndefined();
+      expect(outcomes[0]?.exitCode).toBe(0);
+      const reportedLength = Number((await readFile(outFile, "utf8")).trim());
+      expect(reportedLength).toBeLessThanOrEqual(4096);
+      expect(reportedLength).toBeGreaterThan(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -28,14 +28,26 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdir, open, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { stringify } from "yaml";
 import { z } from "zod";
 import { ConfigErrorCodes } from "../config/index";
+// Deliberate deeper-than-contract import: `loadValidatedLayer` is exported
+// from `config/layers.ts` but not re-exported through `config/index.ts`'s
+// frozen public surface. Reused here (see `readRegistryRaw` below -- the
+// *only* call site in this file) rather than re-deriving its YAML guards,
+// most notably the alias/anchor self-reference cycle fix M2.3 shipped
+// after a real repo-crashing bug: `config` is in M2.4's *Depends on* list,
+// PLAN.md rule 2 is written at module granularity (not "one file per
+// module"), and re-deriving the guard is exactly what the M2.4 brief
+// asked this dispatch not to do. Funneled through exactly one function so
+// a future change to `loadValidatedLayer`'s signature breaks in one place
+// here, not scattered across this file.
 import { loadValidatedLayer } from "../config/layers";
 import { CanKanError, isCanKanError } from "../errors";
 import { BoardErrorCodes } from "./errors";
+import { resolvePersonalBoardPath } from "./personal";
 import { resolveDataHome } from "./xdg";
 
 // ---------------------------------------------------------------------------
@@ -44,8 +56,8 @@ import { resolveDataHome } from "./xdg";
 
 /**
  * `--board personal|repo|all` are selectors (CONCEPT.md §6c), not
- * registrable names -- a registered board named `personal` would shadow
- * the personal board.
+ * registrable names -- a registered board named `personal` (in any
+ * casing) would shadow the personal board.
  */
 const RESERVED_BOARD_NAMES: ReadonlySet<string> = new Set(["personal", "repo", "all"]);
 
@@ -53,17 +65,20 @@ const RESERVED_BOARD_NAMES: ReadonlySet<string> = new Set(["personal", "repo", "
 const DRIVE_LETTER_PREFIX = /^[A-Za-z]:/;
 
 /**
- * A board name must be an opaque identifier: no path separators (`/` or
- * `\`), no `.` or `..`, no absolute path, no NUL or control characters, not
- * empty, no Windows drive-letter prefix, and not one of the reserved
- * selector names. Checked unconditionally rather than via
- * `process.platform` -- PLAN.md ships a `win-x64` build target, and a
- * registry entry hand-authored (or corrupted) on one platform must be
- * judged the same way on every other.
+ * A board name must be an opaque identifier: no leading/trailing
+ * whitespace, no path separators (`/` or `\`), no `.` or `..`, no
+ * absolute path, no NUL or control characters, not empty, no Windows
+ * drive-letter prefix, and not one of the reserved selector names
+ * (matched case-insensitively -- `Personal`, `PERSONAL`, and `"  personal
+ * "` are all refused, not just the exact lowercase spelling). Checked
+ * unconditionally rather than via `process.platform` -- PLAN.md ships a
+ * `win-x64` build target, and a registry entry hand-authored (or
+ * corrupted) on one platform must be judged the same way on every other.
  */
 export function isValidBoardName(name: string): boolean {
   if (name.length === 0) return false;
-  if (RESERVED_BOARD_NAMES.has(name)) return false;
+  if (name.trim() !== name) return false;
+  if (RESERVED_BOARD_NAMES.has(name.toLowerCase())) return false;
   if (name === "." || name === "..") return false;
   if (name.includes("/") || name.includes("\\")) return false;
   if (DRIVE_LETTER_PREFIX.test(name)) return false;
@@ -127,6 +142,30 @@ function requireRegistryPath(env: Readonly<Record<string, string | undefined>>):
   return registryPath;
 }
 
+async function ensureRegistryDir(registryPath: string): Promise<void> {
+  await mkdir(dirname(registryPath), { recursive: true });
+}
+
+/**
+ * The personal board's own canonical path, or `undefined` when it cannot
+ * be resolved (no data home) or does not exist yet (nothing to collide
+ * with -- `register()`'s `targetPath` is already realpath'd, so it can
+ * never equal a path that does not exist). Used by both `register()` (F7:
+ * refuse registering the personal board as a repo board) and
+ * `listRegisteredBoards` (F7: skip a hand-edited entry that points at it).
+ */
+async function resolveCanonicalPersonalPath(
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<string | undefined> {
+  const raw = resolvePersonalBoardPath(env);
+  if (!raw) return undefined;
+  try {
+    return await realpath(raw);
+  } catch {
+    return undefined;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Reading (R16-style guard reuse -- see the note on `readRegistryRaw` below)
 // ---------------------------------------------------------------------------
@@ -145,21 +184,18 @@ function isEExist(err: unknown): boolean {
  * error).
  *
  * Reuses `config/layers.ts`'s `loadValidatedLayer` wholesale rather than
- * re-deriving its guards -- a **non-contract import** (`config/index.ts`'s
- * frozen public surface does not re-export it; this reaches one level
- * deeper, which M2.1's root `index.ts` sanctions the same way `resolve.ts`
- * importing `../errors` directly does). That one call gets, for free: the
- * "always our own message, never the YAML parser's" syntax-error text
- * (R16 -- the credential-leak mitigation), the alias/anchor self-reference
- * cycle guard added after M2.3's own repo-crashing bug, and a
- * `${absPath}: ...` validation-failure message built from `zod` issue
- * paths, never from `issue.message`. The `"global"` first argument is a
- * throwaway label -- `loadValidatedLayer`'s `LoadedLayer.layer` field is
- * discarded entirely below; `repos.yml` is not a config layer, but the
- * function's read/parse/validate machinery is identical for any YAML file
- * validated against a zod schema, and "global" (a user's own file, not
- * repo-controlled) is also the accurate choice for `rejectSymlink: false`
- * below.
+ * re-deriving its guards -- see the comment at this file's import of it,
+ * above. That one call gets, for free: the "always our own message,
+ * never the YAML parser's" syntax-error text (R16 -- the credential-leak
+ * mitigation), the alias/anchor self-reference cycle guard added after
+ * M2.3's own repo-crashing bug, and a `${absPath}: ...` validation-failure
+ * message built from `zod` issue paths, never from `issue.message`. The
+ * `"global"` first argument is a throwaway label -- `loadValidatedLayer`'s
+ * `LoadedLayer.layer` field is discarded entirely below; `repos.yml` is
+ * not a config layer, but the function's read/parse/validate machinery is
+ * identical for any YAML file validated against a zod schema, and
+ * "global" (a user's own file, not repo-controlled) is also the accurate
+ * choice for `rejectSymlink: false` below.
  *
  * `loadValidatedLayer` throws with `ConfigErrorCodes.INVALID_CONFIG` on
  * failure; rewrapped here as `BoardErrorCodes.REGISTRY_INVALID` (same
@@ -212,9 +248,10 @@ function toEntry(raw: RawRegistryEntry): RegistryEntry {
 
 /**
  * Lists every board in the registry, split into `boards` (directory
- * confirmed present) and `skipped` (directory missing, or not a
- * directory) -- one bad entry never breaks the read for every other one.
- * `--board all` (dispatch B) consumes `boards`; `--board <name>` can
+ * confirmed present) and `skipped` (directory missing, not a directory,
+ * or -- F7 -- the personal board's own path smuggled into a hand-edited
+ * `repos.yml`) -- one bad entry never breaks the read for every other
+ * one. `--board all` (dispatch B) consumes `boards`; `--board <name>` can
  * filter `boards` by name, or use `findRegisteredBoard` below directly.
  *
  * Returns an empty listing (never throws) when no registry file exists,
@@ -228,10 +265,15 @@ export async function listRegisteredBoards(
     return { boards: [], skipped: [] };
   }
   const raw = await readRegistryRaw(registryPath);
+  const personalPath = await resolveCanonicalPersonalPath(env);
 
   const boards: RegistryEntry[] = [];
   const skipped: SkippedRegistryEntry[] = [];
   for (const entry of raw.repos) {
+    if (personalPath !== undefined && entry.path === personalPath) {
+      skipped.push({ name: entry.name, path: entry.path, reason: "is the personal board" });
+      continue;
+    }
     try {
       const stats = await stat(entry.path);
       if (!stats.isDirectory()) {
@@ -255,12 +297,13 @@ export async function listRegisteredBoards(
  * found" for "not a legal board name to look up."
  *
  * A name that *is* registered but whose directory `listRegisteredBoards`
- * had to skip (deleted, or no longer a directory) is **not** treated the
- * same as "never registered": returning `undefined` for it would be
- * exactly the silent-drop the brief's robustness requirements forbid, on
- * the one read path `--board <name>` actually uses. Instead this throws a
- * typed `BOARD_DIRECTORY_MISSING` error naming the path and the reason, so
- * a caller can tell "api is registered but its directory vanished" apart
+ * had to skip (deleted, no longer a directory, or found to be the
+ * personal board) is **not** treated the same as "never registered":
+ * returning `undefined` for it would be exactly the silent-drop the
+ * brief's robustness requirements forbid, on the one read path
+ * `--board <name>` actually uses. Instead this throws a typed
+ * `BOARD_DIRECTORY_MISSING` error naming the path and the reason, so a
+ * caller can tell "api is registered but its directory vanished" apart
  * from "api was never registered."
  */
 export async function findRegisteredBoard(
@@ -287,17 +330,40 @@ export async function findRegisteredBoard(
 }
 
 // ---------------------------------------------------------------------------
-// Writing: atomic (temp + rename), guarded by an O_EXCL lockfile with
-// bounded, stale-breaking retry around the whole read-modify-write.
+// Writing: atomic (temp + rename), guarded by an identity-bearing,
+// O_EXCL lockfile with bounded, stale-breaking retry around the whole
+// read-modify-write.
 // ---------------------------------------------------------------------------
 
+// LOCK_TIMEOUT_MS is deliberately *less* than LOCK_STALE_MS: a `register()`
+// call that starts while a lock is merely fresh (not yet stale) and whose
+// holder then crashes will itself time out with REGISTRY_LOCK_TIMEOUT
+// rather than wait out the full staleness window -- the *next* call
+// breaks the (by-then) stale lock immediately, so the system recovers
+// within one retry cycle rather than one call. Raising the timeout to
+// `>= LOCK_STALE_MS` would make every call self-heal in a single attempt,
+// at the cost of a live (non-crashed) contender blocking its caller
+// longer before reporting anything back. Accepted trade-off, not
+// re-litigated per call site.
 const LOCK_STALE_MS = 10_000;
 const LOCK_RETRY_DELAY_MS = 25;
 const LOCK_TIMEOUT_MS = 5_000;
+const MAX_LOCK_LOST_RETRIES = 3;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+async function readLockToken(lockPath: string): Promise<string | undefined> {
+  try {
+    return await readFile(lockPath, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+/** Thrown internally when a held lock is confirmed lost mid-write; `register()` retries the whole attempt on this, never surfaces it. */
+class LockLostError extends Error {}
 
 /**
  * Guards the read-modify-write in `register()` with an `O_EXCL` lockfile
@@ -308,38 +374,97 @@ function sleep(ms: number): Promise<void> {
  * one silently clobbering the other's row on write. This lock serializes
  * the whole read-modify-write instead.
  *
- * A stale lock (older than `LOCK_STALE_MS` -- e.g. a process crashed
- * holding it) is broken by age, but breaking it naively is itself racy:
- * if two waiters both see the same stale lock and both `unlink` it, both
- * can end up believing they hold it. The fix is to `rename` the stale
- * lock to a private name before removing it -- `rename` is atomic, so
- * exactly one racing waiter's rename succeeds (the loser gets `ENOENT`
- * and loops back to retry acquisition fresh); only the winner unlinks the
- * file it renamed and then retries.
+ * The lockfile is **identity-bearing**: a random UUID token is written
+ * into it at acquisition. This closes two independent ways two processes
+ * could otherwise both believe they hold the lock (found in review):
+ *
+ * - **Stealing a fresh lock.** Breaking a lock naively by age (`stat`,
+ *   then `unlink` if old) races: between the `stat` that judges staleness
+ *   and the action that claims it, the original holder can finish and
+ *   release, and a *third* process can acquire a brand-new lock at the
+ *   same path -- the waiter then breaks that fresh lock by mistake. Fixed
+ *   by `rename`-ing the file to a private name first (atomic, so only one
+ *   racing waiter's rename can land the same target), then re-reading the
+ *   token from the renamed copy and comparing it to the token observed
+ *   before the rename: a mismatch means a fresh lock was stolen, not a
+ *   stale one broken. In that case the stolen lock is put back with
+ *   `link(private, lockPath)` -- **never `rename`** -- because `link`
+ *   fails `EEXIST` if the path is occupied again by then, so restoring a
+ *   mistakenly-stolen lock can never clobber whoever holds it *now*; a
+ *   plain `rename` would silently overwrite them.
+ * - **Unlinking someone else's lock.** A holder that overran the
+ *   staleness window (and so had its lock broken by a waiter) must not
+ *   then delete the *next* holder's lockfile in its own `finally`. Fixed
+ *   by reading the token back immediately before unlinking and comparing
+ *   it to the token this call wrote at acquisition -- only unlink if it
+ *   still reads back as ours.
+ *
+ * A residual TOCTOU window remains between the staleness `stat`/token
+ * read and the `rename` that claims it -- closing it fully would need an
+ * atomic "compare-and-break" primitive the filesystem does not offer
+ * here, the same class of accepted residual `config/layers.ts`'s own
+ * `assertNotSymlink` documents. Worst case here is losing one registry
+ * row after a stall longer than `LOCK_STALE_MS`, never corruption: `fn`
+ * is handed `assertStillHeld` (below) to re-check identity immediately
+ * before the registry `rename` that actually publishes its write, and
+ * `register()` retries the whole read-modify-write (bounded by
+ * `MAX_LOCK_LOST_RETRIES`) rather than publish a write made under a lock
+ * it no longer holds.
  */
-async function withRegistryLock<T>(registryPath: string, fn: () => Promise<T>): Promise<T> {
+async function withRegistryLock<T>(
+  registryPath: string,
+  fn: (assertStillHeld: () => Promise<void>) => Promise<T>,
+): Promise<T> {
   const lockPath = `${registryPath}.lock`;
-  await mkdir(dirname(registryPath), { recursive: true });
-
+  const myToken = randomUUID();
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
+
   for (;;) {
     try {
       const handle = await open(lockPath, "wx");
+      await handle.writeFile(myToken);
       await handle.close();
       break;
     } catch (err) {
       if (!isEExist(err)) throw err;
 
+      const observedToken = await readLockToken(lockPath);
       const stats = await stat(lockPath).catch(() => undefined);
-      if (stats && Date.now() - stats.mtimeMs > LOCK_STALE_MS) {
+      if (observedToken !== undefined && stats && Date.now() - stats.mtimeMs > LOCK_STALE_MS) {
         const stalePath = `${lockPath}.stale-${randomUUID()}`;
         try {
           await rename(lockPath, stalePath);
-          await unlink(stalePath);
         } catch (renameErr) {
           if (!isEnoent(renameErr)) throw renameErr;
+          continue; // already gone -- retry acquisition from scratch
         }
-        continue; // retry acquiring immediately -- no need to sleep first
+
+        const renamedToken = await readLockToken(stalePath);
+        if (renamedToken !== observedToken) {
+          // We renamed away a *fresh* lock a new holder created in the
+          // gap between our stat/token-read and this rename -- give it
+          // back without risking a clobber (see docstring).
+          try {
+            await link(stalePath, lockPath);
+          } catch (linkErr) {
+            if (!isEExist(linkErr)) throw linkErr;
+            // Someone else already re-occupies `lockPath` -- fine, our
+            // stolen copy is simply discarded below.
+          }
+          await unlink(stalePath).catch(() => {});
+        } else {
+          // Confirmed genuinely stale -- discard it and retry acquisition.
+          await unlink(stalePath).catch(() => {});
+        }
+
+        if (Date.now() > deadline) {
+          throw new CanKanError(
+            BoardErrorCodes.REGISTRY_LOCK_TIMEOUT,
+            `${registryPath}: timed out waiting for another process to finish updating the board registry`,
+            { details: { file: registryPath } },
+          );
+        }
+        continue;
       }
 
       if (Date.now() > deadline) {
@@ -353,16 +478,25 @@ async function withRegistryLock<T>(registryPath: string, fn: () => Promise<T>): 
     }
   }
 
+  const assertStillHeld = async (): Promise<void> => {
+    const current = await readLockToken(lockPath);
+    if (current !== myToken) {
+      throw new LockLostError(`${registryPath}: lost the registry lock to another process mid-write`);
+    }
+  };
+
   try {
-    return await fn();
+    return await fn(assertStillHeld);
   } finally {
-    await unlink(lockPath).catch(() => {});
+    const current = await readLockToken(lockPath);
+    if (current === myToken) {
+      await unlink(lockPath).catch(() => {});
+    }
   }
 }
 
 async function writeRegistryAtomic(registryPath: string, data: RawRegistryFile): Promise<void> {
   const dir = dirname(registryPath);
-  await mkdir(dir, { recursive: true });
   const tmpPath = join(dir, `.repos.yml.tmp-${randomUUID()}`);
   await writeFile(tmpPath, stringify(data), "utf8");
   await rename(tmpPath, registryPath);
@@ -379,6 +513,18 @@ async function writeRegistryAtomic(registryPath: string, data: RawRegistryFile):
  * duplicate row. A `name` already bound, in the registry, to a
  * *different* path is rejected (`BoardErrorCodes.BOARD_NAME_TAKEN`) --
  * otherwise two different repos could silently fight over one name.
+ *
+ * F7: refuses to register the personal board's own directory as a repo
+ * board -- otherwise `--board <name>` could resolve a repo selector to
+ * the personal board, defeating CONCEPT.md §6c's privacy default ("repo
+ * boards never read the personal board unless `--board all`").
+ *
+ * Retries the whole read-modify-write, up to `MAX_LOCK_LOST_RETRIES`
+ * times, if `withRegistryLock`'s `assertStillHeld` determines the lock
+ * was lost mid-write (see that function's docstring) -- this is expected
+ * to be exceedingly rare (it requires overrunning `LOCK_STALE_MS` while
+ * still holding the lock) and self-resolves on retry rather than
+ * surfacing a spurious failure to the caller.
  */
 export async function register(
   name: string,
@@ -389,34 +535,55 @@ export async function register(
     throw invalidNameError(name);
   }
   const canonicalPath = await realpath(targetPath);
+  const personalPath = await resolveCanonicalPersonalPath(env);
+  if (personalPath !== undefined && canonicalPath === personalPath) {
+    throw new CanKanError(
+      BoardErrorCodes.CANNOT_REGISTER_PERSONAL_BOARD,
+      `cannot register the personal board (${canonicalPath}) as a repo board`,
+      { details: { path: canonicalPath } },
+    );
+  }
   const registryPath = requireRegistryPath(env);
+  await ensureRegistryDir(registryPath);
 
-  return withRegistryLock(registryPath, async () => {
-    const raw = await readRegistryRaw(registryPath);
-    const repos = [...raw.repos];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await withRegistryLock(registryPath, async (assertStillHeld) => {
+        const raw = await readRegistryRaw(registryPath);
+        const repos = [...raw.repos];
 
-    const conflicting = repos.find((entry) => entry.name === name && entry.path !== canonicalPath);
-    if (conflicting) {
-      throw new CanKanError(
-        BoardErrorCodes.BOARD_NAME_TAKEN,
-        `board name "${name}" is already registered to a different path (${conflicting.path})`,
-        { details: { name, existingPath: conflicting.path, requestedPath: canonicalPath } },
-      );
+        const conflicting = repos.find((entry) => entry.name === name && entry.path !== canonicalPath);
+        if (conflicting) {
+          throw new CanKanError(
+            BoardErrorCodes.BOARD_NAME_TAKEN,
+            `board name "${name}" is already registered to a different path (${conflicting.path})`,
+            { details: { name, existingPath: conflicting.path, requestedPath: canonicalPath } },
+          );
+        }
+
+        const entry: RawRegistryEntry = {
+          name,
+          path: canonicalPath,
+          last_seen: new Date().toISOString(),
+        };
+        const existingIndex = repos.findIndex((e) => e.path === canonicalPath);
+        if (existingIndex >= 0) {
+          repos[existingIndex] = entry;
+        } else {
+          repos.push(entry);
+        }
+
+        // Re-check lock identity immediately before the write that
+        // actually publishes -- see `withRegistryLock`'s docstring.
+        await assertStillHeld();
+        await writeRegistryAtomic(registryPath, { version: 1, repos });
+        return toEntry(entry);
+      });
+    } catch (err) {
+      if (err instanceof LockLostError && attempt < MAX_LOCK_LOST_RETRIES) {
+        continue;
+      }
+      throw err;
     }
-
-    const entry: RawRegistryEntry = {
-      name,
-      path: canonicalPath,
-      last_seen: new Date().toISOString(),
-    };
-    const existingIndex = repos.findIndex((e) => e.path === canonicalPath);
-    if (existingIndex >= 0) {
-      repos[existingIndex] = entry;
-    } else {
-      repos.push(entry);
-    }
-
-    await writeRegistryAtomic(registryPath, { version: 1, repos });
-    return toEntry(entry);
-  });
+  }
 }

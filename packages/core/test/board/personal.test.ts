@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -85,6 +85,30 @@ describe("ensurePersonalBoard -- lazy, idempotent creation", () => {
       expect(a.board.ticketsDir).toBe(b.board.ticketsDir);
       const createdFlags = [a.created, b.created].sort();
       expect(createdFlags).toEqual([false, true]);
+    });
+  });
+
+  test("F6: the board root is created 0700, not the platform mkdir default", async () => {
+    await withEnv(undefined, async () => {
+      const result = await ensurePersonalBoard({ env: hermeticEnv() });
+      const stats = await stat(result.board.root);
+      expect(stats.mode & 0o777).toBe(0o700);
+    });
+  });
+
+  test("F10: <root>/.cankan/ is created as part of the skeleton", async () => {
+    await withEnv(undefined, async () => {
+      const result = await ensurePersonalBoard({ env: hermeticEnv() });
+      const stats = await stat(join(result.board.root, ".cankan"));
+      expect(stats.isDirectory()).toBe(true);
+    });
+  });
+
+  test("ticketsDir actually exists on disk after ensurePersonalBoard (this function creates it; buildBoardRef itself no longer does)", async () => {
+    await withEnv(undefined, async () => {
+      const result = await ensurePersonalBoard({ env: hermeticEnv() });
+      const stats = await stat(result.board.ticketsDir);
+      expect(stats.isDirectory()).toBe(true);
     });
   });
 });

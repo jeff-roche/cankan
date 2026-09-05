@@ -40,4 +40,21 @@ export const BoardErrorCodes = {
    * symlinked intermediate path component.
    */
   TICKETS_DIR_ESCAPES_BOARD: "TICKETS_DIR_ESCAPES_BOARD",
+  /**
+   * `tickets_dir` is a value the filesystem itself cannot represent (an
+   * embedded NUL byte, a component long enough to trip `ENAMETOOLONG`,
+   * ...). `tickets_dir` is deliberately unvalidated by `config/schema.ts`
+   * -- ADR 0002 assigns this class of check to `board/ref.ts` -- so this
+   * is where a raw platform error (a `TypeError`, or a bare `Error` with
+   * `code: "ENAMETOOLONG"`) gets wrapped into something
+   * `isCanKanError`/M3.10's exit-code map can see.
+   */
+  TICKETS_DIR_INVALID: "TICKETS_DIR_INVALID",
+  /**
+   * `register()` refused to register the personal board's own directory
+   * as a repo board -- doing so would let `--board <name>` resolve a repo
+   * selector to the personal board, defeating CONCEPT.md §6c's privacy
+   * default.
+   */
+  CANNOT_REGISTER_PERSONAL_BOARD: "CANNOT_REGISTER_PERSONAL_BOARD",
 } as const;

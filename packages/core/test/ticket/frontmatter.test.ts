@@ -159,6 +159,43 @@ describe("setCankanBlock — the disposable-cache rebuild path", () => {
     expect(output.endsWith("## Description\nHand-written probe ticket for M1.3 read-tolerance testing.\n\n## Acceptance Criteria\n- [ ] Returns 429 above 100 req/min per key\n- [ ] Documented in API reference\n")).toBe(true);
   });
 
+  test("replaces with a full CONCEPT.md-shaped block (nested sync map, deps array, aliases array) and reparses to the same shape", () => {
+    const parsed = parseTicketFile(PROBE2_BEFORE_EDIT);
+    const fullBlock = {
+      origin: "jira:PROJ-45",
+      display_id: "PROJ-45",
+      sync: {
+        state: "ahead",
+        base_hash: "3c9fabc",
+        pulled_at: "2026-09-04T10:12:00Z",
+        url: "https://acme.atlassian.net/browse/PROJ-45",
+      },
+      deps: [
+        { type: "blocks", id: "ck-2b1e44" },
+        { type: "discovered-from", id: "ck-91ab02" },
+      ],
+      aliases: ["TASK-12"],
+    };
+    const mutated = setCankanBlock(parsed, fullBlock);
+
+    // The rebuild path must round-trip through reparsing: what comes back
+    // out of `frontmatter.cankan` must deep-equal what was set, proving the
+    // nested-map/seq indentation survived `stringify` + `indentBlock`.
+    expect(mutated.frontmatter.cankan).toEqual(fullBlock);
+
+    const output = serializeTicketFile(mutated);
+    expect(
+      output.startsWith(
+        "---\nid: ck-a1b2c3\ntitle: Some title\nstatus: To Do\nassignee: []\nlabels: []\ndependencies: []\ncreated_date: '2026-09-04 22:00'\nordinal: 1000\n",
+      ),
+    ).toBe(true);
+    expect(
+      output.endsWith(
+        "## Description\nHand-written probe ticket for M1.3 read-tolerance testing.\n\n## Acceptance Criteria\n- [ ] Returns 429 above 100 req/min per key\n- [ ] Documented in API reference\n",
+      ),
+    ).toBe(true);
+  });
+
   test("adds a cankan: block to a ticket that has none, just before the closing delimiter", () => {
     const parsed = parseTicketFile(PROBE2_AFTER_EDIT);
     const mutated = setCankanBlock(parsed, { display_id: "PROJ-1" });

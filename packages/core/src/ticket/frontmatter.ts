@@ -1,6 +1,6 @@
 import matter from "gray-matter";
 import { type ParsedNode, type Scalar, isMap, isScalar, parseDocument, stringify } from "yaml";
-import { CanKanError } from "../errors";
+import { CanKanError, ErrorCodes } from "../errors";
 import { TicketErrorCodes } from "./errors";
 import { type CankanBlock, type TicketFrontmatter, ticketFrontmatterSchema } from "./schema";
 
@@ -259,11 +259,10 @@ function isInternal(ticket: ParsedTicket): ticket is InternalParsedTicket {
 function requireSplit(ticket: ParsedTicket): TicketFileSplit {
   if (!isInternal(ticket)) {
     // Cannot happen for a `ParsedTicket` obtained from `parseTicketFile` —
-    // guards against a hand-built object smuggled past the type system.
-    throw new CanKanError(
-      TicketErrorCodes.FRONTMATTER_MALFORMED,
-      "Not a ticket parsed by parseTicketFile",
-    );
+    // guards against a hand-built object smuggled past the type system. A
+    // caller error, not malformed frontmatter, so it raises the shared
+    // `USAGE` code rather than a `ticket/`-local one.
+    throw new CanKanError(ErrorCodes.USAGE, "Not a ticket parsed by parseTicketFile");
   }
   return ticket.split;
 }

@@ -85,27 +85,94 @@ export interface ResolveActorOptions {
 }
 
 // ---------------------------------------------------------------------------
-// The grammar (R-9): `actor := [ tool ":" ] name [ "/" context ]`.
+// The grammar (R-9, as amended by R-11): `actor := [ tool ":" ] name [ "/" context ]`.
+//
+// **R-11 supersedes R-9's whitespace clause only** -- everything else in R-9
+// stands (this shape, non-empty segments, no `:`/`/` inside a segment,
+// context-without-tool rejected). R-9's original "no whitespace in any
+// segment" made CONCEPT.md's own documented default -- `actor` "defaults to
+// git user.name", and a conventional `user.name` is "Firstname Lastname" --
+// unrepresentable; probing `tryParseActor` against `makeTempRepo()`'s real
+// fixture (`"CanKan Test"`) proved it. R-11's fix:
+//
+//   1. The `name` segment may contain internal `U+0020` spaces,
+//      unconditionally (with or without a tool) -- a state-dependent rule
+//      ("only when there is no tool") would make `"claude-code:Jeff Roche"`
+//      illegal while `"Jeff Roche"` alone is legal, with no principle a
+//      user editing `local.yml` could predict.
+//   2. `tool` and `context` may not contain whitespace at all -- they are
+//      machine identifiers, and also appear in queue glob patterns
+//      (`actors: ["codex:*"]`).
+//   3. Leading/trailing whitespace stays malformed everywhere -- on the
+//      whole value and on every individual segment (`"claude-code: alice"`
+//      and `" alice"` both remain errors).
+//   4. Every whitespace character other than plain `U+0020` (tab, newline,
+//      CR, VT, FF, NBSP, and the other Unicode space separators), and every
+//      Unicode control (`\p{Cc}`) or format (`\p{Cf}`) character, stays
+//      rejected everywhere. The actor is the attribution key in an
+//      append-only JSONL log (CONCEPT §3): a newline inside an actor is a
+//      log-injection vector against M2.7's format, and a `\p{Cf}` bidi
+//      override or zero-width joiner yields a visually identical but
+//      distinct actor string -- attribution spoofing in a record that is
+//      never rewritten.
+//
+// R-8 ("empty is malformed, not absent") still falls out for free: `""`
+// and `"   "` still fail the empty/leading-trailing-whitespace checks
+// below, unchanged by any of this.
 // ---------------------------------------------------------------------------
 
-/**
- * A segment character is forbidden (R-9) if it is whitespace, a C0/DEL
- * control character, `:`, or `/`. Checked by char code rather than a
- * `\x00-\x1F` regex range -- biome's `noControlCharactersInRegex` rejects a
- * literal control-character escape inside a character class outright, and
- * a per-character code check is no less clear here.
- */
-function isForbiddenSegmentChar(ch: string): boolean {
-  const code = ch.charCodeAt(0);
-  return ch === ":" || ch === "/" || /\s/.test(ch) || code <= 0x1f || code === 0x7f;
+/** Any Unicode control (`\p{Cc}`) or format (`\p{Cf}`) character -- R-11
+ *  point 4. A property-escape regex, not a literal control-character
+ *  range, so biome's `noControlCharactersInRegex` does not flag it. */
+function isControlOrFormatChar(ch: string): boolean {
+  return /\p{Cc}|\p{Cf}/u.test(ch);
 }
 
-function isValidSegment(segment: string): boolean {
+/** Any whitespace character (JS's `\s`, which already covers NBSP and the
+ *  other Unicode space separators) other than a plain ASCII space -- R-11
+ *  point 4's "every whitespace character other than U+0020". */
+function isNonSpaceWhitespace(ch: string): boolean {
+  return ch !== " " && /\s/.test(ch);
+}
+
+/** Whether `ch` is forbidden inside a segment. `allowInternalSpace` is
+ *  `true` only for the `name` segment (R-11 point 1); `tool`/`context`
+ *  reject a plain space exactly like every other whitespace character
+ *  (R-11 point 2). */
+function isForbiddenSegmentChar(ch: string, allowInternalSpace: boolean): boolean {
+  if (ch === ":" || ch === "/") {
+    return true;
+  }
+  if (isControlOrFormatChar(ch)) {
+    return true;
+  }
+  if (isNonSpaceWhitespace(ch)) {
+    return true;
+  }
+  return ch === " " && !allowInternalSpace;
+}
+
+function hasLeadingOrTrailingWhitespace(value: string): boolean {
+  return /^\s/.test(value) || /\s$/.test(value);
+}
+
+/**
+ * A segment is valid if it is non-empty, has no leading/trailing
+ * whitespace of its own (R-11 point 3 -- checked per segment, not only on
+ * the whole raw value, so `"claude-code: alice"`'s leading space on `name`
+ * is still caught even though the whole string's own edges are clean), and
+ * contains no forbidden character. `allowInternalSpace` defaults to
+ * `false` for `tool`/`context`; only the `name` segment passes `true`.
+ */
+function isValidSegment(segment: string, allowInternalSpace = false): boolean {
   if (segment.length === 0) {
     return false;
   }
+  if (hasLeadingOrTrailingWhitespace(segment)) {
+    return false;
+  }
   for (const ch of segment) {
-    if (isForbiddenSegmentChar(ch)) {
+    if (isForbiddenSegmentChar(ch, allowInternalSpace)) {
       return false;
     }
   }
@@ -119,6 +186,18 @@ interface ParseFailure {
 interface ParseSuccess {
   readonly actor: Actor;
 }
+
+/** The reason reported for an invalid `tool` or `context` segment (R-11
+ *  point 2: no whitespace allowed at all). */
+const MACHINE_SEGMENT_REASON =
+  'must be non-empty, must not have leading or trailing whitespace, and must contain no ' +
+  'whitespace, control/format characters, ":", or "/"';
+
+/** The reason reported for an invalid `name` segment (R-11 point 1: an
+ *  internal `U+0020` space is the one whitespace character it may carry). */
+const NAME_SEGMENT_REASON =
+  'must be non-empty, must not have leading or trailing whitespace, and must contain no ":", ' +
+  '"/", control/format characters, or whitespace other than a single internal space (U+0020)';
 
 /**
  * The grammar walk, returning a reason string on failure rather than
@@ -141,7 +220,7 @@ function tryParseActor(raw: string): ParseSuccess | ParseFailure {
   if (raw.length === 0) {
     return { reason: "actor value must not be empty" };
   }
-  if (/^\s/.test(raw) || /\s$/.test(raw)) {
+  if (hasLeadingOrTrailingWhitespace(raw)) {
     return { reason: "actor value must not have leading or trailing whitespace" };
   }
 
@@ -155,10 +234,7 @@ function tryParseActor(raw: string): ParseSuccess | ParseFailure {
       return { reason: 'actor value must contain at most one ":"' };
     }
     if (!isValidSegment(tool)) {
-      return {
-        reason:
-          'tool segment must be non-empty and contain no whitespace, control characters, ":", or "/"',
-      };
+      return { reason: `tool segment ${MACHINE_SEGMENT_REASON}` };
     }
   }
 
@@ -172,18 +248,14 @@ function tryParseActor(raw: string): ParseSuccess | ParseFailure {
       return { reason: 'actor value must contain at most one "/"' };
     }
     if (!isValidSegment(context)) {
-      return {
-        reason:
-          'context segment must be non-empty and contain no whitespace, control characters, ":", or "/"',
-      };
+      return { reason: `context segment ${MACHINE_SEGMENT_REASON}` };
     }
   }
 
-  if (!isValidSegment(name)) {
-    return {
-      reason:
-        'name segment must be non-empty and contain no whitespace, control characters, ":", or "/"',
-    };
+  // R-11 point 1: `name` is the one segment that may contain an internal
+  // space, whether or not a tool is present.
+  if (!isValidSegment(name, true)) {
+    return { reason: `name segment ${NAME_SEGMENT_REASON}` };
   }
 
   if (tool === null && context !== null) {

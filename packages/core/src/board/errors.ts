@@ -57,4 +57,12 @@ export const BoardErrorCodes = {
    * default.
    */
   CANNOT_REGISTER_PERSONAL_BOARD: "CANNOT_REGISTER_PERSONAL_BOARD",
+  /**
+   * `register()` repeatedly lost the registry lock to another process
+   * mid-write (its `assertStillHeld` check kept failing) and exhausted
+   * `MAX_LOCK_LOST_RETRIES`. Distinct from `REGISTRY_LOCK_TIMEOUT`, which
+   * is "never acquired the lock at all" -- this is "held it, then lost it,
+   * repeatedly, before ever publishing a write."
+   */
+  REGISTRY_LOCK_LOST: "REGISTRY_LOCK_LOST",
 } as const;

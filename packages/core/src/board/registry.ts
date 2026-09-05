@@ -362,7 +362,15 @@ async function readLockToken(lockPath: string): Promise<string | undefined> {
   }
 }
 
-/** Thrown internally when a held lock is confirmed lost mid-write; `register()` retries the whole attempt on this, never surfaces it. */
+/**
+ * Thrown internally when a held lock is confirmed lost mid-write.
+ * `register()` retries the whole attempt on this (bounded by
+ * `MAX_LOCK_LOST_RETRIES`); once retries are exhausted, `register()`
+ * converts it to a typed `CanKanError` (`REGISTRY_LOCK_LOST`) rather than
+ * letting this internal-only type escape -- an untyped `Error` reaching a
+ * caller bypasses `isCanKanError`/M3.10's exit-code map, exactly the class
+ * of hole `TICKETS_DIR_INVALID` closed in `ref.ts` for the same reason.
+ */
 class LockLostError extends Error {}
 
 /**
@@ -403,13 +411,25 @@ class LockLostError extends Error {}
  * read and the `rename` that claims it -- closing it fully would need an
  * atomic "compare-and-break" primitive the filesystem does not offer
  * here, the same class of accepted residual `config/layers.ts`'s own
- * `assertNotSymlink` documents. Worst case here is losing one registry
- * row after a stall longer than `LOCK_STALE_MS`, never corruption: `fn`
- * is handed `assertStillHeld` (below) to re-check identity immediately
- * before the registry `rename` that actually publishes its write, and
- * `register()` retries the whole read-modify-write (bounded by
- * `MAX_LOCK_LOST_RETRIES`) rather than publish a write made under a lock
- * it no longer holds.
+ * `assertNotSymlink` documents. **Worst case here is a liveness stall,
+ * not a lost row or corruption** (round 2 review correction -- the
+ * original text here undersold this): if a victim's own `assertStillHeld`
+ * call (below) lands inside this exact rename-then-link gap, its
+ * `finally` reads `lockPath` *before* the restore lands, sees a token
+ * that is not its own, correctly declines to unlink (it is not the file
+ * this call wrote) -- and the subsequent `link` then re-establishes an
+ * orphaned lockfile carrying the *victim's own abandoned token* with a
+ * freshly-bumped mtime. Both the process that broke the lock and the
+ * victim then spin to `REGISTRY_LOCK_TIMEOUT` (or `register()`'s
+ * `LockLostError` retry path, then `REGISTRY_LOCK_LOST` once that's
+ * exhausted), and the orphan only clears once it ages past
+ * `LOCK_STALE_MS` and some later call breaks it for real. No two writes
+ * are ever both published -- that guarantee holds -- but this is a stall
+ * a caller can observe, not merely "one lost registry row." `fn` is
+ * handed `assertStillHeld` (below) to re-check identity immediately
+ * before the registry `rename` that actually publishes its write, which
+ * is what keeps a *published* write from ever happening under a lock
+ * that is already gone; it does not prevent the stall itself.
  */
 async function withRegistryLock<T>(
   registryPath: string,
@@ -444,13 +464,16 @@ async function withRegistryLock<T>(
           // We renamed away a *fresh* lock a new holder created in the
           // gap between our stat/token-read and this rename -- give it
           // back without risking a clobber (see docstring).
-          try {
-            await link(stalePath, lockPath);
-          } catch (linkErr) {
-            if (!isEExist(linkErr)) throw linkErr;
-            // Someone else already re-occupies `lockPath` -- fine, our
-            // stolen copy is simply discarded below.
-          }
+          //
+          // N2 (round 2 review): tolerate *any* `link` failure here, not
+          // only `EEXIST` -- some filesystems (exFAT, some FUSE/network
+          // mounts) cannot hard-link at all and fail `EPERM`/`EMLINK`.
+          // Either way the outcome is the same: this call gives up on
+          // restoring its stolen copy and lets `assertStillHeld` handle
+          // the consequences for whoever actually holds (or held) the
+          // lock, rather than letting an untyped filesystem error escape
+          // `withRegistryLock` and leak `stalePath` behind it.
+          await link(stalePath, lockPath).catch(() => {});
           await unlink(stalePath).catch(() => {});
         } else {
           // Confirmed genuinely stale -- discard it and retry acquisition.
@@ -523,8 +546,10 @@ async function writeRegistryAtomic(registryPath: string, data: RawRegistryFile):
  * times, if `withRegistryLock`'s `assertStillHeld` determines the lock
  * was lost mid-write (see that function's docstring) -- this is expected
  * to be exceedingly rare (it requires overrunning `LOCK_STALE_MS` while
- * still holding the lock) and self-resolves on retry rather than
- * surfacing a spurious failure to the caller.
+ * still holding the lock) and usually self-resolves on retry. If every
+ * retry loses the lock again, the internal `LockLostError` is converted
+ * to a typed `CanKanError` (`BoardErrorCodes.REGISTRY_LOCK_LOST`) rather
+ * than escaping raw -- see `LockLostError`'s own docstring.
  */
 export async function register(
   name: string,
@@ -580,8 +605,22 @@ export async function register(
         return toEntry(entry);
       });
     } catch (err) {
-      if (err instanceof LockLostError && attempt < MAX_LOCK_LOST_RETRIES) {
-        continue;
+      if (err instanceof LockLostError) {
+        if (attempt < MAX_LOCK_LOST_RETRIES) {
+          continue;
+        }
+        // N1 (round 2 review): `LockLostError` is an internal-only type
+        // (see its own docstring) -- it must never itself reach a caller.
+        // Converted here, at the one place retries are exhausted, into a
+        // typed `CanKanError` so `isCanKanError`/M3.10's exit-code map can
+        // see it, exactly the discipline `TICKETS_DIR_INVALID` applies in
+        // `ref.ts` for the same class of "don't let a raw internal
+        // exception escape" defect.
+        throw new CanKanError(
+          BoardErrorCodes.REGISTRY_LOCK_LOST,
+          `${registryPath}: repeatedly lost the registry lock to another process mid-write, after ${MAX_LOCK_LOST_RETRIES} retries`,
+          { cause: err, details: { file: registryPath } },
+        );
       }
       throw err;
     }

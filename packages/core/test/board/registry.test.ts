@@ -1,6 +1,18 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  unlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { withEnv } from "../../../test-utils/src/withEnv";
 import { ensurePersonalBoard } from "../../src/board/personal";
@@ -18,6 +30,73 @@ import { hermeticEnv } from "../config/testHelpers";
 async function makeBoardDir(): Promise<{ dir: string; cleanup: () => Promise<void> }> {
   const dir = await mkdtemp(join(tmpdir(), "cankan-registry-board-"));
   return { dir, cleanup: () => rm(dir, { recursive: true, force: true }) };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Creates a FIFO (named pipe) at `path` via the real `mkfifo(1)` -- Node
+ * has no `fs.mkfifo`. Used only by the lock-race tests below: a FIFO's
+ * `open()`/read/write calls are real blocking rendezvous points, which is
+ * what makes it possible to deterministically pause `withRegistryLock`'s
+ * internal reads at an exact line, from outside the process, without
+ * mocking anything.
+ */
+function mkfifo(path: string): void {
+  const result = Bun.spawnSync(["mkfifo", path]);
+  if (result.exitCode !== 0) {
+    throw new Error(`mkfifo ${path} failed: ${result.stderr.toString()}`);
+  }
+}
+
+/**
+ * Opens `path` for writing in a **subprocess**, writes `content`, and
+ * (optionally) holds the write end open for `holdMs` before closing.
+ * Deliberately a subprocess, not an in-process `fs.open`/`fs.write`:
+ * opening a FIFO for writing blocks until a reader connects, and doing
+ * that directly in this process's own JS stalls Bun's event loop outright
+ * (verified) -- reads are fine in-process (they use the thread pool
+ * properly), only the write side needs to live in a separate OS process.
+ * EOF (and so the paired reader's `readFile` resolving) only happens once
+ * this process's fd closes -- a `write()` does not signal EOF by itself,
+ * which is what makes `holdMs` useful as a window for the caller to do
+ * something (e.g. back-date the file's mtime) before the paired read can
+ * complete.
+ */
+function spawnFifoWriter(path: string, content: string, holdMs = 0) {
+  const script =
+    holdMs > 0
+      ? `exec 3>'${path}'; printf '%s' '${content}' >&3; sleep ${holdMs / 1000}; exec 3>&-`
+      : `exec 3>'${path}'; printf '%s' '${content}' >&3; exec 3>&-`;
+  return Bun.spawn(["bash", "-c", script]);
+}
+
+async function waitForPath(path: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      await lstat(path);
+      return;
+    } catch {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${path} to appear`);
+      await sleep(10);
+    }
+  }
+}
+
+async function waitForGlobMatch(dir: string, prefix: string, timeoutMs = 5000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const entries = await readdir(dir).catch(() => [] as string[]);
+    const match = entries.find((entry) => entry.startsWith(prefix));
+    if (match) return join(dir, match);
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for a file starting with "${prefix}" in ${dir}`);
+    }
+    await sleep(10);
+  }
 }
 
 describe("registry -- missing file", () => {
@@ -182,6 +261,140 @@ describe("registry -- stale lock breaking", () => {
       }
     });
   });
+});
+
+describe("registry -- N3: a stale lock stolen mid-break is restored via link, never rename", () => {
+  test("a fresh lock stolen by a naive stale-break is put back as a FIFO (proving link, not rename) and leaves no orphaned .stale-* file", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const registryPath = resolveRegistryPath(env);
+      if (!registryPath) throw new Error("test setup: registry path did not resolve");
+      await mkdir(join(registryPath, ".."), { recursive: true });
+
+      const lockPath = `${registryPath}.lock`;
+      const lockDir = dirname(lockPath);
+      const lockBasename = basename(lockPath);
+      mkfifo(lockPath);
+      const initiallyStale = new Date(Date.now() - 30_000);
+      await utimes(lockPath, initiallyStale, initiallyStale);
+
+      const board = await makeBoardDir();
+      try {
+        // `register()`'s own EEXIST-on-open path is what reads `lockPath`
+        // -- a FIFO makes that read (and the read of whatever it gets
+        // renamed to) a real, externally-controllable rendezvous point
+        // instead of something this test would otherwise have to guess
+        // the timing of.
+        const registerPromise = register("fifo-race", board.dir, env);
+        registerPromise.catch(() => {});
+
+        // ---- Round 1: feed OLD-TOKEN; back-date mtime while the writer
+        // still holds the FIFO open (a write bumps mtime, a close does
+        // not -- verified) so `stat` still judges it stale once the
+        // paired read completes. ----
+        const w1 = spawnFifoWriter(lockPath, "OLD-TOKEN", 300);
+        await sleep(100);
+        await utimes(lockPath, new Date(Date.now() - 30_000), new Date(Date.now() - 30_000));
+        await w1.exited;
+
+        const stalePath1 = await waitForGlobMatch(lockDir, `${lockBasename}.stale-`);
+
+        // ---- Feed a *different* token via the renamed path: from
+        // `withRegistryLock`'s point of view this is indistinguishable
+        // from "a new holder acquired the lock in the gap between our
+        // staleness check and our rename." ----
+        const w2 = spawnFifoWriter(stalePath1, "FRESH-TOKEN");
+        await w2.exited;
+
+        // The mismatch must restore `lockPath` -- and restore it as a
+        // FIFO, which is only possible via `link` (a plain `open(path,
+        // "wx")` would create a brand-new *regular* file, never a FIFO).
+        await waitForPath(lockPath);
+        await sleep(50); // let the restore's own unlink(stalePath) settle
+        const restored = await lstat(lockPath);
+        expect(restored.isFIFO()).toBe(true);
+        const leftoversAfterRestore = (await readdir(lockDir)).filter((f) =>
+          f.startsWith(`${lockBasename}.stale-`),
+        );
+        expect(leftoversAfterRestore).toEqual([]);
+
+        // ---- Round 2: same trick, but with a *matching* token both
+        // times, so this pass is genuinely stale (no mismatch) and gets
+        // discarded for good via unlink -- freeing `lockPath` for a real
+        // acquisition, so the test (and `register()`) terminate cleanly
+        // instead of racing this FIFO forever. ----
+        const w3 = spawnFifoWriter(lockPath, "MATCH-TOKEN", 300);
+        await sleep(100);
+        await utimes(lockPath, new Date(Date.now() - 30_000), new Date(Date.now() - 30_000));
+        await w3.exited;
+
+        const stalePath2 = await waitForGlobMatch(lockDir, `${lockBasename}.stale-`);
+        const w4 = spawnFifoWriter(stalePath2, "MATCH-TOKEN");
+        await w4.exited;
+
+        const entry = await registerPromise;
+        expect((entry as { name: string }).name).toBe("fifo-race");
+
+        const finalContents = await readdir(lockDir);
+        expect(finalContents.some((f) => f.includes(".stale-"))).toBe(false);
+        expect(finalContents.some((f) => f === lockBasename)).toBe(false);
+      } finally {
+        await board.cleanup();
+        await unlink(lockPath).catch(() => {});
+      }
+    });
+  }, 15000);
+});
+
+describe("registry -- N1: LockLostError never escapes register() untyped", () => {
+  test("repeatedly losing the lock mid-write, past MAX_LOCK_LOST_RETRIES, surfaces a typed REGISTRY_LOCK_LOST error", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const registryPath = resolveRegistryPath(env);
+      if (!registryPath) throw new Error("test setup: registry path did not resolve");
+      const lockPath = `${registryPath}.lock`;
+      await mkdir(dirname(registryPath), { recursive: true });
+
+      // `registryPath` itself (the actual repos.yml file `readRegistryRaw`
+      // reads inside the locked section) is the FIFO here -- it gives
+      // this test a rendezvous point *after* the lock has already been
+      // acquired but *before* `assertStillHeld()` runs, which is exactly
+      // the window `assertStillHeld` exists to guard. `MAX_LOCK_LOST_
+      // RETRIES` is 3 (register.ts), so 4 total acquisitions (attempts
+      // 0-3) are needed to exhaust it.
+      mkfifo(registryPath);
+
+      const board = await makeBoardDir();
+      try {
+        const registerPromise = register("n1-race", board.dir, env);
+
+        for (let attempt = 0; attempt <= 3; attempt++) {
+          await waitForPath(lockPath);
+          // Simulate "another process broke/took this lock while we were
+          // busy": remove it out from under the in-flight register()
+          // call. This both makes the upcoming assertStillHeld() see no
+          // lock at all (a mismatch) and frees `lockPath` for the retry's
+          // own fresh acquisition.
+          await unlink(lockPath).catch(() => {});
+          const w = spawnFifoWriter(registryPath, "version: 1\nrepos: []\n");
+          await w.exited;
+        }
+
+        let thrown: unknown;
+        try {
+          await registerPromise;
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("REGISTRY_LOCK_LOST");
+        expect((thrown as Error).message).toContain(registryPath);
+      } finally {
+        await board.cleanup();
+        await unlink(lockPath).catch(() => {});
+      }
+    });
+  }, 15000);
 });
 
 describe("registry -- upsert semantics", () => {

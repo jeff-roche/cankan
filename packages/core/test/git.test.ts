@@ -449,10 +449,12 @@ describe("F1 — a coordination ref that is itself a symbolic ref", () => {
     // public `GitAdapter` without racing two real processes. This test
     // drives `updateRefCASCore` directly (the module-internal export, not
     // re-exported from `index.ts`) to exercise exactly the code path that
-    // gap would reach, without needing to win a race to prove it: the
-    // backstop's soundness does not depend on timing, only on `--no-deref`
-    // behaving as asserted below whenever this function is called against a
-    // ref that happens to be a symref.
+    // gap would reach, without needing to win a race to prove it. Note,
+    // though: this specific scenario (a *stale* compare) asserts the CAS
+    // invariant holds across a symref swap, not `--no-deref`'s presence —
+    // it passes identically with or without the flag. The *next* test
+    // (a matching compare) is the one whose assertions actually depend on
+    // `--no-deref` behaving as documented.
     const repo = await tempRepo();
     const mainTipAtSymrefTime = git(repo.dir, ["rev-parse", "main"]).trim();
 

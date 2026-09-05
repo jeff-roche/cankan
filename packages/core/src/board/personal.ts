@@ -97,6 +97,28 @@ function isEnoent(err: unknown): boolean {
 }
 
 /**
+ * Runs a filesystem operation, converting any failure into a typed
+ * `PERSONAL_BOARD_UNAVAILABLE` (security review: an audit of this file
+ * found every bare `await` on a filesystem call could surface a raw,
+ * untyped platform error on the ordinary public API -- no hostile input
+ * required, just an unwritable data home, a dangling symlink where the
+ * personal board should be, or its root demoted to a regular file. Every
+ * such call in this file is routed through here so the class is closed
+ * once, not site by site.
+ */
+async function wrapFsFailure<T>(operation: () => Promise<T>, path: string): Promise<T> {
+  try {
+    return await operation();
+  } catch (err) {
+    throw new CanKanError(
+      BoardErrorCodes.PERSONAL_BOARD_UNAVAILABLE,
+      `personal board directory operation failed at ${path}`,
+      { cause: err, details: { path } },
+    );
+  }
+}
+
+/**
  * Creates the personal board's directory skeleton on first use (lazily)
  * and returns its `BoardRef`. Idempotent and safe under concurrent
  * callers: two processes calling this at the same time converge on the
@@ -142,7 +164,7 @@ export async function ensurePersonalBoard(
     );
   }
 
-  await mkdir(dirname(rawPath), { recursive: true });
+  await wrapFsFailure(() => mkdir(dirname(rawPath), { recursive: true }), dirname(rawPath));
 
   let created = true;
   try {
@@ -165,10 +187,15 @@ export async function ensurePersonalBoard(
     }
   }
 
-  // F10: the personal board's `.cankan/` directory. `mkdir(recursive)` is
+  // The personal board's `.cankan/` directory. `mkdir(recursive)` is
   // idempotent, so this is safe under concurrent callers regardless of
-  // which one (if any) actually created `root` above.
-  await mkdir(join(rawPath, ".cankan"), { recursive: true });
+  // which one (if any) actually created `root` above. Also the site of a
+  // sibling class of failure to the one just above: `rawPath` existing as
+  // a dangling symlink (`ENOENT`), a regular file (`ENOTDIR`), or with
+  // mode `000` (`EACCES`) all reach this `mkdir` rather than the one
+  // above it.
+  const cankanDir = join(rawPath, ".cankan");
+  await wrapFsFailure(() => mkdir(cankanDir, { recursive: true }), cankanDir);
 
   // `buildBoardRef` is read-only (see file header): this first call only
   // learns the containment-checked, intended `ticketsDir` path -- it may
@@ -176,16 +203,25 @@ export async function ensurePersonalBoard(
   // `BoardRef.ticketsDir` is the full realpath of something that now
   // really exists (discharging ADR 0002 step (b) here).
   const probe = await buildBoardRef({ kind: "personal", name: "personal", root: rawPath, env });
-  await mkdir(probe.ticketsDir, { recursive: true });
+  await wrapFsFailure(() => mkdir(probe.ticketsDir, { recursive: true }), probe.ticketsDir);
   const board = await buildBoardRef({ kind: "personal", name: "personal", root: rawPath, env });
 
-  const needsGitInit = await lstat(join(board.root, ".git")).then(
-    () => false,
-    (err) => {
-      if (isEnoent(err)) return true;
-      throw err;
-    },
-  );
+  const gitPath = join(board.root, ".git");
+  let needsGitInit: boolean;
+  try {
+    await lstat(gitPath);
+    needsGitInit = false;
+  } catch (err) {
+    if (isEnoent(err)) {
+      needsGitInit = true;
+    } else {
+      throw new CanKanError(
+        BoardErrorCodes.PERSONAL_BOARD_UNAVAILABLE,
+        `could not check for a .git directory in the personal board: ${gitPath}`,
+        { cause: err, details: { path: gitPath } },
+      );
+    }
+  }
 
   return { board, created, needsGitInit };
 }

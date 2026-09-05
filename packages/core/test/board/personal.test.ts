@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -141,6 +141,134 @@ describe("ensurePersonalBoard -- lazy, idempotent creation", () => {
         // Restore write permission before withEnv()'s own cleanup removes
         // the temp home tree.
         await chmod(parent, 0o700);
+      }
+    });
+  });
+
+  // Security review (G1): the F12 fix above wrapped exactly the one `mkdir`
+  // the finding cited. An audit of this file found three sibling bare
+  // filesystem calls that could surface the identical class of raw,
+  // untyped error on the ordinary public API -- no hostile input required.
+  // Each test below reproduces a real, distinct underlying platform error
+  // at a different one of those calls.
+
+  test("G1: an unwritable $XDG_DATA_HOME is a typed error, not a raw EACCES, at the very first mkdir", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const dataHome = env.XDG_DATA_HOME;
+      if (!dataHome) throw new Error("test setup: XDG_DATA_HOME not set by hermeticEnv()");
+      await mkdir(dataHome, { recursive: true });
+      await chmod(dataHome, 0o000);
+      try {
+        let thrown: unknown;
+        try {
+          await ensurePersonalBoard({ env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("PERSONAL_BOARD_UNAVAILABLE");
+      } finally {
+        await chmod(dataHome, 0o700);
+      }
+    });
+  });
+
+  test("G1: a dangling symlink where the personal board should be is a typed error, not a raw ENOENT", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const rawPath = resolvePersonalBoardPath(env);
+      if (!rawPath) throw new Error("test setup: personal board path did not resolve");
+      await mkdir(dirname(rawPath), { recursive: true });
+      // mkdir(rawPath) sees an existing entry (the symlink itself) and
+      // reports EEXIST regardless of what it points to; the very next
+      // mkdir (`.cankan/` inside it) is what actually tries to traverse
+      // the broken link and fails ENOENT.
+      await symlink(join(dirname(rawPath), "nonexistent-target"), rawPath);
+
+      let thrown: unknown;
+      try {
+        await ensurePersonalBoard({ env });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("PERSONAL_BOARD_UNAVAILABLE");
+    });
+  });
+
+  test("G1: a personal root pre-existing with mode 000 is a typed error, not a raw EACCES", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const rawPath = resolvePersonalBoardPath(env);
+      if (!rawPath) throw new Error("test setup: personal board path did not resolve");
+      await mkdir(dirname(rawPath), { recursive: true });
+      await mkdir(rawPath, { mode: 0o000 });
+      try {
+        let thrown: unknown;
+        try {
+          await ensurePersonalBoard({ env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("PERSONAL_BOARD_UNAVAILABLE");
+      } finally {
+        await chmod(rawPath, 0o700);
+      }
+    });
+  });
+
+  test("G1: the personal board path already existing as a regular file is a typed error, not a raw ENOTDIR", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const rawPath = resolvePersonalBoardPath(env);
+      if (!rawPath) throw new Error("test setup: personal board path did not resolve");
+      await mkdir(dirname(rawPath), { recursive: true });
+      await writeFile(rawPath, "not a directory");
+
+      let thrown: unknown;
+      try {
+        await ensurePersonalBoard({ env });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
+      expect((thrown as { code: string }).code).toBe("PERSONAL_BOARD_UNAVAILABLE");
+    });
+  });
+
+  test("G1: re-creating a deleted ticketsDir through an unwritable intermediate directory is a typed error, not a raw EACCES", async () => {
+    await withEnv(undefined, async () => {
+      const env = hermeticEnv();
+      const first = await ensurePersonalBoard({ env });
+      // Remove only "tasks", leaving "backlog" (ticketsDir's own parent)
+      // in place so this isolates the ticketsDir mkdir specifically --
+      // root and .cankan/ stay untouched and fully accessible. Mode
+      // `0o500` (read + execute, no write), not `0o000`: `lstat` only
+      // needs execute/search permission to traverse into `backlog` and
+      // determine "tasks" doesn't exist, which `buildBoardRef`'s own
+      // probe call (inside ensurePersonalBoard, before this test's own
+      // `mkdir` wrap ever runs) does successfully either way -- `0o000`
+      // blocks that traversal too and surfaces `ref.ts`'s own (already
+      // typed) `TICKETS_DIR_INVALID` instead, which doesn't discriminate
+      // this specific wrap. `mkdir` itself additionally needs *write* on
+      // the immediate parent, which `0o500` still denies -- that is what
+      // this test isolates.
+      await rm(first.board.ticketsDir, { recursive: true, force: true });
+      const backlogDir = dirname(first.board.ticketsDir);
+      await chmod(backlogDir, 0o500);
+      try {
+        let thrown: unknown;
+        try {
+          await ensurePersonalBoard({ env });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect((thrown as { code: string }).code).toBe("PERSONAL_BOARD_UNAVAILABLE");
+      } finally {
+        await chmod(backlogDir, 0o700);
       }
     });
   });

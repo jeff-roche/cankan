@@ -403,16 +403,39 @@ export async function resolveBoard(options: ResolveBoardOptions): Promise<BoardR
         details: { name: flag.name },
       });
     }
-    const ref = await buildBoardRef({ kind: "repo", name: entry.name, root: entry.path, env });
-    // `register()`/`listRegisteredBoards()` refuse a registry entry whose
-    // *root* is contained in the personal board, but neither of those
-    // checks can see a symlink alias to the personal board (only
-    // `buildBoardRef`'s canonicalization reveals it) or a
-    // `tickets_dir`-based alias from a registered *ancestor* of the
-    // personal board (only knowable once `buildBoardRef` has resolved
-    // `ticketsDir`) -- both closed here, after building, rather than left
-    // to leak an explicit repo selector into the personal board.
     const personalPath = await canonicalPersonalPath(env);
+
+    // Pre-check, by root only, *before* buildBoardRef ever runs (security
+    // review) -- mirroring walkForBoard's own pre-check for the cwd-walk
+    // paths. `register()`/`listRegisteredBoards()` refuse a registry
+    // entry whose stored *path string* is contained in the personal
+    // board, but a symlink alias to the personal board (`entry.path`
+    // itself an ordinary-looking string that only resolves there) passes
+    // that string check. Without this pre-check, `buildBoardRef` would
+    // `loadConfig` the *personal* board's own `.cankan/config.yml` before
+    // this branch ever gets a chance to refuse it -- a real, literal
+    // personal-board read on a repo-selector path -- and any failure in
+    // that read (a malformed personal config, a `tickets_dir` there
+    // escaping its own root, a bad `coordination.ref`) would publish
+    // exactly the personal board's own path this error is written to
+    // withhold.
+    if (personalPath !== undefined) {
+      const canonicalEntryPath = await realpath(entry.path).catch(() => entry.path);
+      if (isContained(personalPath, canonicalEntryPath)) {
+        throw new CanKanError(
+          BoardErrorCodes.REGISTERED_BOARD_IS_PERSONAL,
+          `board "${flag.name}" resolves into the personal board; a registry entry cannot alias it -- use "--board personal" instead`,
+          { details: { name: flag.name } },
+        );
+      }
+    }
+
+    const ref = await buildBoardRef({ kind: "repo", name: entry.name, root: entry.path, env });
+    // Post-check (unchanged): a `tickets_dir`-based alias from a
+    // registered *ancestor* of the personal board is only knowable once
+    // `buildBoardRef` has resolved `ticketsDir`, so it still runs after
+    // building -- this repo's own config is not the personal board's, so
+    // reading it first carries none of the pre-check's risk above.
     if (personalPath !== undefined && aliasesPersonalBoard(ref, personalPath)) {
       throw new CanKanError(
         BoardErrorCodes.REGISTERED_BOARD_IS_PERSONAL,

@@ -68,10 +68,22 @@ export const BoardErrorCodes = {
   REGISTRY_LOCK_LOST: "REGISTRY_LOCK_LOST",
   /**
    * `resolveBoard()`'s `cwd` does not exist (`fs.realpath` failed
-   * `ENOENT`). Never falls through to the personal board for this --
-   * CONCEPT.md §6c's privacy default means an unresolvable, explicitly
-   * requested location must be a visible error, not a silent
-   * reclassification into "the user's private board."
+   * `ENOENT`). Never falls through to the personal board for this -- `cwd`
+   * itself could not even be located, which is a different failure than
+   * "`cwd` resolved fine, but the repo it landed on turned out to be
+   * disqualified."
+   *
+   * That second case *does* fall through to the personal board on the
+   * no-flag path: a `cwd` inside a repo whose own `tickets_dir` reaches
+   * into the personal board resolves to `kind: "personal"` with no flag,
+   * while an explicit `--board repo` on the identical repo still errors
+   * (`NOT_INSIDE_REPO_BOARD`). That split is deliberate, not a
+   * contradiction of this code's own principle: an *implicit* resolution
+   * (no flag given) falls through to the next thing in precedence, the
+   * same as "no repo found at all" always has; an *explicit* selector
+   * (`--board repo`, or `cwd` simply not existing, as here) names a
+   * specific outcome and must fail loudly rather than silently substitute
+   * a different board when it cannot deliver the one asked for.
    */
   CWD_NOT_FOUND: "CWD_NOT_FOUND",
   /**
@@ -118,14 +130,32 @@ export const BoardErrorCodes = {
    */
   REGISTERED_BOARD_IS_PERSONAL: "REGISTERED_BOARD_IS_PERSONAL",
   /**
-   * `ensurePersonalBoard()` could not create the personal board's root
-   * directory (a filesystem error other than "it already exists" --
-   * `EACCES` on its parent, most commonly). Wrapped rather than left to
-   * escape as a raw platform error, the same discipline this module
-   * already applies to `TICKETS_DIR_INVALID` (`ref.ts`), the internal
-   * lock-loss exception (`registry.ts`), and `CWD_UNRESOLVABLE`
-   * (`resolve.ts`) -- an untyped error here would be invisible to
-   * `isCanKanError`/M3.10's exit-code map.
+   * `ensurePersonalBoard()` hit an unexpected filesystem error building or
+   * inspecting the personal board's directory skeleton -- creating its
+   * root, its `.cankan/` directory, or its tickets directory, or checking
+   * for `.git`. Covers every bare filesystem call in `personal.ts` that
+   * isn't given its own specific handling (`EEXIST` on the root, `ENOENT`
+   * on `.git`): an unwritable data home, a dangling symlink where the
+   * board should be, its root demoted to a regular file, and similar,
+   * every one of them reachable on the ordinary public API with no
+   * hostile actor involved. Wrapped rather than left to escape as a raw
+   * platform error, the same discipline this module already applies to
+   * `TICKETS_DIR_INVALID` (`ref.ts`), the internal lock-loss exception
+   * (`registry.ts`), and `CWD_UNRESOLVABLE` (`resolve.ts`) -- an untyped
+   * error here would be invisible to `isCanKanError`/M3.10's exit-code
+   * map.
    */
   PERSONAL_BOARD_UNAVAILABLE: "PERSONAL_BOARD_UNAVAILABLE",
+  /**
+   * `registry.ts` hit an unexpected filesystem error reading, writing, or
+   * locking `repos.yml` (or resolving the repo directory `register()` was
+   * asked to add) that isn't already covered by a more specific code --
+   * an unwritable `$XDG_DATA_HOME`, a lockfile whose directory became
+   * unwritable mid-acquisition, an atomic write's `rename` failing for a
+   * reason other than the target simply not existing yet, or a
+   * `register()` target path that cannot be `realpath`'d. Wrapped for the
+   * same reason `PERSONAL_BOARD_UNAVAILABLE` exists: every bare filesystem
+   * call in this file must surface a typed error, not a raw platform one.
+   */
+  REGISTRY_UNAVAILABLE: "REGISTRY_UNAVAILABLE",
 } as const;

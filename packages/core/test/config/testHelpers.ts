@@ -69,3 +69,37 @@ export function hermeticEnv(
     ...extra,
   };
 }
+
+/**
+ * Runs `fn` with every `CANKAN_*` var removed from the real `process.env`
+ * for the duration, restoring exactly what was there afterward -- the same
+ * save/delete/restore pattern `withEnv` uses for `HOME`/`XDG_*`.
+ *
+ * This exists for the one deliberate test of `LoadConfigOptions.env`'s
+ * `?? process.env` default (review round 2 finding 8): `withEnv()` only
+ * ever redirects `HOME`/`XDG_*`, never `CANKAN_*`, so a bare
+ * `loadConfig({})` inside `withEnv()` alone still inherits whatever
+ * `CANKAN_*` vars the operator's shell or CI happens to have exported --
+ * exactly the leakage `hermeticEnv()` exists to close everywhere else in
+ * this suite, just reached through the *other* channel (`process.env`
+ * itself, not an explicit `env` object).
+ */
+export async function withoutCankanEnv<T>(fn: () => T | Promise<T>): Promise<T> {
+  const saved = new Map<string, string>();
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("CANKAN_")) {
+      saved.set(key, process.env[key] as string);
+      delete process.env[key];
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const key of saved.keys()) {
+      delete process.env[key];
+    }
+    for (const [key, value] of saved) {
+      process.env[key] = value;
+    }
+  }
+}

@@ -118,10 +118,15 @@ export const UNCLASSIFIED_KEYS: readonly string[] = [
 ] as const;
 
 /**
- * Whether `pattern` matches `key`, both given as `.`-separated dotted
- * paths. A pattern segment of `*` matches exactly one key segment,
- * whatever it is; every other pattern segment must equal the key segment
- * at that position literally.
+ * Whether `pattern` (a dotted pattern string) matches `keySegments` (already
+ * split into path segments — see AMENDMENT A1 in `../.superpowers/sdd/phase-M2.3/contract.md`
+ * for why `classifyKey` must classify from segments rather than a
+ * re-joined-and-re-split string: a record key can itself contain a literal
+ * "." — `hooks: { "release.done": ... }`, `repos.names`'s filesystem-path
+ * keys — and splitting a rendered `"hooks.release.done"` string back apart
+ * would miscount segments and misclassify). A pattern segment of `*`
+ * matches exactly one key segment, whatever it is; every other pattern
+ * segment must equal the key segment at that position literally.
  *
  * A pattern matches as a **prefix**: it need not name every segment of
  * `key`, only the leading ones. This is what lets a 3-segment pattern like
@@ -131,9 +136,8 @@ export const UNCLASSIFIED_KEYS: readonly string[] = [
  * subtree inherits one classification, matching how CONCEPT.md's table
  * treats it as a single row. A pattern longer than `key` never matches.
  */
-function matchesPattern(pattern: string, key: string): boolean {
+function matchesPattern(pattern: string, keySegments: readonly string[]): boolean {
   const patternSegments = pattern.split(".");
-  const keySegments = key.split(".");
   if (patternSegments.length > keySegments.length) {
     return false;
   }
@@ -143,7 +147,16 @@ function matchesPattern(pattern: string, key: string): boolean {
 }
 
 /**
- * Classifies one dotted config key path as `"policy"` or `"preference"`.
+ * Classifies one config key as `"policy"` or `"preference"`.
+ *
+ * Accepts either form (AMENDMENT A1 — union parameter, not a new method
+ * name, so the export name set is unchanged for the lanes freezing against
+ * it): a `readonly string[]` of path segments (the unambiguous form —
+ * `resolve.ts` always calls this way, since only segments can safely
+ * represent a record key that itself contains a "."), or a plain dotted
+ * `string`, split on "." here for backward-compatible callers that already
+ * know none of their segments contain an embedded dot (e.g. this file's own
+ * tests, and the classification-table patterns themselves).
  *
  * When more than one `KEY_CLASSIFICATION` pattern matches the same key, the
  * pattern with the most segments (the most specific one) wins — mirroring
@@ -156,10 +169,11 @@ function matchesPattern(pattern: string, key: string): boolean {
  * default classification, not an exhaustive one, and contract R2 rules
  * unclassified keys preference by default.
  */
-export function classifyKey(key: string): "policy" | "preference" {
+export function classifyKey(key: string | readonly string[]): "policy" | "preference" {
+  const keySegments = Array.isArray(key) ? key : (key as string).split(".");
   let best: KeyClassificationEntry | undefined;
   for (const entry of KEY_CLASSIFICATION) {
-    if (!matchesPattern(entry.pattern, key)) {
+    if (!matchesPattern(entry.pattern, keySegments)) {
       continue;
     }
     if (!best || entry.pattern.split(".").length > best.pattern.split(".").length) {

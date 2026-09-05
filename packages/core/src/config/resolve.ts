@@ -1,13 +1,29 @@
 /**
  * The precedence engine (contract §1's `loadConfig`, `ConfigResult`,
- * `ResolvedEntry`, `LoadConfigOptions`) -- per-key precedence (R1), per-leaf
- * map resolution (R3), the `!policy` tag (R6), eager `POLICY_VIOLATION`
- * (R7), and `CANKAN_*` env overrides (R8-R10).
+ * `ResolvedEntry`, `LoadConfigOptions`, as amended by AMENDMENT A1) -- per-key
+ * precedence (R1), per-leaf map resolution (R3), the `!policy` tag (R6),
+ * eager `POLICY_VIOLATION` (R7), and `CANKAN_*` env overrides (R8-R10).
+ *
+ * **AMENDMENT A1 note:** attribution is keyed by `path: readonly string[]`
+ * throughout this file, never by a `.`-joined string. A record key can
+ * itself contain a literal "." (`hooks: { "release.done": ... }`, and above
+ * all `repos.names`, whose keys are filesystem paths) -- joining a path to a
+ * string and later splitting it back apart on "." is lossy and ambiguous,
+ * and was the root cause of a real defect (a raw `ZodError` escaping
+ * `loadConfig` for any `repos.names` key containing a dot). `key` /
+ * `ResolvedEntry.key` still exist as the **rendered, display-only** form
+ * (`path.join(".")`); nothing in this file's internal logic reads a
+ * rendered key back apart into segments. Where a `Map`/`Set` needs a
+ * primitive key to dedupe or look up an array by value, `encodePathKey`
+ * (`JSON.stringify`) is used -- that encoding is lossless and unambiguous,
+ * unlike a dot-join, and nothing ever decodes it back into segments either;
+ * it is purely a hashing trick for `Map`/`Set`, not a second "the key" in
+ * the amendment's sense.
  *
  * The core move: every value anywhere in a layer's data -- not just
- * map-valued fields -- is flattened to a dotted leaf path and resolved
- * independently (`resolved(key)` works for `claims.lease` exactly as it
- * does for `backers.github.credential`). Array values (`columns`,
+ * map-valued fields -- is flattened to a leaf `path` and resolved
+ * independently (`resolved(["claims","lease"])` works exactly like
+ * `resolved(["backers","github","credential"])`). Array values (`columns`,
  * `ready.order`, `definition_of_done`, `exclude_labels`, and any
  * `backers.*`/`queues.*` array field) are one leaf each -- replaced
  * wholesale by whichever layer wins, never element-merged. That is a
@@ -34,6 +50,7 @@ import { CanKanError, ErrorCodes } from "../errors";
 import { ConfigErrorCodes } from "./errors";
 import { classifyKey } from "./keys";
 import {
+  buildConfigValidationError,
   type ConfigLayer,
   type LoadedLayer,
   type ValidatedLayer,
@@ -53,12 +70,17 @@ import {
 export type { ConfigLayer, LoadedLayer } from "./layers";
 
 // ---------------------------------------------------------------------------
-// Contract §1 -- attribution and the result.
+// Contract §1 (as amended by A1) -- attribution and the result.
 // ---------------------------------------------------------------------------
 
 /** Where one effective key's value came from. */
 export interface ResolvedEntry {
-  /** Dotted path, e.g. "claims.lease", "backers.github.credential". */
+  /** AUTHORITATIVE: the key as path segments. A segment may itself contain
+   *  ".", so this is the only lossless form (AMENDMENT A1). */
+  path: readonly string[];
+  /** Display form: `path.join(".")`. LOSSY and ambiguous when a segment
+   *  contains a dot -- for display and for `cankan config show --resolved`
+   *  output, never for programmatic lookup. */
   key: string;
   value: unknown;
   layer: ConfigLayer;
@@ -75,9 +97,21 @@ export interface ConfigResult {
   readonly value: EffectiveConfig;
   /** Every layer file that was found, in precedence order (highest first). */
   readonly layers: readonly LoadedLayer[];
-  /** Attribution for one dotted key. Returns undefined if the key has no
-   *  effective value (not set anywhere and no built-in default). */
-  resolved(key: string): ResolvedEntry | undefined;
+  /**
+   * Attribution for one effective key. Returns undefined if the key has no
+   * effective value (not set anywhere and no built-in default).
+   *
+   * AMENDMENT A1: accepts either form. `readonly string[]` matches
+   * segment-by-segment -- the unambiguous lookup. A plain `string` matches
+   * **exactly against the rendered `entry.key`**, and is never split on
+   * "." -- `resolved("hooks.release.done")` finds the entry whose single
+   * record key is `"release.done"`, because that is plainly what a caller
+   * means. If two distinct paths render to the same string (a record key
+   * containing "." colliding with a differently-nested nested key), the
+   * string form returns whichever appears **first in `entries()` order**;
+   * the array form is the escape hatch for that case.
+   */
+  resolved(key: string | readonly string[]): ResolvedEntry | undefined;
   /** Attribution for every effective key, sorted by `key`. Powers
    *  `cankan config show --resolved` (M3.3) and `doctor` (M3.9). */
   entries(): readonly ResolvedEntry[];
@@ -94,7 +128,50 @@ export interface LoadConfigOptions {
 }
 
 // ---------------------------------------------------------------------------
-// The `!policy` tag (R6, S3, S4).
+// Path-array plumbing (AMENDMENT A1). `render` is display-only;
+// `encodePathKey` is an internal `Map`/`Set` bucketing trick, never
+// decoded back into segments by anything in this file.
+// ---------------------------------------------------------------------------
+
+function renderPath(path: readonly string[]): string {
+  return path.join(".");
+}
+
+function encodePathKey(path: readonly string[]): string {
+  return JSON.stringify(path);
+}
+
+function pathStartsWith(prefix: readonly string[], path: readonly string[]): boolean {
+  if (prefix.length > path.length) {
+    return false;
+  }
+  return prefix.every((segment, i) => segment === path[i]);
+}
+
+function isStrictPrefix(shorter: readonly string[], longer: readonly string[]): boolean {
+  return shorter.length < longer.length && pathStartsWith(shorter, longer);
+}
+
+/**
+ * Drops any path that is a strict prefix of another path in the same set
+ * (review round 2 finding 6). This arises only from a present-but-empty
+ * map entry (`backers: { github: {} }`) coexisting with a more specific
+ * leaf under the same name from a *different* layer (`backers.github.type`
+ * from global): without this filter, `entries()` would carry both the
+ * phantom intermediate entry (value `{}`, attributed to whichever layer
+ * merely declared the entry) and the real leaf entries beneath it, which
+ * is actively misleading for `cankan config show --resolved` and `doctor`,
+ * not merely redundant. `value` itself was never affected -- the merge
+ * already combines both correctly -- this is purely an `entries()`/
+ * `resolved()` presentation fix, done by skipping both the `ResolvedEntry`
+ * and the `setPath` call for the shorter path.
+ */
+function dropStrictPrefixes(paths: readonly (readonly string[])[]): (readonly string[])[] {
+  return paths.filter((p) => !paths.some((q) => q !== p && isStrictPrefix(p, q)));
+}
+
+// ---------------------------------------------------------------------------
+// The `!policy` tag (R6, S3, S4, and review round 2 finding 7).
 //
 // Registered for every layer's parse, not just the repo file: `yaml@2`
 // leaves a node's `.tag` set to `!policy` even when the tag can't be
@@ -178,23 +255,36 @@ const policyMapTag: CollectionTag = {
 const POLICY_TAGS: Tags = [policyScalarTag, policySeqTag, policyMapTag];
 
 /**
- * Every dotted path in `doc` whose node is tagged `!policy`, i.e. every
- * pinned "root" (R6: "applies to the tagged node and every leaf beneath
- * it" -- callers check pin status with a prefix match against these roots,
- * not equality). `visit.SKIP`s into an already-pinned subtree: a nested
- * `!policy` there would only ever be redundant, and skipping keeps the
- * result to one entry per genuinely distinct pin.
+ * Every path in `doc` whose node is tagged `!policy`, i.e. every pinned
+ * "root" (R6: "applies to the tagged node and every leaf beneath it" --
+ * callers check pin status with `pathStartsWith`, not equality).
+ * `visit.SKIP`s into an already-pinned subtree: a nested `!policy` there
+ * would only ever be redundant, and skipping keeps the result to one entry
+ * per genuinely distinct pin.
+ *
+ * **Review round 2 finding 7:** a `!policy` tag on the *document root*
+ * (no `Pair` ancestor at all, so the accumulated segments array is empty)
+ * previously produced a pinned root of `""`, which `findPinnedRoot` could
+ * never match against any real key -- silently pinning nothing. That is a
+ * silently-broken security control, worse than an upfront rejection, and
+ * it fails *open* for the repo (the attacker in this threat model): a
+ * repo author writing `!policy` at the top of the file, intending to pin
+ * everything, would get no error and no protection. This function now
+ * throws instead, for repo, repo-local, and global alike (repo-local and
+ * global already reject *any* `!policy` occurrence one level up in
+ * `loadConfig`; a root-level tag on either would already be caught there
+ * too, but this throws with a specific, actionable message either way).
  *
  * An aliased (`*ref`) occurrence of a pinned anchor does **not** itself
  * carry `.tag` (only the `&anchor !policy ...` definition site does), so it
  * is never recorded as a separate pinned root here. That is a strictly
  * *weaker* pin, not a bypass: S4's actual concern (can `!policy` be
- * smuggled *into* local/global via an alias?) is settled below, where the
- * rejection walk finds the tag at its one real definition site regardless
- * of how many places later alias it.
+ * smuggled *into* local/global via an alias?) is settled in `loadConfig`,
+ * where the rejection walk finds the tag at its one real definition site
+ * regardless of how many places later alias it.
  */
-function findPolicyTaggedPaths(doc: Document): string[] {
-  const paths: string[] = [];
+function findPolicyTaggedPaths(doc: Document, absPath: string): string[][] {
+  const paths: string[][] = [];
   visit(doc, (_key, node, path) => {
     if ((isScalar(node) || isMap(node) || isSeq(node)) && node.tag === POLICY_TAG) {
       const segments: string[] = [];
@@ -203,7 +293,14 @@ function findPolicyTaggedPaths(doc: Document): string[] {
           segments.push(String(entry.key.value));
         }
       }
-      paths.push(segments.join("."));
+      if (segments.length === 0) {
+        throw new CanKanError(
+          ConfigErrorCodes.INVALID_CONFIG,
+          `${absPath}: "!policy" on the document root is not supported; tag individual keys`,
+          { details: { file: absPath } },
+        );
+      }
+      paths.push(segments);
       return visit.SKIP;
     }
     return undefined;
@@ -212,34 +309,32 @@ function findPolicyTaggedPaths(doc: Document): string[] {
 }
 
 /**
- * The pinned root (if any) covering `key` -- exact match or a dotted-path
+ * The pinned root (if any) covering `path` -- exact match or a path
  * ancestor, per R6's "every leaf beneath it".
  */
-function findPinnedRoot(key: string, pinnedRoots: readonly string[]): string | undefined {
-  return pinnedRoots.find((root) => key === root || key.startsWith(`${root}.`));
+function findPinnedRoot(
+  path: readonly string[],
+  pinnedRoots: readonly (readonly string[])[],
+): readonly string[] | undefined {
+  return pinnedRoots.find((root) => pathStartsWith(root, path));
 }
 
 // ---------------------------------------------------------------------------
-// S1 -- the prototype-pollution guard. The dotted-path flatten/rebuild is a
-// `setPath` whose keys come straight from config files; a naive rebuild of
-// `hooks.__proto__.pwned` pollutes `Object.prototype` in this exact
-// runtime. `__proto__` itself never survives `yaml` -> `zod` (`zod`'s
-// `z.record()` silently drops it), but `constructor` and `prototype` do, as
-// ordinary own string-valued properties -- so all three segments are
-// rejected here, uniformly, wherever a dotted path is walked or rebuilt:
-// flattening layer data into leaves, rebuilding the merged object, and
-// turning an env var name back into a dotted path.
+// S1 -- the prototype-pollution guard. Exported (not via `index.ts`) so a
+// white-box test can exercise it directly -- see the review round 2
+// finding 9 comment below on why an end-to-end fixture alone does not
+// prove this guard is load-bearing.
 // ---------------------------------------------------------------------------
 
 const FORBIDDEN_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
 
-function isSafeSegment(segment: string): boolean {
+export function isSafeSegment(segment: string): boolean {
   return !FORBIDDEN_SEGMENTS.has(segment);
 }
 
 /**
  * S6: not `value.constructor === Object` -- `constructor` can be a spoofed
- * *own* string property surviving `yaml` -> `zod` (see above), so that
+ * *own* string property surviving `yaml` -> `zod` (see below), so that
  * check is exactly the wrong tool here. Prototype identity does not have
  * that problem.
  */
@@ -252,31 +347,59 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Flattens a parsed layer's data (or the effective defaults) into dotted
- * leaf paths. Arrays and every other non-plain-object value are leaves
- * (see the file-level comment on array handling); a forbidden segment (S1)
- * drops that whole subtree from the result rather than merely the final
- * leaf, since a hostile `hooks.__proto__.pwned` must never reach the merge
- * step at any depth.
+ * Sentinel `flattenLeaves` records for a present-but-empty map entry
+ * (`queues: { urgent: {} }` -- a legal, empty `queueEntrySchema`) instead
+ * of the layer's own object reference.
  *
- * A genuinely empty object (`queues: { urgent: {} }` -- a legal, empty
- * `queueEntrySchema`) is itself a leaf: with no keys to recurse into, the
- * naive version of this function recorded nothing at all for `queues.urgent`,
- * silently dropping a present-but-empty map entry from the merged result.
- * An object left empty only *after* forbidden segments are filtered out
- * (e.g. `{ __proto__: {...} }` alone) is not this case -- it still records
- * nothing, which is correct: S1 says that whole subtree should vanish, not
- * collapse into a `{}` placeholder.
+ * **Review round 2 finding 5:** the previous version stored `value` (the
+ * layer's own, shallow-frozen-at-best object) directly as the leaf value.
+ * `setPath`'s intermediate-container step then *reused* that exact
+ * reference as a container for a more specific leaf from a *different*
+ * layer, mutating it in place -- reproduced as: user's global config has
+ * `hooks: {}`, a hostile repo has `hooks: { post_close: "curl ... | sh" }`,
+ * and after `loadConfig`, `layers[global].data.hooks` (returned to the
+ * caller as-is) had been mutated to contain the repo's hook command, even
+ * though the file on disk never changed. Contract §1 exposes `layers`
+ * *precisely* so M2.16 can reason about which file a hook came from; this
+ * defeated that provenance guarantee entirely. Recording a sentinel here
+ * means `setPath` (below) always materializes a **fresh** `{}` for this
+ * case, never a reference back into any layer's data. `layers.ts` also now
+ * deep-freezes `LoadedLayer.data` as a backstop.
  */
-function flattenLeaves(
+const EMPTY_OBJECT_LEAF = Symbol("empty-object-leaf");
+
+/** One flattened leaf: its full path and its value (or `EMPTY_OBJECT_LEAF`). */
+export interface FlatLeaf {
+  path: string[];
+  value: unknown;
+}
+
+/**
+ * Flattens a parsed layer's data (or the effective defaults) into leaves,
+ * keyed by `encodePathKey` for `Map` lookup. Arrays and every other
+ * non-plain-object value are leaves (see the file-level comment on array
+ * handling); a forbidden segment (S1) drops that whole subtree from the
+ * result rather than merely the final leaf, since a hostile
+ * `hooks.__proto__.pwned` must never reach the merge step at any depth.
+ *
+ * A genuinely empty object is itself a leaf (see `EMPTY_OBJECT_LEAF`'s
+ * comment): with no keys to recurse into, a naive version of this function
+ * recorded nothing at all for it, silently dropping a present-but-empty
+ * map entry from the merged result. An object left empty only *after*
+ * forbidden segments are filtered out (e.g. `{ __proto__: {...} }` alone)
+ * is not this case -- it still records nothing, which is correct: S1 says
+ * that whole subtree should vanish, not collapse into a `{}` placeholder.
+ */
+export function flattenLeaves(
   value: unknown,
   prefix: readonly string[],
-  out: Map<string, unknown>,
-): Map<string, unknown> {
+  out: Map<string, FlatLeaf>,
+): Map<string, FlatLeaf> {
   if (isPlainObject(value)) {
     const keys = Object.keys(value);
     if (keys.length === 0 && prefix.length > 0) {
-      out.set(prefix.join("."), value);
+      const path = [...prefix];
+      out.set(encodePathKey(path), { path, value: EMPTY_OBJECT_LEAF });
       return out;
     }
     for (const key of keys) {
@@ -288,33 +411,55 @@ function flattenLeaves(
     return out;
   }
   if (prefix.length > 0) {
-    out.set(prefix.join("."), value);
+    const path = [...prefix];
+    out.set(encodePathKey(path), { path, value });
   }
   return out;
 }
 
+/** Replaces the `EMPTY_OBJECT_LEAF` sentinel with a fresh, unshared `{}`. */
+function materializeLeafValue(value: unknown): unknown {
+  return value === EMPTY_OBJECT_LEAF ? {} : value;
+}
+
 /**
- * Rebuilds the merged object one leaf at a time. A forbidden segment (S1)
- * anywhere in the path silently drops that leaf rather than throwing -- a
- * hostile repo config setting `hooks.__proto__.pwned` fails closed (the
- * hook event is simply never resolved) instead of denying service for
- * every other key in the same file. Intermediate containers are created
- * with `Object.create(null)` as defense in depth on top of the segment
- * check itself.
+ * Rebuilds the merged object one leaf at a time. `value` here is always
+ * already materialized (never the `EMPTY_OBJECT_LEAF` sentinel, and never
+ * a reference read out of a `LoadedLayer.data`'s own object graph -- see
+ * `materializeLeafValue` and the finding-5 comment above): `setPath` never
+ * reuses a caller-supplied object as a container, only ever objects it
+ * creates itself.
  *
- * `allKeys` is a `Set`, so a genuinely-empty-object leaf (`queues.urgent`
- * -- see `flattenLeaves`) and a more specific leaf nested under the same
- * prefix (`queues.urgent.order`, from a different layer) can be visited in
- * either order. If the empty-object leaf's `{}` were assigned
- * unconditionally, whichever of the two happened to run *last* would
- * clobber the other's work. Guarding "don't overwrite an already-plain-
- * object destination with another plain object" makes the result the same
- * regardless of iteration order: the intermediate-container branch above
- * already reuses (rather than replaces) an existing plain object, so
- * whichever leaf lands first establishes the container and the other
- * merges into or no-ops against it.
+ * A forbidden segment (S1) anywhere in the path silently drops that leaf
+ * rather than throwing -- a hostile repo config setting
+ * `hooks.__proto__.pwned` fails closed (the hook event is simply never
+ * resolved) instead of denying service for every other key in the same
+ * file. Intermediate containers are created with `Object.create(null)`.
+ *
+ * **Review round 2 finding 9, on why this guard is defense-in-depth, not
+ * the sole barrier:** a security review replayed this fixture through a
+ * faithful reimplementation of this function with `FORBIDDEN_SEGMENTS`
+ * fully removed, and found no live bypass either way, because:
+ * - `__proto__` never reaches this function at all for data that came
+ *   through a real config file -- `zod`'s `z.record(...)` strips an own
+ *   `__proto__` key during schema validation, before `flattenLeaves` ever
+ *   runs (verified: `yaml` materializes it as an own property, but
+ *   `z.record().parse(...)` silently drops it).
+ * - `constructor`/`prototype` *do* survive validation as ordinary own
+ *   string-valued properties, but reading/writing them against an
+ *   `Object.create(null)` container (this function's intermediate nodes)
+ *   is inert -- there is no prototype chain there for those names to
+ *   reach into.
+ * So the end-to-end path is already fail-closed for reasons independent of
+ * this guard. That does not make the guard redundant: it is the one place
+ * in this codebase (not a library) that would otherwise construct exactly
+ * the primitive a naive `setPath` demonstrates -- `naiveSetPath({},
+ * ["hooks","__proto__","pwned"], true)` (a plain-object-container version
+ * with no segment check) genuinely pollutes `Object.prototype` in this
+ * runtime. The guard is kept, unweakened, as deliberate defense-in-depth;
+ * see the white-box test exercising it directly.
  */
-function setPath(root: Record<string, unknown>, path: readonly string[], value: unknown): void {
+export function setPath(root: Record<string, unknown>, path: readonly string[], value: unknown): void {
   let node = root;
   for (let i = 0; i < path.length - 1; i++) {
     const segment = path[i] as string;
@@ -332,6 +477,10 @@ function setPath(root: Record<string, unknown>, path: readonly string[], value: 
     return;
   }
   if (isPlainObject(value) && isPlainObject(node[last])) {
+    // A leaf whose value is itself a plain object (only ever the fresh
+    // `{}` from `materializeLeafValue`) must not clobber a more-specific
+    // leaf already written under the same prefix (`queues.urgent.order`)
+    // -- regardless of which leaf a `Set`/`Map` iterates first.
     return;
   }
   node[last] = value;
@@ -341,7 +490,7 @@ function setPath(root: Record<string, unknown>, path: readonly string[], value: 
 // Schema introspection: walking `effectiveConfigSchema` to enumerate its
 // fixed-shape leaves (R2's classification walk in keys.ts does the same
 // thing for a different purpose) and to look up the leaf schema at an
-// arbitrary dotted path (for env coercion, R9).
+// arbitrary path (for env coercion, R9).
 // ---------------------------------------------------------------------------
 
 type IntrospectableSchema = z.ZodType & { type: string; def: Record<string, unknown> };
@@ -363,8 +512,8 @@ function unwrapSchema(schema: IntrospectableSchema): IntrospectableSchema {
 }
 
 /**
- * Every leaf dotted path reachable through `effectiveConfigSchema`'s
- * *fixed* shape -- object fields only. A `z.record(...)` field (`backers`,
+ * Every leaf path reachable through `effectiveConfigSchema`'s *fixed*
+ * shape -- object fields only. A `z.record(...)` field (`backers`,
  * `queues`, `hooks`, ...) is a dynamic map whose real keys the schema
  * cannot enumerate; those leaves are discovered from actual layer data
  * instead (`flattenLeaves` over each loaded layer), not from here.
@@ -372,7 +521,7 @@ function unwrapSchema(schema: IntrospectableSchema): IntrospectableSchema {
 function collectFixedLeafPaths(
   schema: IntrospectableSchema,
   prefix: readonly string[],
-  out: string[],
+  out: string[][],
 ): void {
   const s = unwrapSchema(schema);
   if (s.type === "object") {
@@ -386,14 +535,14 @@ function collectFixedLeafPaths(
     return;
   }
   if (prefix.length > 0) {
-    out.push(prefix.join("."));
+    out.push([...prefix]);
   }
 }
 
 /**
- * The zod schema governing one dotted path, navigating through both fixed
- * object fields and `z.record(...)` maps (any segment is a legal record
- * key). Returns `undefined` when the path does not exist in
+ * The zod schema governing one path, navigating through both fixed object
+ * fields and `z.record(...)` maps (any segment is a legal record key).
+ * Returns `undefined` when the path does not exist in
  * `effectiveConfigSchema` at all (R10: `CANKAN_*` resolves only against
  * keys that exist here) or when it names a container rather than a leaf.
  * A record whose value type is opaque (`z.unknown()`/`z.any()` -- e.g.
@@ -437,10 +586,17 @@ function getLeafSchema(root: z.ZodType, path: readonly string[]): z.ZodType | un
 
 // ---------------------------------------------------------------------------
 // Env overrides (R8-R10).
+//
+// AMENDMENT A1's "known limit, accepted": this mapping cannot express a
+// segment that itself contains a dot, a space (`status_map` keys are
+// column names like "To Do"), or mixed case -- `CANKAN_` + upper-snake with
+// `__` for dots has no escape mechanism for any of those. Such keys are
+// simply not settable from the environment; this is an accepted limitation
+// of the env channel, not a defect, and no encoding is invented for it.
 // ---------------------------------------------------------------------------
 
 /** The inverse of R8's mapping rule -- `undefined` for anything not `CANKAN_*`. */
-function envVarToKey(varName: string): string | undefined {
+function envVarToPath(varName: string): string[] | undefined {
   if (!varName.startsWith("CANKAN_")) {
     return undefined;
   }
@@ -448,10 +604,7 @@ function envVarToKey(varName: string): string | undefined {
   if (rest.length === 0) {
     return undefined;
   }
-  return rest
-    .split("__")
-    .map((segment) => segment.toLowerCase())
-    .join(".");
+  return rest.split("__").map((segment) => segment.toLowerCase());
 }
 
 /**
@@ -506,14 +659,19 @@ const FILE_LAYER_ORDER: readonly Exclude<ConfigLayer, "env" | "default">[] = [
 
 type FileLayer = Exclude<ConfigLayer, "env" | "default">;
 
-/** See contract §1. */
+/** See contract §1 (as amended by A1). */
 export async function loadConfig(options: LoadConfigOptions = {}): Promise<ConfigResult> {
   const env = options.env ?? process.env;
   const repoRoot = options.repoRoot;
 
+  // Review round 2 finding 1: `resolveGlobalConfigPath` now returns
+  // `undefined` when no absolute path can be formed (HOME/XDG_CONFIG_HOME
+  // both absent/relative) -- treated as R12's "missing layer", not loaded.
   const globalPath = resolveGlobalConfigPath(env);
   const [globalLoaded, repoLoaded, repoLocalLoaded] = await Promise.all([
-    loadValidatedLayer("global", globalPath, globalConfigSchema, POLICY_TAGS),
+    globalPath
+      ? loadValidatedLayer("global", globalPath, globalConfigSchema, POLICY_TAGS)
+      : Promise.resolve(undefined),
     repoRoot
       ? loadValidatedLayer("repo", resolveRepoConfigPath(repoRoot), repoConfigSchema, POLICY_TAGS)
       : Promise.resolve(undefined),
@@ -534,12 +692,13 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
   // regardless of whether it is later aliased elsewhere in the same file.
   // A multi-document file is already rejected before this point -- yaml
   // itself reports a MULTIPLE_DOCS parse error, caught by
-  // `loadValidatedLayer`'s R16 path.
+  // `loadValidatedLayer`'s R16 path. `findPolicyTaggedPaths` itself throws
+  // for a root-level tag (finding 7), for any of the three files.
   for (const loaded of [repoLocalLoaded, globalLoaded]) {
     if (!loaded) {
       continue;
     }
-    if (findPolicyTaggedPaths(loaded.doc).length > 0) {
+    if (findPolicyTaggedPaths(loaded.doc, loaded.layer.file).length > 0) {
       throw new CanKanError(
         ConfigErrorCodes.INVALID_CONFIG,
         `${loaded.layer.file}: "!policy" is only allowed in .cankan/config.yml`,
@@ -548,19 +707,21 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
     }
   }
 
-  const pinnedRoots = repoLoaded ? findPolicyTaggedPaths(repoLoaded.doc) : [];
+  const pinnedRoots: string[][] = repoLoaded
+    ? findPolicyTaggedPaths(repoLoaded.doc, repoLoaded.layer.file)
+    : [];
 
   const globalLeaves = globalLoaded
     ? flattenLeaves(globalLoaded.layer.data, [], new Map())
-    : new Map<string, unknown>();
+    : new Map<string, FlatLeaf>();
   const repoLeaves = repoLoaded
     ? flattenLeaves(repoLoaded.layer.data, [], new Map())
-    : new Map<string, unknown>();
+    : new Map<string, FlatLeaf>();
   const repoLocalLeaves = repoLocalLoaded
     ? flattenLeaves(repoLocalLoaded.layer.data, [], new Map())
-    : new Map<string, unknown>();
+    : new Map<string, FlatLeaf>();
 
-  const leavesByLayer: Record<FileLayer, Map<string, unknown>> = {
+  const leavesByLayer: Record<FileLayer, Map<string, FlatLeaf>> = {
     "repo-local": repoLocalLeaves,
     repo: repoLeaves,
     global: globalLeaves,
@@ -583,13 +744,19 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
       if (!loaded) {
         continue;
       }
-      for (const key of [...leavesByLayer[attemptedLayer].keys()].sort()) {
-        const pin = findPinnedRoot(key, pinnedRoots);
+      const sortedLeaves = [...leavesByLayer[attemptedLayer].values()].sort((a, b) => {
+        const ka = renderPath(a.path);
+        const kb = renderPath(b.path);
+        return ka < kb ? -1 : ka > kb ? 1 : 0;
+      });
+      for (const leaf of sortedLeaves) {
+        const pin = findPinnedRoot(leaf.path, pinnedRoots);
         if (!pin) {
           continue;
         }
         const pinningFile = repoLoaded.layer.file;
         const pinningFileRelative = repoRoot ? relative(repoRoot, pinningFile) : pinningFile;
+        const key = renderPath(leaf.path);
         throw new CanKanError(
           ErrorCodes.POLICY_VIOLATION,
           `${key} is set as policy by ${pinningFileRelative}`,
@@ -606,45 +773,55 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
     }
   }
 
-  // The full candidate key set: every fixed schema leaf, every dynamic leaf
-  // any loaded layer actually set, and every CANKAN_* var that maps to a
-  // real leaf in effectiveConfigSchema (R10) -- e.g. CANKAN_ACTOR when no
-  // file sets `actor` at all.
-  const fixedLeaves: string[] = [];
+  // The full candidate path set: every fixed schema leaf, every dynamic
+  // leaf any loaded layer actually set, and every CANKAN_* var that maps
+  // to a real leaf in effectiveConfigSchema (R10) -- e.g. CANKAN_ACTOR
+  // when no file sets `actor` at all.
+  const fixedLeaves: string[][] = [];
   collectFixedLeafPaths(effectiveConfigSchema as unknown as IntrospectableSchema, [], fixedLeaves);
 
-  const envKeyToVar = new Map<string, string>();
+  const envPathByVar = new Map<string, string>(); // encodePathKey(path) -> CANKAN_* var name
+  const envPaths: string[][] = [];
   for (const [varName, raw] of Object.entries(env)) {
     if (raw === undefined || !varName.startsWith("CANKAN_")) {
       continue;
     }
-    const key = envVarToKey(varName);
-    if (!key?.split(".").every(isSafeSegment)) {
+    const path = envVarToPath(varName);
+    if (!path?.every(isSafeSegment)) {
       continue;
     }
-    if (getLeafSchema(effectiveConfigSchema, key.split(".")) === undefined) {
+    if (getLeafSchema(effectiveConfigSchema, path) === undefined) {
       continue; // R10: only keys that exist in effectiveConfigSchema
     }
-    envKeyToVar.set(key, varName);
+    envPathByVar.set(encodePathKey(path), varName);
+    envPaths.push(path);
   }
 
-  const allKeys = new Set<string>([
+  const allPathsByKey = new Map<string, string[]>();
+  for (const path of [
     ...fixedLeaves,
-    ...globalLeaves.keys(),
-    ...repoLeaves.keys(),
-    ...repoLocalLeaves.keys(),
-    ...envKeyToVar.keys(),
-  ]);
+    ...[...globalLeaves.values()].map((l) => l.path),
+    ...[...repoLeaves.values()].map((l) => l.path),
+    ...[...repoLocalLeaves.values()].map((l) => l.path),
+    ...envPaths,
+  ]) {
+    allPathsByKey.set(encodePathKey(path), path);
+  }
+
+  // Review round 2 finding 6: drop any candidate path that is a strict
+  // prefix of another candidate path (see `dropStrictPrefixes`'s comment).
+  const candidatePaths = dropStrictPrefixes([...allPathsByKey.values()]);
 
   const defaultsFlat = flattenLeaves(effectiveConfigSchema.parse({}), [], new Map());
 
-  const resolvedMap = new Map<string, ResolvedEntry>();
+  const resolvedByPath = new Map<string, ResolvedEntry>();
   const merged: Record<string, unknown> = {};
 
-  for (const key of allKeys) {
-    const classification = classifyKey(key);
-    const pin = findPinnedRoot(key, pinnedRoots);
+  for (const path of candidatePaths) {
+    const classification = classifyKey(path);
+    const pin = findPinnedRoot(path, pinnedRoots);
     const chain = classification === "policy" || pin ? POLICY_CHAIN : PREFERENCE_CHAIN;
+    const pathKey = encodePathKey(path);
 
     let winner:
       | { layer: ConfigLayer; value: unknown; file?: string; envVar?: string }
@@ -652,7 +829,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
 
     for (const rung of chain) {
       if (rung === "env") {
-        const varName = envKeyToVar.get(key);
+        const varName = envPathByVar.get(pathKey);
         if (varName === undefined) {
           continue;
         }
@@ -660,7 +837,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
         if (raw === undefined) {
           continue;
         }
-        const leafSchema = getLeafSchema(effectiveConfigSchema, key.split("."));
+        const leafSchema = getLeafSchema(effectiveConfigSchema, path);
         if (!leafSchema) {
           continue;
         }
@@ -668,23 +845,25 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
         if (!coerced.ok) {
           throw new CanKanError(
             ConfigErrorCodes.INVALID_CONFIG,
-            `${varName} does not satisfy ${key}'s schema`,
-            { details: { envVar: varName, key } },
+            `${varName} does not satisfy ${renderPath(path)}'s schema`,
+            { details: { envVar: varName, key: renderPath(path) } },
           );
         }
         winner = { layer: "env", value: coerced.value, envVar: varName };
         break;
       }
       if (rung === "default") {
-        if (defaultsFlat.has(key)) {
-          winner = { layer: "default", value: defaultsFlat.get(key) };
+        const leaf = defaultsFlat.get(pathKey);
+        if (leaf) {
+          winner = { layer: "default", value: materializeLeafValue(leaf.value) };
         }
         break;
       }
       const leaves = leavesByLayer[rung];
       const loaded = loadedByLayer[rung];
-      if (loaded && leaves.has(key)) {
-        winner = { layer: rung, value: leaves.get(key), file: loaded.layer.file };
+      const leaf = leaves.get(pathKey);
+      if (loaded && leaf) {
+        winner = { layer: rung, value: materializeLeafValue(leaf.value), file: loaded.layer.file };
         break;
       }
     }
@@ -693,7 +872,9 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
       continue;
     }
 
+    const key = renderPath(path);
     const entry: ResolvedEntry = {
+      path,
       key,
       value: winner.value,
       layer: winner.layer,
@@ -701,24 +882,51 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Confi
       ...(winner.envVar !== undefined ? { envVar: winner.envVar } : {}),
       ...(pin && repoLoaded ? { pinnedBy: repoLoaded.layer.file } : {}),
     };
-    resolvedMap.set(key, entry);
-    setPath(merged, key.split("."), winner.value);
+    resolvedByPath.set(pathKey, entry);
+    setPath(merged, path, winner.value);
   }
 
-  const value = effectiveConfigSchema.parse(merged);
+  // Review round 2 finding 4: this used to be a bare `.parse(...)`, so a
+  // schema mismatch here (which AMENDMENT A1's path-array fix should make
+  // effectively unreachable in practice, since the lossy dotted round-trip
+  // that could cause one is gone) would throw a raw `ZodError` out of
+  // `loadConfig` -- `isCanKanError` false, `code` undefined, invisible to
+  // M3.10's exit-code map. Wrapped defensively regardless.
+  const parsedValue = effectiveConfigSchema.safeParse(merged);
+  if (!parsedValue.success) {
+    throw buildConfigValidationError("merged effective config", parsedValue.error);
+  }
+  const value = parsedValue.data;
 
   const layers: LoadedLayer[] = FILE_LAYER_ORDER.map((name) => loadedByLayer[name]?.layer).filter(
     (l): l is LoadedLayer => l !== undefined,
   );
 
-  const sortedEntries = [...resolvedMap.values()].sort((a, b) =>
-    a.key < b.key ? -1 : a.key > b.key ? 1 : 0,
+  const sortedEntries = Object.freeze(
+    [...resolvedByPath.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)),
   );
+
+  // AMENDMENT A1 rule 3: the string form of `resolved()` matches exactly
+  // against the rendered `key`, and on a collision returns whichever entry
+  // appears first in `entries()` order.
+  const resolvedByRenderedKey = new Map<string, ResolvedEntry>();
+  for (const entry of sortedEntries) {
+    if (!resolvedByRenderedKey.has(entry.key)) {
+      resolvedByRenderedKey.set(entry.key, entry);
+    }
+  }
+
+  function resolved(key: string | readonly string[]): ResolvedEntry | undefined {
+    if (Array.isArray(key)) {
+      return resolvedByPath.get(encodePathKey(key));
+    }
+    return resolvedByRenderedKey.get(key as string);
+  }
 
   return {
     value,
     layers: Object.freeze(layers),
-    resolved: (key: string) => resolvedMap.get(key),
+    resolved,
     entries: () => sortedEntries,
   };
 }

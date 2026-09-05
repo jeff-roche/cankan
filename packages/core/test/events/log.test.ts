@@ -10,6 +10,7 @@ import {
   type EventCandidate,
   read,
 } from "../../src/events/log";
+import type { EventId } from "../../src/events/schema";
 // See `git.test.ts`'s own comment: `@jeff-roche/cankan-test-utils` is not a
 // declared dependency of `packages/core/package.json`, so a relative import
 // to the source file is used instead of the package specifier.
@@ -496,6 +497,58 @@ describe("read — filters", () => {
     expect(sinceSecond).toEqual([]);
   });
 
+  test("fix round 4, Medium 1: a malformed since is rejected rather than silently returning [] on a board with real events", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const appended = await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    const realUlid = appended.event.id as string;
+
+    // Before the fix: a lowercased-but-otherwise-real ULID passed `read`'s
+    // `id > since` comparison against every real event as "not greater
+    // than," so this resolved `[]` on a board holding a real event — the
+    // mutual-exclusion guarantee's own failure shape (a caller polling
+    // with this cursor would conclude ck-1 is unheld).
+    await expectCode(
+      read(adapter, COORD_REF, { now: SEPT_15_MS, since: realUlid.toLowerCase() as EventId }),
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+    );
+  });
+
+  test("fix round 4, Medium 1: degenerate since values (null/object/0 coerced through) are rejected", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    // Cast through `unknown` — these are runtime-only shapes a caller
+    // bypassing TypeScript (or forwarding external input blindly) could
+    // still pass; `ReadOptions.since` being typed `EventId` does not stop
+    // them at runtime.
+    for (const bad of [null, {}, 0] as const) {
+      await expectCode(
+        read(adapter, COORD_REF, { now: SEPT_15_MS, since: bad as unknown as EventId }),
+        EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+      );
+    }
+  });
+
+  test("fix round 4, Medium 1: valid-shaped since values (25/27 chars, I/L/O/U, empty string) are all rejected, and a real ULID is accepted", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const appended = await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    const realUlid = appended.event.id as string;
+
+    for (const bad of [realUlid.slice(0, 25), `${realUlid}X`, `${realUlid.slice(0, 25)}I`, ""]) {
+      await expectCode(
+        read(adapter, COORD_REF, { now: SEPT_15_MS, since: bad as unknown as EventId }),
+        EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+      );
+    }
+
+    // And a genuinely valid ULID (this event's own id) is accepted and
+    // correctly excludes it (exclusive lower bound).
+    await expect(read(adapter, COORD_REF, { now: SEPT_15_MS, since: appended.event.id })).resolves.toEqual([]);
+  });
+
   test("ticket matches case-insensitively, canonicalized the same way append canonicalizes on write", async () => {
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);
@@ -505,6 +558,26 @@ describe("read — filters", () => {
     const records = await read(adapter, COORD_REF, { now: SEPT_15_MS, ticket: "CK-1" });
     expect(records).toHaveLength(1);
     expect(records[0]?.event.ticket as string | undefined).toBe("ck-1");
+  });
+
+  test("fix round 4, corrected sweep: a non-string ticket filter is rejected with a CanKanError, not a raw TypeError", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    // Before the fix: `canonicalizeTicketId`'s entire body is a bare
+    // `.toLowerCase()` call — a method that does not exist on `number` or
+    // `null` — so this leaked an unwrapped, native `TypeError` straight out
+    // of `read()`, not a `CanKanError`.
+    for (const bad of [123, null] as const) {
+      try {
+        await read(adapter, COORD_REF, { now: SEPT_15_MS, ticket: bad as unknown as string });
+        throw new Error("expected read() to reject");
+      } catch (error) {
+        if (!isCanKanError(error)) throw error;
+        expect(error.code).toBe(EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
+      }
+    }
   });
 
   test("actor matches by exact string equality", async () => {
@@ -868,6 +941,56 @@ describe("append — fix round 3 sweep: casRetry.maxAttempts validated against w
 });
 
 // ============================================================================
+// Fix round 4, Medium 2 — casRetry.backoffMs's *return value* was forwarded
+// to withCasRetry unvalidated
+// ============================================================================
+
+describe("append — fix round 4, Medium 2: casRetry.backoffMs's return value validated against setTimeout's actual domain", () => {
+  /**
+   * `backoffMs` is only ever called *between* a failed attempt and the
+   * next one — so exercising its validation requires forcing at least one
+   * real retry, using the same interleave seam the CAS-retry test uses.
+   */
+  async function forceOneRetryThenReturn(backoffMs: (attemptNumber: number) => number): Promise<unknown> {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-seed"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    const hooks: AppendHooks = {
+      beforeCas: async (attemptNumber) => {
+        if (attemptNumber === 1) {
+          // Guarantee this call's own first attempt is rejected, forcing
+          // a real second attempt (and therefore a real `backoffMs` call)
+          // through the loop.
+          await append(adapter, COORD_REF, claim("ck-interloper"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+        }
+      },
+    };
+
+    return appendCore(adapter, COORD_REF, claim("ck-mine"), { now: SEPT_15_MS, casRetry: { maxAttempts: 3, backoffMs } }, hooks);
+  }
+
+  test("rejects an in-range-but-day-scale return value (INT32_MAX) that setTimeout would not clamp", async () => {
+    // Before the fix: `setTimeout(fn, 2_147_483_647)` is genuinely
+    // scheduled for ~24.8 days (confirmed by probe, task-2-report.md's
+    // fix-round-4 addendum) rather than firing immediately the way
+    // `NaN`/`Infinity`/negative/over-32-bit values are clamped to do — so
+    // this specific value is the one a bare `Number.isFinite` check would
+    // have let straight through.
+    await expectCode(forceOneRetryThenReturn(() => 2_147_483_647), EventErrorCodes.EVENT_APPEND_INVALID_OPTION);
+  }, 10_000);
+
+  test("rejects NaN and a negative return value", async () => {
+    await expectCode(forceOneRetryThenReturn(() => Number.NaN), EventErrorCodes.EVENT_APPEND_INVALID_OPTION);
+  }, 10_000);
+
+  test("accepts a legitimate small return value and completes the retry normally", async () => {
+    const result = (await forceOneRetryThenReturn(() => 5)) as { event: { ticket: string } };
+    expect(result.event.ticket as string).toBe("ck-mine");
+  }, 10_000);
+});
+
+// ============================================================================
 // Fix round 2, Ruling R23 — S6's two-lane design was correct but unguarded:
 // the suite stayed green even with the fix reverted to a single shared factory
 // ============================================================================
@@ -984,6 +1107,29 @@ describe("append — fix round 1, S2: the existing-blob-size bound", () => {
       EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
     );
   });
+
+  test("fix round 4, Low 2: a non-number maxExistingBlobBytes is rejected, not silently accepted", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const oversized = `${"x".repeat(65 * 1024 * 1024)}\n`;
+    await seedMonthFile(adapter, oversized);
+
+    // Before the fix: `Number.isNaN` does not coerce, so neither "abc" nor
+    // {} is `NaN`, and neither is `< 0` (JavaScript's own `ToNumber`
+    // coercion for the comparison makes both `false`) — both passed the
+    // pre-fix check and silently disabled the cap, applying the write onto
+    // the oversized month exactly as if no cap existed.
+    for (const bad of ["abc", {}] as const) {
+      await expectCode(
+        append(adapter, COORD_REF, claim("ck-1"), {
+          now: SEPT_15_MS,
+          casRetry: FAST_RETRY,
+          maxExistingBlobBytes: bad as unknown as number,
+        }),
+        EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+      );
+    }
+  }, 20_000);
 });
 
 // ============================================================================

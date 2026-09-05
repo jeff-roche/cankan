@@ -21,7 +21,7 @@ import { CanKanError } from "../errors";
 import type { CasRetryOptions, GitAdapter } from "../git/index";
 import { validateCoordinationRef, withCasRetry } from "../git/index";
 import { EventErrorCodes } from "./errors";
-import { canonicalizeTicketId, parseEvent } from "./schema";
+import { canonicalizeTicketId, isValidEventId, parseEvent } from "./schema";
 import type { Event, EventId, EventValidationIssue } from "./schema";
 
 // ============================================================================
@@ -89,6 +89,69 @@ const MAX_TRAILING_MONTHS = 120;
 const MAX_CAS_ATTEMPTS = 10_000;
 
 /**
+ * Upper bound on a caller-supplied `AppendOptions.casRetry.backoffMs`'s
+ * *return value* (fix round 4, Medium 2). `git/retry.ts`'s `withCasRetry`
+ * passes `backoffMs(attemptNumber)`'s result straight to `sleep`
+ * (`setTimeout` by default), and an **in-range** return value is not
+ * clamped the way an out-of-range one is — confirmed directly on this
+ * runtime (bun 1.4.0): `setTimeout(fn, NaN | Infinity | -5 | 2**31 |
+ * 1e15)` all fire almost immediately (each clamped to ~1ms, with a
+ * `TimeoutOverflowWarning`/`TimeoutNaNWarning`/`TimeoutNegativeWarning`),
+ * but `setTimeout(fn, 2_147_483_647)` (`INT32_MAX`, the boundary of the
+ * 32-bit signed range `setTimeout`'s delay actually uses) is still pending
+ * after 600ms — it is genuinely scheduled for the full ~24.8 days, and
+ * the pending timer keeps the process alive for that whole span. Through
+ * the real `appendCore` retry loop under real forced contention, with an
+ * already-validated `maxAttempts: 2`: confirmed the call is still
+ * unresolved after 5 seconds, having made only its first attempt — the
+ * identical availability loss `MAX_CAS_ATTEMPTS` closes for attempt
+ * *count*, reachable instead through backoff *duration*: up to
+ * `maxAttempts - 1` waits of ~24.8 days each under the default
+ * `maxAttempts` (50), or unboundedly many under a caller-supplied one.
+ *
+ * Same scope reasoning as `MAX_CAS_ATTEMPTS`: the guard belongs in
+ * `git/retry.ts` (M2.6, out of this phase's reach per Ruling R19) and is
+ * reported as a widened follow-up recommendation covering both options;
+ * `events/` validates what it forwards. One minute is generous headroom
+ * over `withCasRetry`'s own default backoff (capped at 1 second per
+ * attempt) while nowhere near the day-scale hazard a caller-supplied
+ * function can otherwise reach.
+ */
+const MAX_BACKOFF_MS = 60_000;
+
+/**
+ * Wraps a caller-supplied `backoffMs` so every value it *returns* — not
+ * just `maxAttempts` — is validated before `withCasRetry` can act on it
+ * (fix round 4, Medium 2). Validates on every call (not once, up front):
+ * nothing requires a caller's function to return the same value on every
+ * attempt, so a single early check would miss a later attempt returning
+ * something out of range. Returns `casRetry` unchanged when no
+ * `backoffMs` override is present — `withCasRetry`'s own default
+ * (`git/retry.ts`'s `defaultBackoffMs`, capped at 1 second) is already
+ * safe by construction and does not need wrapping.
+ */
+function withValidatedBackoff(casRetry: CasRetryOptions | undefined): CasRetryOptions | undefined {
+  const userBackoffMs = casRetry?.backoffMs;
+  if (userBackoffMs === undefined) {
+    return casRetry;
+  }
+  return {
+    ...casRetry,
+    backoffMs: (attemptNumber: number) => {
+      const ms = userBackoffMs(attemptNumber);
+      if (!Number.isFinite(ms) || ms < 0 || ms > MAX_BACKOFF_MS) {
+        throw new CanKanError(
+          EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+          `casRetry.backoffMs must return a finite number in [0, ${MAX_BACKOFF_MS}], got ${ms}`,
+          { details: { backoffMs: ms, max: MAX_BACKOFF_MS } },
+        );
+      }
+      return ms;
+    },
+  };
+}
+
+/**
  * Validates `trailingMonths` before it drives any loop (fix round 1, S1).
  * Must be a finite integer in `[1, MAX_TRAILING_MONTHS]` — `0`, a negative
  * number, `NaN`, and `Infinity` are all rejected by `Number.isInteger`
@@ -149,11 +212,23 @@ const MAX_DATE_MS = 8_640_000_000_000_000;
 const MAX_ULID_TIME_MS = 281_474_976_710_655;
 
 /**
- * Validates a `now` that reaches date formatting only — `monthKeyUtc`, via
- * `read`'s and `initRef`'s month-key computation — never a ULID factory.
- * Used by `read` (this file) and, via the module-internal export below, by
- * `ref.ts`'s `initRef` (fix round 3 sweep: `initRef` previously validated
- * no `now` at all — see task-2-report.md's fix-round-3 addendum).
+ * Validates a `now` that never reaches a ULID factory (`append`'s tighter
+ * `validateNowForMinting`, below, is for that case). Named for its
+ * strictest/defining consumer, `monthKeyUtc` — via `read`'s window
+ * computation and `initRef`'s placeholder-file naming — but **fix round 4's
+ * corrected sweep traced `read`'s `now` further and found a second
+ * consumer this name doesn't advertise**: `read` also feeds the same `now`
+ * to `parseEvent`'s `ts`-upper-bound check on every line (`now + 24h`).
+ * Probed directly at this function's own boundary (task-2-report.md's
+ * fix-round-4 addendum) rather than assumed: `parseEvent(line, { now:
+ * MAX_DATE_MS })` behaves correctly (no `NaN`, no crash — a real `ts` is
+ * always far enough in the past relative to an astronomically-future
+ * `now` to pass), and `now: -MAX_DATE_MS`/`now: 0` correctly reject the
+ * same `ts` as "in the future" rather than miscomparing — this bound
+ * already covers that consumer's domain too, so no second, separate check
+ * is needed for it. Used by `read` (this file) and, via the
+ * module-internal export below, by `ref.ts`'s `initRef` (fix round 3
+ * sweep: `initRef` previously validated no `now` at all).
  */
 export function validateNowForDateFormatting(now: number): void {
   if (!Number.isFinite(now) || now < -MAX_DATE_MS || now > MAX_DATE_MS) {
@@ -178,6 +253,73 @@ function validateNowForMinting(now: number): void {
       `now must be within ulid's encodable range [0, ${MAX_ULID_TIME_MS}], got ${now}`,
       { details: { now, minValue: 0, maxValue: MAX_ULID_TIME_MS } },
     );
+  }
+}
+
+/**
+ * Validates `ReadOptions.since` against `read()`'s own filter's actual
+ * domain (fix round 4, Medium 1 — a gap the fix-round-3 sweep missed
+ * entirely because its invariant said "every *numeric* option," and
+ * `since` is a string). `read()`'s filter compares `record.event.id >
+ * since` — a lexicographic string comparison, which JavaScript happily
+ * performs (and silently miscompares) against *any* string, or coerces
+ * via `ToString` against a non-string entirely — so an invalid `since`
+ * does not throw and does not get ignored: it silently changes which
+ * records the comparison keeps. Confirmed directly against a board
+ * holding real events: a lowercased-but-otherwise-real ULID, and each of
+ * `null`/`{}`/`0`, all pass every real event's `id` through the `>`
+ * comparison as "not greater than," so `filtered` keeps **zero** of them
+ * — a *silently empty* result, not an error, on a board that has events.
+ * End to end, this is the mutual-exclusion guarantee's own failure shape:
+ * a caller polling `read({ ticket, since: <malformed cursor> })` and
+ * getting back no records concludes the ticket is unheld.
+ *
+ * `isValidEventId` (already exported from `schema.ts` for exactly "is this
+ * specific string a valid event id" checks, and already applied to every
+ * `candidate.id` `append` accepts, and to every line's `id` `read` parses
+ * off the ref) is the same check, just not previously wired to this one
+ * more caller-supplied entry point for an event id.
+ */
+function validateSince(since: string): void {
+  if (!isValidEventId(since)) {
+    // Obligation E: `since` is a caller-supplied string that has not yet
+    // been validated as safe to publish — unlike `now`/`trailingMonths`
+    // (numbers, whose string form is always a safe numeric literal), an
+    // invalid `since` could itself carry arbitrary bytes if it reached
+    // this call already tainted by an untrusted upstream source. No
+    // `details` at all: report that the check failed, never the value
+    // that failed it — the same discipline `ticket/filename.ts`'s
+    // `assertSafeId` already applies.
+    throw new CanKanError(EventErrorCodes.EVENT_LOG_INVALID_WINDOW, "since must be a valid ULID event id");
+  }
+}
+
+/**
+ * Validates `ReadOptions.ticket`'s actual domain — a genuine `string`
+ * (fix round 4, corrected sweep). Found by tracing `ticket`'s data flow
+ * rather than grepping its name: `read()` feeds it to
+ * `canonicalizeTicketId`, whose entire body is a bare `.toLowerCase()`
+ * call (`schema.ts`) — a method that does not exist on `number`/`null`/an
+ * object literal. Confirmed directly: `canonicalizeTicketId(123)` and
+ * `canonicalizeTicketId(null)` both throw a raw, unwrapped `TypeError`
+ * ("... .toLowerCase is not a function" / "null is not an object"), not a
+ * `CanKanError` — the same "leaks a third-party/native error past
+ * `isCanKanError` handling" shape this dispatch has already closed for
+ * `now`-past-`ulid`'s-encoder (fix round 3, M1) and `since`-past-`isValidEventId`
+ * (this round, Medium 1). `.toLowerCase()` itself never throws for any
+ * *string* input regardless of length or content, so a plain `typeof`
+ * check closes the actual defect completely — no further shape
+ * restriction is needed (a garbage-but-string `ticket` filter simply
+ * matches nothing, which is the same fail-strict, not fail-open, shape
+ * `actor`'s plain `!==` comparison already has by construction — traced
+ * and probed too: any type compared with `!==` against a string is safe,
+ * confirmed directly, no fix needed there).
+ */
+function validateTicketFilter(ticket: string): void {
+  if (typeof ticket !== "string") {
+    throw new CanKanError(EventErrorCodes.EVENT_LOG_INVALID_WINDOW, `ticket filter must be a string, got ${typeof ticket}`, {
+      details: { type: typeof ticket },
+    });
   }
 }
 
@@ -468,7 +610,16 @@ export interface AppendOptions {
    * task-2-report.md).
    */
   readonly ulidFactory?: (seedTime?: number) => string;
-  /** Passed through to `withCasRetry` unchanged — the retry policy is M2.6's, not reimplemented here. */
+  /**
+   * Passed through to `withCasRetry` — the retry policy is M2.6's, not
+   * reimplemented here. `maxAttempts` and `backoffMs`'s return value are
+   * each validated against `withCasRetry`'s own loop/sleep domain before
+   * this reaches M2.6 (fix round 3 sweep, Ruling R27; fix round 4, Medium
+   * 2) — see `MAX_CAS_ATTEMPTS`/`MAX_BACKOFF_MS`'s doc comments. `sleep`
+   * is passed through entirely unvalidated: overriding the actual wait
+   * primitive with a broken implementation is a caller-side bug, not a
+   * numeric value this module can meaningfully bound.
+   */
   readonly casRetry?: CasRetryOptions;
   /**
    * The cap on the *existing* month blob's size, checked before this call
@@ -610,16 +761,24 @@ export async function appendCore(
   // from the real-clock path.
   const mint = options.ulidFactory ?? (options.now !== undefined ? injectedClockUlidFactory : defaultUlidFactory);
   const maxExistingBlobBytes = options.maxExistingBlobBytes ?? MAX_MONTH_BLOB_BYTES;
-  // Fix round 2 (Low): `NaN` would otherwise silently disable the size cap
-  // (`existingBytes > NaN` is always `false`), and a negative value would
-  // refuse even an empty month — see `AppendOptions.maxExistingBlobBytes`'s
-  // doc comment. `Number.POSITIVE_INFINITY` (the documented bypass) is
-  // explicitly allowed.
-  if (Number.isNaN(maxExistingBlobBytes) || maxExistingBlobBytes < 0) {
+  // Fix round 2 (Low) / fix round 4, Low 2: `NaN` would otherwise silently
+  // disable the size cap (`existingBytes > NaN` is always `false`), and a
+  // negative value would refuse even an empty month — see
+  // `AppendOptions.maxExistingBlobBytes`'s doc comment.
+  // `Number.POSITIVE_INFINITY` (the documented bypass) is explicitly
+  // allowed. **`typeof ... !== "number"` is the fix-round-4 addition**:
+  // `Number.isNaN` does not coerce (unlike the global `isNaN`), so a
+  // non-number value (a string, an object) is neither `NaN` nor `< 0` in
+  // JavaScript's own comparison semantics — confirmed by probe
+  // (task-2-report.md's fix-round-4 addendum) that `"abc"` and `{}` both
+  // passed the pre-fix check and silently disabled the cap, TypeScript's
+  // own type on this option notwithstanding (a boundary function is
+  // reachable from less-strict callers than `tsc` polices).
+  if (typeof maxExistingBlobBytes !== "number" || Number.isNaN(maxExistingBlobBytes) || maxExistingBlobBytes < 0) {
     throw new CanKanError(
       EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
-      `maxExistingBlobBytes must be a non-negative number (or Infinity), got ${maxExistingBlobBytes}`,
-      { details: { maxExistingBlobBytes } },
+      `maxExistingBlobBytes must be a non-negative number (or Infinity), got ${typeof maxExistingBlobBytes === "number" ? maxExistingBlobBytes : typeof maxExistingBlobBytes}`,
+      { details: { maxExistingBlobBytes: typeof maxExistingBlobBytes === "number" ? maxExistingBlobBytes : null } },
     );
   }
   // Fix round 3 sweep, Ruling R27: `casRetry.maxAttempts` is forwarded
@@ -744,7 +903,7 @@ export async function appendCore(
       return { done: true, value: { event, month, line: priorLineCount } };
     }
     return { done: false };
-  }, options.casRetry);
+  }, withValidatedBackoff(options.casRetry));
 }
 
 // ============================================================================
@@ -843,6 +1002,16 @@ export interface ReadOptions {
    * gate a read (obligation D's sibling rule). A caller polling
    * incrementally passes the highest `id` it has already seen; `since`
    * itself is not re-returned.
+   *
+   * Validated (fix round 4, Medium 1) via `isValidEventId` before any git
+   * invocation. Previously **not validated at all**: `id > since` is a
+   * lexicographic string comparison, which JavaScript performs (and
+   * silently miscompares) against any string — a lowercased-but-otherwise-
+   * real ULID, or `since` values as degenerate as `null`/`{}`/`0` coerced
+   * through, all made every real event's `id` compare as "not greater
+   * than," so `read()` silently returned `[]` on a board that has events.
+   * This is the mutual-exclusion guarantee's own failure shape: a caller
+   * polling with a malformed cursor concludes a held ticket is unheld.
    */
   readonly since?: EventId;
   /** Matched case-insensitively: canonicalized the same way `append` canonicalizes `ticket` on write (ADR 0001:751-764), so `read({ ticket: "CK-1" })` finds an event appended as `ck-1`. */
@@ -906,6 +1075,23 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
   // months that cannot exist.
   validateNowForDateFormatting(now);
   validateTrailingMonths(trailingMonths);
+  // Fix round 4, Medium 1: `since` is compared with `>` against every
+  // parsed line's `id` below — see `validateSince`'s doc comment for why
+  // an unvalidated `since` fails open exactly like an unvalidated
+  // `trailingMonths`/`now` did in earlier rounds, but silently rather than
+  // by throwing, which makes it the more dangerous of the two shapes.
+  if (options.since !== undefined) {
+    validateSince(options.since);
+  }
+  // Fix round 4, corrected sweep: `ticket` reaches `canonicalizeTicketId`
+  // (a bare `.toLowerCase()`) in the filter step below — see
+  // `validateTicketFilter`'s doc comment. Checked here, fail-fast and
+  // before any git invocation, consistently with every other option check
+  // above, even though the actual consumption happens later in this
+  // function.
+  if (options.ticket !== undefined) {
+    validateTicketFilter(options.ticket);
+  }
 
   const head = await adapter.readRef(validatedRef);
   if (head === null) {

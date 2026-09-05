@@ -24,6 +24,66 @@ import { validateCoordinationRef } from "../git/index";
 import { EventErrorCodes } from "./errors";
 import { monthKeyUtc } from "./log";
 
+/**
+ * A deliberately-nonexistent path, used only to probe whether a ref's
+ * resolved target behaves like a tree-ish object (fix round 1, S3) — see
+ * `assertRefIsUsable`. Never a real month file name, so a legitimate,
+ * already-populated coordination ref can never coincidentally collide with
+ * it.
+ */
+const USABILITY_PROBE_PATH = "events/.cankan-ref-usability-probe";
+
+/**
+ * `readRef` returning non-null only proves *some* git object exists at
+ * `ref` — not that it is a usable coordination ref (fix round 1, S3).
+ * Verified directly (real `update-ref`/`commit-tree`, not assumed): a ref
+ * planted straight at a **blob** makes `initRef` (before this fix) resolve
+ * successfully, after which every later `append`'s `commit-tree -p <ref>`
+ * fails forever with an opaque `GIT_COMMAND_FAILED` — and `initRef` could
+ * never repair it, because it kept seeing "non-null" and returning.
+ *
+ * Probed here via the adapter's own `readBlobFromRef`, against a path
+ * (`USABILITY_PROBE_PATH`) that is never a real month file: `readBlobFromRef`
+ * resolves `ref` to a commit and runs `ls-tree` against it, which requires
+ * its target to be tree-ish. A blob target fails that call outright
+ * (`ls-tree` cannot list a blob), which this function converts into a
+ * named, diagnosable `EVENT_REF_UNUSABLE` — instead of `initRef` reporting
+ * success on a ref nothing downstream can actually use. A usable target
+ * (a real commit, or — see the residual gap below — a bare tree) returns
+ * `null` for this nonexistent path without throwing, which this function
+ * treats as "usable."
+ *
+ * **Known residual gap, out of this fix's reach (Orchestrator Ruling
+ * R19).** A ref planted at a raw **tree**, or an **annotated tag** peeling
+ * to one, is *also* unusable — a later `append`'s `commit-tree -p <ref>`
+ * requires a real commit, not a bare tree, and fails the same way the blob
+ * case does — but is **not** caught here: `ls-tree` operates identically on
+ * any tree-ish object, tree or commit alike, so this probe cannot tell them
+ * apart with the surface `GitAdapter` exposes today. Closing that fully
+ * would need an object-type query (e.g. `git cat-file -t <sha>`) that does
+ * not exist on `GitAdapter`. Adding one is M2.6's call, not this
+ * dispatch's: R19 scopes this fix to `events/`, using only M2.6's existing
+ * public surface, and explicitly defers the cleaner fix (the new adapter
+ * primitive) to a follow-up recommendation rather than this dispatch
+ * editing `git/` to expand its own blast radius. A write-based probe (e.g.
+ * attempting `commitTreeToRef` with `parent: existing` to see whether
+ * `commit-tree -p` accepts it) was considered and rejected: it would give
+ * `initRef` a side effect — a redundant commit — on every call against an
+ * already-healthy ref, which is worse than leaving this one case
+ * undetected until the M2.6 addition lands.
+ */
+async function assertRefIsUsable(adapter: GitAdapter, validatedRef: string): Promise<void> {
+  try {
+    await adapter.readBlobFromRef(validatedRef, USABILITY_PROBE_PATH);
+  } catch (cause) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_REF_UNUSABLE,
+      `ref exists but does not resolve to a usable coordination ref: ${validatedRef}`,
+      { cause, details: { ref: validatedRef } },
+    );
+  }
+}
+
 export interface InitRefOptions {
   /**
    * The clock used to name the placeholder month file (`events/<yyyy-mm>.jsonl`,
@@ -98,6 +158,9 @@ export async function initRefCore(
 
   const existing = await adapter.readRef(validatedRef);
   if (existing !== null) {
+    // Fix round 1, S3: confirm the ref is usable before reporting success —
+    // see `assertRefIsUsable`'s doc comment.
+    await assertRefIsUsable(adapter, validatedRef);
     return;
   }
 
@@ -135,4 +198,9 @@ export async function initRefCore(
       { details: { ref: validatedRef } },
     );
   }
+
+  // Fix round 1, S3: the winner might not be a usable coordination ref
+  // either (see `assertRefIsUsable`) — confirm before reporting success
+  // here too, symmetrically with the `existing !== null` branch above.
+  await assertRefIsUsable(adapter, validatedRef);
 }

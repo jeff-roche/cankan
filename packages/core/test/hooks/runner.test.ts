@@ -263,6 +263,20 @@ describe("PLAN.md's two 'Done when' tests", () => {
     // to completion.
     expect(elapsedMs).toBeLessThan(5_000);
   });
+
+  test("RunHooksOptions.timeoutMs actually reaches the spawned hook end-to-end through runHooks", async () => {
+    const cfg = fakeConfigResult([fakeLayer("repo", "/fake/.cankan/config.yml", { expire: "sleep 30" })]);
+    const startedAt = Date.now();
+    const outcomes = await runHooks({ cfg, event: "expire", repoRoot: process.cwd(), timeoutMs: 100 });
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.timedOut).toBe(true);
+    // Well under `sleep 30`'s 30s, and under DEFAULT_HOOK_TIMEOUT_MS too --
+    // proves `timeoutMs: 100` actually propagated from `RunHooksOptions`
+    // through to the spawned hook, not just `spawnHook`'s own default.
+    expect(elapsedMs).toBeLessThan(DEFAULT_HOOK_TIMEOUT_MS);
+  });
 });
 
 describe("obligation 3: the timeout kills the whole process group, including grandchildren", () => {
@@ -528,14 +542,21 @@ describe("environment: merged, never replaced, stdin ignored, cwd explicit", () 
   });
 
   test("cwd is the explicit repoRoot passed in, not process.cwd()", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "cankan-hooks-cwd-"));
+    // Uses `makeTempRepoRoot()` (realpath'd), not a raw `mkdtemp`, because
+    // this test compares against a *shell-reported* path (`pwd`'s own
+    // `getcwd()`) rather than merely interpolating the path into a
+    // command -- on macOS, an un-resolved `$TMPDIR` path
+    // (`/var/folders/...`) and `sh`'s own physical-path answer
+    // (`/private/var/folders/...`) would disagree even though they name
+    // the same directory (task brief §9; the same hazard M2.6 hit twice).
+    const { root: dir, cleanup } = await makeTempRepoRoot();
     try {
       const cfg = fakeConfigResult([fakeLayer("repo", join(dir, ".cankan", "config.yml"), { release: "pwd" })]);
       const outcomes = await runHooks({ cfg, event: "release", repoRoot: dir });
       expect(outcomes[0]?.exitCode).toBe(0);
       expect(outcomes[0]?.stdout.trim()).toBe(dir);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 

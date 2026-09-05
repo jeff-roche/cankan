@@ -36,6 +36,49 @@ describe("layer path resolution (R11)", () => {
   });
 });
 
+describe("resolveGlobalConfigPath never returns a relative path (review round 2 finding 1)", () => {
+  // Reproduced by security review: with HOME and XDG_CONFIG_HOME both
+  // absent, the old implementation computed `join("", ".config")` ===
+  // ".config" -- a cwd-relative path. In an environment with no HOME
+  // (`env -i`, a distroless container, a systemd unit with no `User=`, or
+  // an agent harness spawning this CLI with a scrubbed environment), a
+  // repo-committed `.config/cankan/config.yml` would then load as the
+  // "global" layer, reaching sections (`identity`, `credentials`,
+  // `personal`) Task A deliberately fenced repo-controlled config out of.
+  //
+  // Deliberately NOT using `process.chdir` here (it's process-wide and
+  // this suite shares a process with concurrently-running suites) --
+  // testing the pure path resolver directly is enough to prove the fix,
+  // and the "no global layer" integration test below proves it end to end
+  // without touching the real working directory.
+  test("yields undefined for {}", () => {
+    expect(resolveGlobalConfigPath({})).toBeUndefined();
+  });
+
+  test("yields undefined for a relative HOME with no XDG_CONFIG_HOME", () => {
+    expect(resolveGlobalConfigPath({ HOME: "rel" })).toBeUndefined();
+  });
+
+  test("ignores a relative XDG_CONFIG_HOME and falls back to $HOME/.config", () => {
+    expect(resolveGlobalConfigPath({ XDG_CONFIG_HOME: "rel", HOME: "/abs" })).toBe(
+      "/abs/.config/cankan/config.yml",
+    );
+  });
+
+  test("yields undefined when XDG_CONFIG_HOME is relative and HOME is also relative", () => {
+    expect(resolveGlobalConfigPath({ XDG_CONFIG_HOME: "rel", HOME: "also-rel" })).toBeUndefined();
+  });
+
+  test("loadConfig({ env: {} }) produces no global entry in layers", async () => {
+    // Not wrapped in withEnv(): `env: {}` fully overrides HOME/XDG_* (both
+    // undefined, regardless of this process's real environment), so
+    // resolveGlobalConfigPath returns undefined and no file is ever read
+    // -- this call touches zero real paths, hermetic by construction.
+    const result = await loadConfig({ env: {} });
+    expect(result.layers.some((l) => l.layer === "global")).toBe(false);
+  });
+});
+
 describe("the XDG fallback branch (R11's testability note)", () => {
   test("XDG_CONFIG_HOME unset falls back to $HOME/.config/cankan/config.yml", async () => {
     await withEnv(undefined, async () => {
@@ -63,6 +106,7 @@ describe("missing-layer tolerance (R12)", () => {
       const result = await loadConfig({ env: hermeticEnv() });
       expect(result.layers).toEqual([]);
       expect(result.resolved("tickets_dir")).toEqual({
+        path: ["tickets_dir"],
         key: "tickets_dir",
         value: "backlog/tasks",
         layer: "default",
@@ -80,6 +124,28 @@ describe("missing-layer tolerance (R12)", () => {
       expect(result.resolved("editor")?.value).toBe("emacs");
       expect(result.resolved("editor")?.layer).toBe("global");
       expect(result.layers.map((l) => l.layer)).toEqual(["global"]);
+    });
+  });
+
+  test("with all three files present, `layers` is ordered repo-local, repo, global (review round 2 finding 10)", async () => {
+    // `FILE_LAYER_ORDER` in resolve.ts is a hand-maintained array; this
+    // pins the order it's expected to produce so a future edit that
+    // silently reorders it fails a test rather than only being noticed by
+    // a downstream consumer of `ConfigResult.layers`.
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      try {
+        const home = process.env.HOME as string;
+        const globalPath = await writeGlobalConfigFile(join(home, ".config"), "editor: vim\n");
+        const repoPath = await writeRepoConfigFile(root, "config.yml", "project: p\n");
+        const localPath = await writeRepoConfigFile(root, "local.yml", "actor: alice\n");
+
+        const result = await loadConfig({ repoRoot: root, env: hermeticEnv() });
+        expect(result.layers.map((l) => l.layer)).toEqual(["repo-local", "repo", "global"]);
+        expect(result.layers.map((l) => l.file)).toEqual([localPath, repoPath, globalPath]);
+      } finally {
+        await cleanup();
+      }
     });
   });
 
@@ -123,7 +189,11 @@ describe("malformed-layer error quality (R13)", () => {
     await withEnv(undefined, async () => {
       const { root, cleanup } = await makeTempRepoRoot();
       try {
-        const path = await writeRepoConfigFile(root, "config.yml", "totally_unknown_field: 1\n");
+        // Kept at 20 chars or fewer so review round 2's tighter S2
+        // truncation cap (findings 2/3, MAX_ISSUE_KEY_DISPLAY_LEN = 20)
+        // doesn't clip this benign field name -- the point of this test is
+        // "the key is named", not "truncation didn't fire".
+        const path = await writeRepoConfigFile(root, "config.yml", "unknown_field_xy: 1\n");
         let thrown: unknown;
         try {
           await loadConfig({ repoRoot: root, env: hermeticEnv() });
@@ -133,7 +203,7 @@ describe("malformed-layer error quality (R13)", () => {
         expect(isCanKanError(thrown)).toBe(true);
         const err = thrown as Error;
         expect(err.message).toContain(path);
-        expect(err.message).toContain("totally_unknown_field");
+        expect(err.message).toContain("unknown_field_xy");
       } finally {
         await cleanup();
       }

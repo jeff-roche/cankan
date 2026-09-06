@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { isCanKanError } from "../../src/errors";
 import { firstSeen } from "../../src/events/index";
 import type { EventId, EventRecord } from "../../src/events/index";
-import { foldState, observeAndFold } from "../../src/state/fold";
+import { foldState, observeAndFold, resolveAliasTargetForTesting } from "../../src/state/fold";
 import { StateErrorCodes } from "../../src/state/errors";
 // `@jeff-roche/cankan-test-utils` is not a declared dependency of
 // `packages/core/package.json` — a relative import to the source file is
@@ -291,7 +291,14 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
     expect(state.tickets[0]?.lease?.expired).toBe(false);
   });
 
-  test("M1 (security review): a lone renew with no unended incumbent mints no lease", () => {
+  test("L8 (security review, corrects an over-tightened M1): a renew that is the first lease-affecting event visible in the window still anchors a live lease", () => {
+    // This is the window-truncation case, not "no claim ever happened": the
+    // fold only ever sees `events`, never the full history, so a renew with
+    // nothing before it in this slice must not be assumed to have no
+    // incumbent at all — its own claim may simply have aged out of the
+    // caller's read window. Treating it as unanchored would let a second
+    // actor claim a ticket someone is actively renewing (verified directly,
+    // security review) — the wrong direction to fail for a mutex.
     const ticket = makeStoredTicket("ck-1", "To Do");
     const renew = fixtureEvent(
       { event: "renew", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
@@ -304,7 +311,31 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
       firstSeen: new Map([[renew.event.id, 0]]),
     });
 
-    expect(state.tickets[0]?.lease).toBeUndefined();
+    expect(state.tickets[0]?.lease?.eventId).toBe(renew.event.id);
+    expect(state.tickets[0]?.lease?.kind).toBe("renew");
+    expect(state.tickets[0]?.lease?.expired).toBe(false);
+  });
+
+  test("L8: an actively-renewed lease whose original claim has aged out of the read window still reads as held", () => {
+    // The realistic scenario L8 exists for: `events` here represents a
+    // caller's `read()` window that no longer includes the original claim
+    // at all — only its later renews are visible. The lease must still read
+    // as live, or an honest actor renewing on a schedule would eventually
+    // lose their own claim to a second actor purely from window truncation.
+    const ticket = makeStoredTicket("ck-1", "To Do");
+    const renewInWindow = fixtureEvent(
+      { event: "renew", ticket: "ck-1", actor: "claude-code:alice/wt-a", lease_until: "2099-01-01T00:00:00Z" },
+      "2026-01",
+      0,
+    );
+    const state = foldState([ticket], [renewInWindow], {
+      now: 100,
+      leaseTtlMs: 10_000,
+      firstSeen: new Map([[renewInWindow.event.id, 0]]),
+    });
+
+    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe("claude-code:alice/wt-a");
+    expect(state.tickets[0]?.lease?.expired).toBe(false);
   });
 
   test("M1: a renew after the incumbent has already ended (release) also mints nothing", () => {
@@ -409,32 +440,105 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
     expect(state.tickets[0]?.lease?.eventId).toBe(sameActorRenew.event.id);
     expect(state.tickets[0]?.lease?.kind).toBe("renew");
   });
+
+  test("M3 GUARANTEE (do not gate on expiry — security review, ADR 0001:801-825): a fresh claim overrides even a still-UNEXPIRED incumbent", () => {
+    // This is the one test that would catch a future refactor of
+    // `resolveLeaseAnchor` that tries to "helpfully" keep the incumbent
+    // when it looks unexpired as of `now`. That rule is explicitly rejected
+    // (see `resolveLeaseAnchor`'s own doc): `firstSeen` is reader-local, so
+    // two peers reading the same events at different `now`s would disagree
+    // about whether the incumbent still counted as unexpired, and therefore
+    // about who holds the ticket — exactly the nondeterminism ADR
+    // 0001:801-825 forbids. `claim`/`takeover` must anchor unconditionally.
+    const ticket = makeStoredTicket("ck-1", "To Do");
+    const aliceClaim = fixtureEvent(
+      {
+        event: "claim",
+        ticket: "ck-1",
+        actor: "claude-code:alice/wt-a",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(1),
+      },
+      "2026-01",
+      0,
+    );
+    const bobClaim = fixtureEvent(
+      {
+        event: "claim",
+        ticket: "ck-1",
+        actor: "claude-code:bob/wt-b",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(2),
+      },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [aliceClaim, bobClaim], {
+      now: 100,
+      leaseTtlMs: 10_000, // generous — alice's claim is still comfortably unexpired at `now`
+      firstSeen: new Map([
+        [aliceClaim.event.id, 0],
+        [bobClaim.event.id, 50],
+      ]),
+    });
+
+    expect(state.tickets[0]?.lease?.eventId).toBe(bobClaim.event.id);
+    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe("claude-code:bob/wt-b");
+  });
 });
 
 describe("foldState — alias resolution does not blow up quadratically (I2, security review)", () => {
-  test("resolving a long alias chain (N=6000) completes well under a second, not tens of seconds", () => {
-    const N = 6000;
-    const finalId = `ck-${N}`;
-    const ticket = makeStoredTicket(finalId, "To Do");
-    // A chain a0 -> a1 -> a2 -> ... -> aN-1 -> ck-<N>. The pre-memoization
-    // implementation resolved each `from` key with its own from-scratch
-    // walk, making this O(N^2); measured directly (security review) at
-    // N=16,000 that was ~4.7s for `foldState` alone. This asserts a
-    // generous wall-clock bound, not a tight one, to avoid CI flakiness —
-    // the point is "not quadratic," not "exactly this fast."
+  /** Builds a pure alias chain `a0 -> a1 -> ... -> a(N-1) -> <finalId>` as fixture `EventRecord`s. */
+  function buildAliasChainEvents(n: number, finalId: string): EventRecord[] {
     const events: EventRecord[] = [];
-    for (let i = 0; i < N; i++) {
-      const from = i === 0 ? "a0" : `a${i}`;
-      const to = i === N - 1 ? finalId : `a${i + 1}`;
+    for (let i = 0; i < n; i++) {
+      const from = `a${i}`;
+      const to = i === n - 1 ? finalId : `a${i + 1}`;
       events.push(fixtureEvent({ event: "alias", ticket: "ck-x", from, to, id: fixedEventId(i) }, "2026-01", i));
     }
+    return events;
+  }
 
+  function timeFoldOverChain(n: number): number {
+    const finalId = `ck-final-${n}`;
+    const ticket = makeStoredTicket(finalId, "To Do");
+    const events = buildAliasChainEvents(n, finalId);
     const start = performance.now();
-    const state = foldState([ticket], events, { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
-    const elapsedMs = performance.now() - start;
+    foldState([ticket], events, { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    return performance.now() - start;
+  }
+
+  test("resolving an alias chain is correct at N=6000", () => {
+    const N = 6000;
+    const finalId = `ck-final-${N}`;
+    const ticket = makeStoredTicket(finalId, "To Do");
+    const state = foldState([ticket], buildAliasChainEvents(N, finalId), {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.aliases).toContain("a0");
-    expect(elapsedMs).toBeLessThan(2000);
+  });
+
+  test("growing the chain 4x grows the wall-clock time roughly 4x, not ~16x (O(N), not O(N^2))", () => {
+    // A wall-clock *absolute* bound is both a CI-flakiness risk on a loaded
+    // shared runner and a weak oracle: extrapolating the review's own
+    // pre-fix measurement (~4.7s at N=16,000) down to N=6000 gives
+    // ~660ms — comfortably under almost any generous absolute bound even
+    // for the REGRESSED quadratic implementation, so an absolute-bound
+    // test at that N could not actually catch a reintroduced O(N^2)
+    // (security review, fix round 3). A *relative*-growth assertion is the
+    // correct oracle instead: quadratic growth means 4x the input gives
+    // ~16x the time; linear growth gives ~4x. N is chosen large enough that
+    // both measurements clear a few milliseconds, so JS timer granularity
+    // and GC jitter don't dominate the ratio.
+    const N = 8000;
+    const baseline = timeFoldOverChain(N);
+    const fourX = timeFoldOverChain(N * 4);
+
+    const ratio = fourX / Math.max(baseline, 0.01);
+    expect(ratio).toBeLessThan(8); // linear predicts ~4; quadratic predicts ~16 — 8 is the midpoint, generous either way
   });
 });
 
@@ -565,12 +669,12 @@ describe("foldState — alias map", () => {
     // `events/schema.ts`'s `aliasEventSchema` rejects `from === to` at the
     // boundary, so this shape should never really reach `foldState` — but
     // this test builds the `EventRecord` directly (bypassing `parseEvent`)
-    // to assert what happens if it somehow does. `resolveAliasTarget`'s
-    // single visited-set guard stops the walk on the very first step (the
-    // self-loop's own target is already visited), so `ck-9` resolves to
-    // itself — which, since `ck-9` IS a real known ticket, means it ends up
-    // listed as its own alias. Harmless, and — the actual point of this
-    // test — does not hang.
+    // to assert what happens if it somehow does. A self-loop is the
+    // degenerate one-node cycle: `resolveAllAliasTargets` (`fold.ts`)
+    // detects `ck-9` revisiting itself on the very first step and resolves
+    // it to itself — which, since `ck-9` IS a real known ticket, means it
+    // ends up listed as its own alias. Harmless, and — the actual point of
+    // this test — does not hang.
     const ticket = makeStoredTicket("ck-9", "To Do");
     // `Event`'s branded fields (`EventId`/`ActorId`/`TicketId`) have no
     // runtime representation beyond a plain string, so a direct object
@@ -602,6 +706,141 @@ describe("foldState — alias map", () => {
     const state = foldState([ticket], [aToB, bToA], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
 
     expect(state.tickets[0]?.aliases).toEqual([]);
+  });
+
+  test("CRITICAL FIX (fix round 3, security review): a 2-node alias cycle resolves the SAME way regardless of event order", () => {
+    // The regression this pins: an earlier memoized implementation cached
+    // whatever node a walk happened to stop at -- including a stop caused
+    // by hitting a cycle, not a validated sink -- so a *later* walk could
+    // adopt that as if it were stable. For `a<->b` with `a` a real ticket,
+    // that made the result depend on which alias event came first:
+    //   events [a->b, b->a] -> eventAliases: []            (dropped "b")
+    //   events [b->a, a->b] -> eventAliases: ["b", "a"]    (fabricated "a")
+    // Order must never decide an outcome (Ruling R12) -- both orderings
+    // below must now produce the identical result.
+    const ticket = makeStoredTicket("a", "To Do");
+
+    const forwardFirst = foldState(
+      [ticket],
+      [
+        fixtureEvent({ event: "alias", ticket: "ck-x", from: "a", to: "b" }, "2026-01", 0),
+        fixtureEvent({ event: "alias", ticket: "ck-x", from: "b", to: "a" }, "2026-01", 1),
+      ],
+      { now: 0, leaseTtlMs: 1000, firstSeen: new Map() },
+    );
+    const backwardFirst = foldState(
+      [ticket],
+      [
+        fixtureEvent({ event: "alias", ticket: "ck-x", from: "b", to: "a" }, "2026-01", 0),
+        fixtureEvent({ event: "alias", ticket: "ck-x", from: "a", to: "b" }, "2026-01", 1),
+      ],
+      { now: 0, leaseTtlMs: 1000, firstSeen: new Map() },
+    );
+
+    // Per-node reference walk (`resolveAliasTargetForTesting`): resolving
+    // "a" gives "b" (not a known ticket under any other id — contributes
+    // nothing); resolving "b" gives "a" (the known ticket "a" itself), so
+    // "b" is listed as one of "a"'s aliases. Net: `a.eventAliases` is
+    // `["b"]`, contributed by the `b -> a` edge alone.
+    expect(forwardFirst.tickets[0]?.aliases).toEqual(["b"]);
+    expect(backwardFirst.tickets[0]?.aliases).toEqual(forwardFirst.tickets[0]?.aliases);
+  });
+
+  test("a real ticket sitting IN a 3-node alias cycle: per-node semantics are pinned, not incidental", () => {
+    // a -> b -> c -> a, with `c` a real known ticket. Unlike the chain
+    // tests above, every node here has an outgoing edge (a true cycle, no
+    // sink), so this exercises `resolveCycleAndTail`'s cycle-member branch
+    // directly rather than its tail branch. Per-node reference values
+    // (verified against `resolveAliasTargetForTesting`, the pre-fix
+    // from-scratch walk, in the property test below): a->c, b->a, c->b.
+    // Only `b` (which resolves to `a` — not `c`) and... walked precisely:
+    // resolving "a" gives "c" (c IS known) -> "a" is an alias of "c".
+    // Resolving "b" gives "a" (not known) -> contributes nothing.
+    // Resolving "c" gives "b" (not known) -> contributes nothing.
+    // So `c.eventAliases` is exactly `["a"]` — a single node, not all
+    // three; a path-compression bug that collapsed the whole cycle to one
+    // representative would instead produce all three.
+    const ticket = makeStoredTicket("c", "To Do");
+    const aToB = fixtureEvent({ event: "alias", ticket: "ck-x", from: "a", to: "b" }, "2026-01", 0);
+    const bToC = fixtureEvent({ event: "alias", ticket: "ck-x", from: "b", to: "c" }, "2026-01", 1);
+    const cToA = fixtureEvent({ event: "alias", ticket: "ck-x", from: "c", to: "a" }, "2026-01", 2);
+    const state = foldState([ticket], [aToB, bToC, cToA], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+    expect(state.tickets[0]?.aliases).toEqual(["a"]);
+  });
+
+  test("property check: the memoized resolver agrees with the pre-fix from-scratch walk, node by node, across chain/cycle/tail shapes", () => {
+    // `knownTicketIds` is chosen explicitly per graph — deliberately NOT
+    // derived from "every value ever used as a `to`", which would make
+    // some `from` keys also count as known tickets and blur what's being
+    // tested. Every node in `edges` (whether or not it's a known ticket) is
+    // checked: a known-ticket target must list the node as an alias; every
+    // OTHER known ticket must NOT.
+    function agreesForEveryNode(edges: ReadonlyMap<string, string>, knownTicketIds: readonly string[]): void {
+      const knownTickets = knownTicketIds.map((id) => makeStoredTicket(id, "To Do"));
+      const events = [...edges.entries()].map(([from, to], i) =>
+        fixtureEvent({ event: "alias", ticket: "ck-x", from, to }, "2026-01", i),
+      );
+      const state = foldState(knownTickets, events, { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+      const aliasesByTicket = new Map(state.tickets.map((t) => [t.id as string, t.aliases]));
+
+      for (const from of edges.keys()) {
+        const expectedTarget = resolveAliasTargetForTesting(edges, from);
+        for (const knownId of knownTicketIds) {
+          const shouldBeListed = knownId === expectedTarget;
+          const isListed = (aliasesByTicket.get(knownId) ?? []).includes(from);
+          expect(isListed, `${from} -> ${expectedTarget} (checked against known ticket ${knownId})`).toBe(
+            shouldBeListed,
+          );
+        }
+      }
+    }
+
+    // Long acyclic chain ending at a real sink.
+    agreesForEveryNode(
+      new Map([
+        ["a0", "a1"],
+        ["a1", "a2"],
+        ["a2", "sink"],
+      ]),
+      ["sink"],
+    );
+    // Pure 2-cycle and 3-cycle (the Critical fix's own shapes) — check
+    // every node as a candidate known ticket, not just one.
+    agreesForEveryNode(
+      new Map([
+        ["a", "b"],
+        ["b", "a"],
+      ]),
+      ["a", "b"],
+    );
+    agreesForEveryNode(
+      new Map([
+        ["a", "b"],
+        ["b", "c"],
+        ["c", "a"],
+      ]),
+      ["a", "b", "c"],
+    );
+    // A tail feeding into a cycle (rho shape).
+    agreesForEveryNode(
+      new Map([
+        ["x", "a"],
+        ["a", "b"],
+        ["b", "a"],
+      ]),
+      ["a", "b"],
+    );
+    // Two independent components resolved in one call.
+    agreesForEveryNode(
+      new Map([
+        ["p", "q"],
+        ["q", "sink1"],
+        ["m", "n"],
+        ["n", "m"],
+      ]),
+      ["sink1", "m", "n"],
+    );
   });
 });
 
@@ -669,7 +908,7 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
     });
   });
 
-  test("a renew-only ticket (no claim/takeover anywhere in this window) mints no lease (M1), but is still observed", async () => {
+  test("a renew-only ticket (no claim/takeover anywhere in this window) anchors a live lease (L8: window truncation, not evidence of no claim) and is observed", async () => {
     await withEnv(undefined, async () => {
       const ticket = makeStoredTicket("ck-1", "To Do");
       const renew = fixtureEvent(
@@ -680,12 +919,14 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
       const boardKey = "test-board-key-3";
       const state = await observeAndFold(boardKey, [ticket], [renew], { now: 1000, leaseTtlMs: 10_000 });
 
-      // M1 (security review): a `renew` with no unended incumbent in chain
-      // order does not mint a lease from nothing.
-      expect(state.tickets[0]?.lease).toBeUndefined();
-      // It is still observed, though — M2.7's contract 2 is unconditional
-      // on kind, independent of what `foldState` later decides to do with
-      // the resulting `firstSeen` entry.
+      // L8 (security review, corrects an over-tightened M1): the fold only
+      // ever sees this window — the renew's own claim may have simply aged
+      // out of it. Anchoring on the renew is the fail-safe direction for a
+      // mutex (over-honor a possibly-gone lease, never risk a double-claim).
+      expect(state.tickets[0]?.lease?.eventId).toBe(renew.event.id);
+      expect(state.tickets[0]?.lease?.expired).toBe(false);
+      // It is observed too, independent of what `foldState` does with it —
+      // M2.7's contract 2 is unconditional on kind.
       expect(await firstSeen(boardKey, renew.event.id)).toBe(1000);
     });
   });

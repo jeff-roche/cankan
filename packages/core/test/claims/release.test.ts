@@ -426,3 +426,79 @@ test("KNOWN GAP: a discarded observation is resurrected by the next fold (fix be
     expect(await firstSeen(boardKey, claimed.eventId)).not.toBeNull();
   });
 });
+
+// ============================================================================
+// Security-review regression: the KNOWN GAP above documents in prose that a
+// resurrected record does not extend a LIVE lease ("this is not a mutual-
+// exclusion defect"). Nothing tested that claim. This is the discriminating
+// oracle for it.
+//
+// Why an ordinary release-then-reclaim does NOT discriminate: resurrecting a
+// record via a ticket claimed AFTER a plain release (as the KNOWN GAP test
+// above does) brings back a record whose `firstSeen` is OLDER than the
+// current anchor's -- the fold's expiry computation (`foldLease`) would
+// compute the same expiry (the anchor's own `firstSeen` plus the TTL)
+// whether or not the resurrected record fed expiry, because a smaller
+// `firstSeen` can never push a max-of computation past what the anchor
+// alone already gives it. Such a test would pass whether or not
+// resurrection feeds expiry, which makes it worthless as an oracle for this
+// property.
+//
+// A TAKEOVER changes that: the displaced actor's own record resurrects only
+// once some LATER claim/takeover/renew is folded (same mechanism as the
+// KNOWN GAP), and that resurrection can be arranged to land AFTER the new
+// anchor's own `firstSeen` -- newer, not older. If any resurrected record
+// fed expiry, `expiresAt` would be computed from the NEWER of the two
+// firstSeens, pushing it past what the anchor alone would give, and a
+// reclaim timed to land just past the anchor's own TTL (but still within
+// what the newer, resurrected firstSeen would imply) would be wrongly
+// rejected. This is the oracle that can actually tell the two apart.
+// ============================================================================
+
+test("a resurrected record NEWER than the current anchor does not extend the lease (discriminating oracle for the KNOWN GAP canary above)", async () => {
+  await withTestBoard(async ({ board }) => {
+    await writeFixtureTickets(board.ticketsDir, [
+      fixtureTicket("ck-probe2", "Takeover then resurrection"),
+      fixtureTicket("ck-probe2-other", "Unrelated ticket"),
+    ]);
+    const original = actorId("actor-probe2-original");
+    const forcer = actorId("actor-probe2-forcer");
+    const boardKey = await boardKeyFor(await createGitAdapter(board.root));
+
+    const a1 = await claim({ board, ticket: "ck-probe2", actor: original, now: NOW });
+    const b1 = await claim({ board, ticket: "ck-probe2", actor: forcer, now: NOW + 5 * 60_000, force: true });
+    expect(b1.kind).toBe("takeover");
+
+    // The takeover's own discard walk already removed the displaced claim.
+    expect(await firstSeen(boardKey, a1.eventId)).toBeNull();
+
+    // ONE fold over an unrelated ticket resurrects it -- at THIS fold's
+    // `now`, which is LATER than the anchor's own `firstSeen` (NOW + 5m).
+    await claim({ board, ticket: "ck-probe2-other", actor: actorId("actor-probe2-other"), now: NOW + 6 * 60_000 });
+
+    // Premise check: `a1` really did resurrect, and strictly NEWER than
+    // `b1`'s own anchor `firstSeen` -- without both of these, the reclaim
+    // assertion below proves nothing about resurrection feeding expiry.
+    // (These two lines are expected to start failing alongside the KNOWN GAP
+    // canary above if `state/fold.ts` is ever fixed to stop resurrecting
+    // terminated-run records -- that is the point: this oracle goes honestly
+    // vacuous rather than silently passing for the wrong reason.)
+    const a1Resurrected = await firstSeen(boardKey, a1.eventId);
+    const b1Anchored = await firstSeen(boardKey, b1.eventId);
+    expect(a1Resurrected).not.toBeNull();
+    expect(a1Resurrected as number).toBeGreaterThan(b1Anchored as number);
+
+    // A reclaim timed to land just past the ANCHOR's own TTL (b1's
+    // `firstSeen` + LEASE_TTL_MS + 1ms) must still succeed. If the
+    // resurrected, newer record fed expiry, `expiresAt` would be
+    // `(NOW + 6m) + LEASE_TTL_MS`, and this reclaim -- which lands before
+    // that -- would be wrongly rejected as `already-held`.
+    const reclaim = await claim({
+      board,
+      ticket: "ck-probe2",
+      actor: actorId("actor-probe2-reclaimer"),
+      now: NOW + 5 * 60_000 + LEASE_TTL_MS + 1,
+    });
+    expect(reclaim.kind).toBe("claim");
+  });
+});

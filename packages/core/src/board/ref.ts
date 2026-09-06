@@ -118,6 +118,21 @@
  * entry is, so this gap has no known unblocked exploit — it is reported as
  * incomplete coverage of the ADR's literal text, not as a live escape.
  * Step (d) (ticket *filename* validation) belongs to M2.5.
+ *
+ * **Correction (M2.5 slice 1B, ADR 0002 amendment "tickets_dir containment
+ * ownership"):** the "no known unblocked exploit" conclusion two sentences
+ * above was disproved by execution, not by further reasoning — a
+ * `git init --separate-git-dir=./innergit` repository's real git-common-dir
+ * lies *beneath* the board root under a first segment (`innergit`) that is
+ * not `.git`, so the by-name check above does not see it, and a checked-in
+ * `tickets_dir: innergit/refs/cankan-evil` passed steps (a) and (b) here
+ * and landed writes inside the repository's real git directory. The gap
+ * was live, not merely incomplete coverage. Likewise, the last sentence
+ * above is wrong: step (d) shipped in M2.2 as specified
+ * (`ticket/filename.ts`), not M2.5. Both are corrected, with the fix, in
+ * the ADR 0002 amendment; the fix itself is `store/ticketStore.ts`'s
+ * `assertTicketsDirContained` (M2.5). Comment-only correction — nothing
+ * above this note was reworded.
  */
 
 import { lstat, realpath } from "node:fs/promises";

@@ -210,6 +210,9 @@ Generalization of Backlog.md's `onStatusChange`. Events: `claim, release, expire
 ### 8b. Configuration: three layers, policy beats preference
 See "Configuration" below. Repo config (`.cankan/config.yml`) is checked in and holds policy and shared setup. Repo-local user config (`.cankan/local.yml`) is gitignored and holds per-checkout preferences and actor identity. Global user config (`~/.config/cankan/config.yml`) holds cross-repo defaults and credentials references. Keys are classified as **policy** (repo wins) or **preference** (user wins); a repo can pin any preference key with `!policy`.
 
+### 8c. Executable repository config trust
+Repository values for `hooks`, `editor`, and `agents.default_tool` can start processes and are never executed merely because a repository was cloned. `cankan trust` explicitly approves the current set of those repo-layer values for one canonical board path. The approval is stored in user XDG state and bound to a SHA-256 fingerprint of the executable values; changing any of them invalidates it. Repo-local and global executable settings are user-owned and need no repo approval. Non-interactive callers (CI, MCP, and agents) cannot prompt and fail closed; an interactive caller directs the user to `cankan trust` before execution.
+
 ### 9. Agent configuration: emit, don't integrate
 `cankan init` writes an `AGENTS.md`/`CLAUDE.md` section (`prime → ready → claim → work → note → close`), an MCP entry, optional git hooks. When Backlog.md is the backer, we append to their instructions rather than replacing them. Agent-internal todo lists are scratchpads flushed into CanKan, never synced.
 

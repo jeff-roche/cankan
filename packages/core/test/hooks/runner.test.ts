@@ -7,6 +7,7 @@ import { effectiveConfigSchema, loadConfig } from "../../src/config/index";
 import type { ConfigResult, LoadedLayer } from "../../src/config/index";
 import { isCanKanError } from "../../src/errors";
 import { HooksErrorCodes } from "../../src/hooks/errors";
+import { grantRepoExecutableTrust } from "../../src/trust/index";
 import {
   DEFAULT_HOOK_TIMEOUT_MS,
   HOOK_EVENTS,
@@ -16,7 +17,14 @@ import {
   runHooks,
   spawnHook,
 } from "../../src/hooks/runner";
-import { isPidAlive, makeTempRepoRoot, pollUntil, testConfigEnv, writeGlobalConfigFile, writeRepoConfigFile } from "./testHelpers";
+import {
+  isPidAlive,
+  makeTempRepoRoot,
+  pollUntil,
+  testConfigEnv,
+  writeGlobalConfigFile,
+  writeRepoConfigFile,
+} from "./testHelpers";
 
 /**
  * Constructs a `ConfigResult` by hand, real `EffectiveConfig` defaults for
@@ -37,8 +45,19 @@ function fakeConfigResult(layers: readonly LoadedLayer[]): ConfigResult {
   };
 }
 
-function fakeLayer(layer: LoadedLayer["layer"], file: string, hooks: Record<string, string>): LoadedLayer {
-  return { layer, file, data: { hooks } };
+function fakeLayer(
+  layer: LoadedLayer["layer"],
+  file: string,
+  hooks: Record<string, string>,
+): LoadedLayer {
+  // Most runner tests exercise process management rather than the repo trust
+  // boundary. Model their commands as caller-owned local settings; dedicated
+  // tests below cover the checked-in repo layer separately.
+  return {
+    layer: layer === "repo" ? "repo-local" : layer,
+    file,
+    data: { hooks },
+  };
 }
 
 /** Any pid a test wants killed in `afterEach` even if the test itself fails. */
@@ -87,7 +106,9 @@ afterEach(() => {
 
 describe("resolving hooks across layers", () => {
   test("no hook configured for an event is a no-op: empty result, no sink calls, nothing spawned", async () => {
-    const cfg = fakeConfigResult([fakeLayer("repo", "/fake/.cankan/config.yml", { close: "true" })]);
+    const cfg = fakeConfigResult([
+      fakeLayer("repo", "/fake/.cankan/config.yml", { close: "true" }),
+    ]);
     let sinkCalls = 0;
     const outcomes = await runHooks({
       cfg,
@@ -109,7 +130,9 @@ describe("resolving hooks across layers", () => {
       for (const event of HOOK_EVENTS) {
         hooks[event] = `printf '${event}\\n' >> '${outFile}'`;
       }
-      const cfg = fakeConfigResult([fakeLayer("repo", join(dir, ".cankan", "config.yml"), hooks)]);
+      const cfg = fakeConfigResult([
+        fakeLayer("repo", join(dir, ".cankan", "config.yml"), hooks),
+      ]);
 
       for (const event of HOOK_EVENTS) {
         const outcomes = await runHooks({ cfg, event, repoRoot: dir });
@@ -128,7 +151,11 @@ describe("resolving hooks across layers", () => {
     const cfg = fakeConfigResult([]);
     let caught: unknown;
     try {
-      await runHooks({ cfg, event: "not-a-real-event" as HookEvent, repoRoot: "/fake" });
+      await runHooks({
+        cfg,
+        event: "not-a-real-event" as HookEvent,
+        repoRoot: "/fake",
+      });
     } catch (err) {
       caught = err;
     }
@@ -157,12 +184,15 @@ describe("resolving hooks across layers", () => {
         );
 
         const cfg = await loadConfig({ repoRoot: root, env: testConfigEnv() });
+        await grantRepoExecutableTrust(root, cfg, testConfigEnv());
         // Deliberately NOT asserting `cfg.layers`'s own order here --
         // `config/resolve.ts`'s `FILE_LAYER_ORDER` is `["repo-local",
         // "repo", "global"]`, different from `HOOK_LAYER_ORDER`. That
         // mismatch is exactly why `resolveHooksForEvent` must not depend
         // on `cfg.layers`'s incidental order (Controller Ruling 3).
-        expect(new Set(cfg.layers.map((l) => l.layer))).toEqual(new Set(["repo", "repo-local", "global"]));
+        expect(new Set(cfg.layers.map((l) => l.layer))).toEqual(
+          new Set(["repo", "repo-local", "global"]),
+        );
 
         const records: HookEventRecord[] = [];
         const outcomes = await runHooks({
@@ -201,7 +231,11 @@ describe("resolving hooks across layers", () => {
         // proving they ran sequentially in that order, not concurrently or
         // in the array's incidental order.
         const orderContent = await readFile(sharedFile, "utf8");
-        expect(orderContent.split("\n").filter(Boolean)).toEqual(["repo", "repo-local", "global"]);
+        expect(orderContent.split("\n").filter(Boolean)).toEqual([
+          "repo",
+          "repo-local",
+          "global",
+        ]);
 
         // The sink record carries the same provenance, plus the event
         // context, one call per hook that ran (not one per event).
@@ -227,7 +261,11 @@ describe("PLAN.md's two 'Done when' tests", () => {
     try {
       const outFile = join(dir, "env.txt");
       const command = `printf '%s\\n' "$TICKET" "$ACTOR" "$FROM" "$TO" "$TITLE" > '${outFile}'`;
-      const cfg = fakeConfigResult([fakeLayer("repo", join(dir, ".cankan", "config.yml"), { claim: command })]);
+      const cfg = fakeConfigResult([
+        fakeLayer("repo", join(dir, ".cankan", "config.yml"), {
+          claim: command,
+        }),
+      ]);
 
       const outcomes = await runHooks({
         cfg,
@@ -243,7 +281,14 @@ describe("PLAN.md's two 'Done when' tests", () => {
       expect(outcomes).toHaveLength(1);
       expect(outcomes[0]?.exitCode).toBe(0);
       const content = await readFile(outFile, "utf8");
-      expect(content.split("\n")).toEqual(["ck-abc123", "alice", "Backlog", "In Progress", "Fix the thing", ""]);
+      expect(content.split("\n")).toEqual([
+        "ck-abc123",
+        "alice",
+        "Backlog",
+        "In Progress",
+        "Fix the thing",
+        "",
+      ]);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -256,9 +301,18 @@ describe("PLAN.md's two 'Done when' tests", () => {
       // `set -u`: dies on an unset var, so this only passes if TICKET,
       // ACTOR, FROM, TO, TITLE are all *present* (possibly empty).
       const command = `set -u; printf '[%s][%s][%s][%s][%s]' "$TICKET" "$ACTOR" "$FROM" "$TO" "$TITLE" > '${outFile}'`;
-      const cfg = fakeConfigResult([fakeLayer("repo", join(dir, ".cankan", "config.yml"), { create: command })]);
+      const cfg = fakeConfigResult([
+        fakeLayer("repo", join(dir, ".cankan", "config.yml"), {
+          create: command,
+        }),
+      ]);
 
-      const outcomes = await runHooks({ cfg, event: "create", repoRoot: dir, ticket: "ck-1" });
+      const outcomes = await runHooks({
+        cfg,
+        event: "create",
+        repoRoot: dir,
+        ticket: "ck-1",
+      });
 
       expect(outcomes[0]?.exitCode).toBe(0);
       const content = await readFile(outFile, "utf8");
@@ -289,9 +343,16 @@ describe("PLAN.md's two 'Done when' tests", () => {
   });
 
   test("RunHooksOptions.timeoutMs actually reaches the spawned hook end-to-end through runHooks", async () => {
-    const cfg = fakeConfigResult([fakeLayer("repo", "/fake/.cankan/config.yml", { expire: "sleep 30" })]);
+    const cfg = fakeConfigResult([
+      fakeLayer("repo", "/fake/.cankan/config.yml", { expire: "sleep 30" }),
+    ]);
     const startedAt = Date.now();
-    const outcomes = await runHooks({ cfg, event: "expire", repoRoot: process.cwd(), timeoutMs: 100 });
+    const outcomes = await runHooks({
+      cfg,
+      event: "expire",
+      repoRoot: process.cwd(),
+      timeoutMs: 100,
+    });
     const elapsedMs = Date.now() - startedAt;
 
     expect(outcomes).toHaveLength(1);
@@ -446,9 +507,18 @@ describe("obligation 3: the timeout kills the whole process group, including gra
   });
 
   test("finding 1, case 2: leader exits promptly while a backgrounded grandchild holds the pipes -- runHooks returns within the timeout, not the grandchild's lifetime", async () => {
-    const cfg = fakeConfigResult([fakeLayer("repo", "/fake/.cankan/config.yml", { expire: "sleep 2 & exit 0" })]);
+    const cfg = fakeConfigResult([
+      fakeLayer("repo", "/fake/.cankan/config.yml", {
+        expire: "sleep 2 & exit 0",
+      }),
+    ]);
     const startedAt = Date.now();
-    const outcomes = await runHooks({ cfg, event: "expire", repoRoot: process.cwd(), timeoutMs: 100 });
+    const outcomes = await runHooks({
+      cfg,
+      event: "expire",
+      repoRoot: process.cwd(),
+      timeoutMs: 100,
+    });
     const elapsedMs = Date.now() - startedAt;
 
     // Before the fix: the direct child's prompt `exit 0` satisfied
@@ -468,7 +538,11 @@ describe("obligation 3: the timeout kills the whole process group, including gra
       // Stdio redirected away from the pipe -- the OLD code's stream-drain
       // step alone could never have detected this grandchild, since the
       // pipe closes as soon as the direct child exits regardless of it.
-      const command = ["sleep 5 >/dev/null 2>&1 &", `echo $! > '${gcFile}'`, "exit 0"].join("\n");
+      const command = [
+        "sleep 5 >/dev/null 2>&1 &",
+        `echo $! > '${gcFile}'`,
+        "exit 0",
+      ].join("\n");
 
       const startedAt = Date.now();
       const result = await spawnHook({
@@ -553,12 +627,17 @@ describe("obligation 2: the five env vars, argv shape, and captured streams", ()
         file: "/fake/.cankan/config.yml",
         command: `printf '%s' "$TITLE" > '${outFile}'`,
         cwd: dir,
-        env: { PATH: process.env.PATH ?? "", TITLE: "$(rm -rf /tmp/should-not-run); `echo pwned`; ; rm -rf ." },
+        env: {
+          PATH: process.env.PATH ?? "",
+          TITLE: "$(rm -rf /tmp/should-not-run); `echo pwned`; ; rm -rf .",
+        },
         timeoutMs: DEFAULT_HOOK_TIMEOUT_MS,
       });
       expect(result.exitCode).toBe(0);
       const content = await readFile(outFile, "utf8");
-      expect(content).toBe("$(rm -rf /tmp/should-not-run); `echo pwned`; ; rm -rf .");
+      expect(content).toBe(
+        "$(rm -rf /tmp/should-not-run); `echo pwned`; ; rm -rf .",
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -629,7 +708,9 @@ describe("12. NUL-byte probe (task brief §5) -- Bun 1.4.0 rejects both cases sy
     try {
       const outFile = join(dir, "title.txt");
       const cfg = fakeConfigResult([
-        fakeLayer("repo", join(dir, ".cankan", "config.yml"), { close: `printf '%s' "$TITLE" > '${outFile}'` }),
+        fakeLayer("repo", join(dir, ".cankan", "config.yml"), {
+          close: `printf '%s' "$TITLE" > '${outFile}'`,
+        }),
       ]);
       const outcomes = await runHooks({
         cfg,
@@ -664,7 +745,12 @@ describe("12. NUL-byte probe (task brief §5) -- Bun 1.4.0 rejects both cases sy
       // 4096-byte cap -- probed (task report / findings file) to make
       // Bun.spawn fail outright before this fix.
       const hugeTitle = "x".repeat(2 * 1024 * 1024);
-      const outcomes = await runHooks({ cfg, event: "close", repoRoot: dir, title: hugeTitle });
+      const outcomes = await runHooks({
+        cfg,
+        event: "close",
+        repoRoot: dir,
+        title: hugeTitle,
+      });
 
       expect(outcomes).toHaveLength(1);
       expect(outcomes[0]?.errorCode).toBeUndefined();
@@ -684,7 +770,11 @@ describe("environment: merged, never replaced, stdin ignored, cwd explicit", () 
     try {
       const outFile = join(dir, "out.txt");
       const command = `printf '%s|%s' "$UNRELATED_VAR" "$TICKET" > '${outFile}'`;
-      const cfg = fakeConfigResult([fakeLayer("repo", join(dir, ".cankan", "config.yml"), { close: command })]);
+      const cfg = fakeConfigResult([
+        fakeLayer("repo", join(dir, ".cankan", "config.yml"), {
+          close: command,
+        }),
+      ]);
 
       const outcomes = await runHooks({
         cfg,
@@ -709,7 +799,11 @@ describe("environment: merged, never replaced, stdin ignored, cwd explicit", () 
     try {
       const outFile = join(dir, "out.txt");
       const command = `printf '%s' "$TICKET" > '${outFile}'`;
-      const cfg = fakeConfigResult([fakeLayer("repo", join(dir, ".cankan", "config.yml"), { close: command })]);
+      const cfg = fakeConfigResult([
+        fakeLayer("repo", join(dir, ".cankan", "config.yml"), {
+          close: command,
+        }),
+      ]);
 
       const outcomes = await runHooks({
         cfg,
@@ -738,7 +832,11 @@ describe("environment: merged, never replaced, stdin ignored, cwd explicit", () 
     // the same directory (task brief §9; the same hazard M2.6 hit twice).
     const { root: dir, cleanup } = await makeTempRepoRoot();
     try {
-      const cfg = fakeConfigResult([fakeLayer("repo", join(dir, ".cankan", "config.yml"), { release: "pwd" })]);
+      const cfg = fakeConfigResult([
+        fakeLayer("repo", join(dir, ".cankan", "config.yml"), {
+          release: "pwd",
+        }),
+      ]);
       const outcomes = await runHooks({ cfg, event: "release", repoRoot: dir });
       expect(outcomes[0]?.exitCode).toBe(0);
       expect(outcomes[0]?.stdout.trim()).toBe(dir);
@@ -767,8 +865,12 @@ describe("the sink", () => {
     try {
       const marker = join(dir, "second-ran.txt");
       const cfg = fakeConfigResult([
-        fakeLayer("repo", join(dir, ".cankan", "config.yml"), { close: "true" }),
-        fakeLayer("repo-local", join(dir, ".cankan", "local.yml"), { close: `touch '${marker}'` }),
+        fakeLayer("repo", join(dir, ".cankan", "config.yml"), {
+          close: "true",
+        }),
+        fakeLayer("repo-local", join(dir, ".cankan", "local.yml"), {
+          close: `touch '${marker}'`,
+        }),
       ]);
       await expect(
         runHooks({
@@ -787,8 +889,14 @@ describe("the sink", () => {
   });
 
   test("an omitted sink is fine -- results are still returned, nothing is emitted anywhere", async () => {
-    const cfg = fakeConfigResult([fakeLayer("repo", "/fake/.cankan/config.yml", { expire: "true" })]);
-    const outcomes = await runHooks({ cfg, event: "expire", repoRoot: process.cwd() });
+    const cfg = fakeConfigResult([
+      fakeLayer("repo", "/fake/.cankan/config.yml", { expire: "true" }),
+    ]);
+    const outcomes = await runHooks({
+      cfg,
+      event: "expire",
+      repoRoot: process.cwd(),
+    });
     expect(outcomes).toHaveLength(1);
     expect(outcomes[0]?.exitCode).toBe(0);
   });
@@ -809,7 +917,14 @@ describe("fix round 2, finding 4: the deadline timer must not keep the process a
       // Absolute path computed at test time (not hardcoded) so this works
       // from any checkout -- `bun run` on the generated script below needs
       // a real filesystem path to import, not a package specifier.
-      const runnerPath = join(import.meta.dir, "..", "..", "src", "hooks", "runner.ts");
+      const runnerPath = join(
+        import.meta.dir,
+        "..",
+        "..",
+        "src",
+        "hooks",
+        "runner.ts",
+      );
       const scriptPath = join(dir, "probe.ts");
       // Fix round 3 (Ruling 17): the invariant this test actually proves is
       // "the process exits well before timeoutMs" -- the margin just needs

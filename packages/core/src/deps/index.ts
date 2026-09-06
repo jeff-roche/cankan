@@ -67,12 +67,14 @@
  * (`{ verdicts, ambiguousIds }`, fix round 1, Ruling R14) rather than a bare
  * map, so a board carrying a duplicated ticket id still surfaces that fact
  * in the sweep instead of the id silently vanishing from the listing.
- * **Read `ready.ts`'s own file comment before wiring either into anything
- * that acts automatically: the result is advisory, never authoritative** —
- * a `blocks` dependency can be permanently, silently neutralized by two
- * events pushed with coordination-ref access alone (no repo access), so
- * nothing downstream may auto-claim, auto-merge or auto-advance on the
- * strength of this result.
+ * **Read `ready.ts`'s own file comment for the full reasoning (fix round
+ * 3): this result is advisory and attacker-influenceable, not a security
+ * boundary, and consumers MAY auto-act on it** — `claim --next` does, by
+ * spec (CONCEPT.md:542). The rule that governs auto-acting: readiness must
+ * never be the sole gate on an action that is not reversible; claiming
+ * qualifies as reversible because release and expiry undo it. The sharp
+ * edge is that a forged `close` stays permanent until #105 lands a `reopen`
+ * event kind — see `ready.ts` for the full attack and the ruling.
  *
  * `DepsErrorCodes` (`./errors.ts`) — `EXCLUDED_LABELS_WITHOUT_LABELS_FOR`
  * (`isReady`/`readySet` was given a non-empty `excludedLabels` with no

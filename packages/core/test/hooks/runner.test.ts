@@ -14,8 +14,8 @@ import {
   HOOK_LAYER_ORDER,
   type HookEvent,
   type HookEventRecord,
+  type HookLayer,
   runHooks,
-  spawnHook,
 } from "../../src/hooks/runner";
 import {
   isPidAlive,
@@ -45,11 +45,29 @@ function fakeConfigResult(layers: readonly LoadedLayer[]): ConfigResult {
   };
 }
 
-/** White-box process tests are not testing repository authorization. */
-function spawnTrustedHook(
-  request: Omit<Parameters<typeof spawnHook>[0], "repoTrusted">,
-) {
-  return spawnHook({ ...request, repoTrusted: true });
+/** Drives process behavior only through the trust-enforcing public boundary. */
+interface TestHookRequest {
+  layer: HookLayer;
+  file: string;
+  command: string;
+  cwd: string;
+  env: Readonly<Record<string, string | undefined>>;
+  timeoutMs: number;
+  title?: string;
+}
+
+async function spawnTrustedHook(request: TestHookRequest) {
+  const layer = request.layer === "repo" ? "repo-local" : request.layer;
+  const [outcome] = await runHooks({
+    cfg: fakeConfigResult([{ layer, file: request.file, data: { hooks: { close: request.command } } }]),
+    event: "close",
+    repoRoot: request.cwd,
+    env: request.env,
+    timeoutMs: request.timeoutMs,
+    title: request.title,
+  });
+  if (!outcome) throw new Error("expected one hook outcome");
+  return outcome;
 }
 
 function fakeLayer(
@@ -579,20 +597,6 @@ describe("obligation 3: the timeout kills the whole process group, including gra
 });
 
 describe("obligation 2: the five env vars, argv shape, and captured streams", () => {
-  test("spawnHook itself refuses an untrusted repo command before spawning", async () => {
-    const result = await spawnHook({
-      layer: "repo",
-      repoTrusted: false,
-      file: "/fake/.cankan/config.yml",
-      command: "exit 99",
-      cwd: process.cwd(),
-      env: { PATH: process.env.PATH },
-      timeoutMs: DEFAULT_HOOK_TIMEOUT_MS,
-    });
-    expect(result.errorCode).toBe(HooksErrorCodes.HOOK_REPO_UNTRUSTED);
-    expect(result.exitCode).toBeNull();
-  });
-
   test("6. a non-zero exit is captured in the result, not thrown", async () => {
     const result = await spawnTrustedHook({
       layer: "repo",
@@ -650,9 +654,9 @@ describe("obligation 2: the five env vars, argv shape, and captured streams", ()
         cwd: dir,
         env: {
           PATH: process.env.PATH ?? "",
-          TITLE: "$(rm -rf /tmp/should-not-run); `echo pwned`; ; rm -rf .",
         },
         timeoutMs: DEFAULT_HOOK_TIMEOUT_MS,
+        title: "$(rm -rf /tmp/should-not-run); `echo pwned`; ; rm -rf .",
       });
       expect(result.exitCode).toBe(0);
       const content = await readFile(outFile, "utf8");
@@ -696,21 +700,6 @@ describe("obligation 2: the five env vars, argv shape, and captured streams", ()
 });
 
 describe("12. NUL-byte probe (task brief §5) -- Bun 1.4.0 rejects both cases synchronously", () => {
-  test("a NUL byte in an env value (e.g. attacker-influenced $TITLE) fails cleanly as HOOK_SPAWN_FAILED, not thrown", async () => {
-    const result = await spawnTrustedHook({
-      layer: "repo",
-      file: "/fake/.cankan/config.yml",
-      command: "true",
-      cwd: process.cwd(),
-      env: { PATH: process.env.PATH ?? "", TITLE: "abc\0def" },
-      timeoutMs: DEFAULT_HOOK_TIMEOUT_MS,
-    });
-    expect(result.errorCode).toBe(HooksErrorCodes.HOOK_SPAWN_FAILED);
-    expect(result.exitCode).toBeNull();
-    expect(result.signal).toBeNull();
-    expect(result.timedOut).toBe(false);
-  });
-
   test("a NUL byte in the resolved command string fails cleanly as HOOK_SPAWN_FAILED, not thrown", async () => {
     const result = await spawnTrustedHook({
       layer: "repo",

@@ -7,8 +7,8 @@ export function rankBetween(before?: number, after?: number): number {
   if (before === undefined && after === undefined) return DEFAULT_RANK_STEP;
   if (before === undefined) return (after as number) - DEFAULT_RANK_STEP;
   if (after === undefined) return before + DEFAULT_RANK_STEP;
-  const midpoint = (before + after) / 2;
-  if (midpoint === before || midpoint === after) throw new Error("no representable rank between values");
+  const midpoint = before / 2 + after / 2;
+  if (!Number.isFinite(midpoint) || midpoint === before || midpoint === after) throw new Error("no representable rank between values");
   return midpoint;
 }
 export function normalizeRanks<T extends { readonly ordinal?: number }>(items: readonly T[]): Array<T & { ordinal: number }> {
@@ -16,4 +16,3 @@ export function normalizeRanks<T extends { readonly ordinal?: number }>(items: r
 }
 export const rankAfter = (rank: number): number => rankBetween(rank);
 export const rankBefore = (rank: number): number => rankBetween(undefined, rank);
-

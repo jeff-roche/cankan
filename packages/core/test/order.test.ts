@@ -16,6 +16,18 @@ describe("ordering", () => {
     expect(Math.sign(compareTickets(a, b, order, "seed"))).toBe(-Math.sign(compareTickets(b, a, order, "seed")));
     expect(compareTickets(a, a, order, "seed")).toBe(0);
   });
+
+  test("supports documented backer, milestone, age, and label keys", () => {
+    const order = parseOrder("label:backend,backer:asc,milestone:asc,age:asc");
+    const first = ticket("ck-1", { labels: ["backend"], backer: "github", milestone: "M1", created_date: "2026-01-01" });
+    const second = ticket("ck-2", { labels: [], backer: "jira", milestone: "M2", created_date: "2025-01-01" });
+    expect(compareTickets(first, second, order)).toBeLessThan(0);
+  });
+
+  test("rejects malformed order terms with extra separators", () => {
+    expect(() => parseOrder("id:asc:desc")).toThrow();
+    expect(() => parseOrder("label:backend:asc:extra")).toThrow();
+  });
 });
 
 describe("ranks", () => {

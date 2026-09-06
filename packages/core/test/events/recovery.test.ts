@@ -649,6 +649,13 @@ describe("recover — fix round 3, Ruling R47: a duplicate-id conflict is always
     expect(result.quarantined).toEqual([]);
     expect(result.newTip).toBe(result.previousTip);
 
+    // Ruling R47's actual requirement: the remediation must name BOTH
+    // occurrences (both months), not just the one this walk found first —
+    // an operator resolving this by hand needs to know both coordinates,
+    // including the one holding the victim's genuine claim.
+    expect(result.unresolved[0]?.remediation).toContain("2026-08");
+    expect(result.unresolved[0]?.remediation).toContain("2026-09");
+
     // Both lines survive, unchanged, in their original months.
     const septRaw = await adapter.readBlobFromRef(COORD_REF, "events/2026-09.jsonl");
     const augRaw = await adapter.readBlobFromRef(COORD_REF, "events/2026-08.jsonl");

@@ -168,6 +168,53 @@
  *    `parentSha`; `readBlobFromRef` re-resolves the ref name on every call,
  *    it does not pin to a specific commit. Corrected to state what actually
  *    guarantees correctness: the CAS on `parent: parentSha` at commit time.
+ *
+ * ## Fix round 3 (orchestrator security + code review) — what changed
+ *
+ * One Critical and one High, both closed here — see `task-4-report.md`'s
+ * fix-round-3 addendum for the full defect-by-defect account and RED/GREEN
+ * evidence.
+ *
+ * 1. **A duplicate-id conflict could be "fixed" by evicting the victim
+ *    (Critical; Ruling R47).** `FIXABLE_REASONS` used to include
+ *    `"duplicate-id-conflict"`, so `recover()` would drop whichever
+ *    occurrence's *month happened to sort first* and keep the other —
+ *    survivorship by an attacker-controlled position, not by legitimacy
+ *    (ADR 0001:811-826 forbids exactly this: no attacker-independent
+ *    survivor key among mutually-distrusting peers). An attacker who wanted
+ *    to evict a victim's genuine claim could forge the same event id, place
+ *    the forgery in an *earlier* month than the victim's real line, and
+ *    wait for (or provoke) a recovery run: `recover()` would remove the
+ *    victim's later, legitimate line and keep the forgery — the exact
+ *    failure fm8(b) warns about, "a silently-granted double-claim." Closed
+ *    by removing `"duplicate-id-conflict"` from `FIXABLE_REASONS` entirely:
+ *    a duplicate-id conflict is now *always* reported `unresolved`, with a
+ *    `remediation` naming both occurrences (their months and line numbers)
+ *    so an operator resolves it by hand; `recover()` never quarantines
+ *    either occurrence and never rewrites either month file for this
+ *    reason, regardless of which one sorts first.
+ * 2. **A blocked `events` prefix made `diagnose()`/`recover()` fail open,
+ *    not closed (High; Ruling R48).** `read()`'s own top-level `events`
+ *    path was never probed the way `quarantine`'s was — a blob, symlink, or
+ *    gitlink planted at the bare `events` path makes every month's
+ *    `readBlobFromRef` resolve as "not found" (nothing exists under a
+ *    non-tree prefix), so `diagnose()` reported a clean board with zero
+ *    months scanned and `recover()` reported `"clean"`, while `read()`
+ *    itself would throw. Closed by probing `events` the same way
+ *    `assertQuarantineDirectoryUsable` already probed `quarantine`, via a
+ *    new shared, mode-aware, non-throwing discriminator,
+ *    `isTreeEntryBlocked` — blocked if the prefix resolves as a real blob,
+ *    or as `GIT_BLOB_AMBIGUOUS` with a mode other than `040000` (a symlink
+ *    or a gitlink/submodule); healthy if absent or `GIT_BLOB_AMBIGUOUS`
+ *    with mode `040000`. `computeDiagnosticReport` now checks `events`
+ *    first, before scanning any month, and reports a single
+ *    `"events-prefix-blocked"` failure (unresolved, with remediation) if
+ *    blocked, rather than an empty, falsely-clean report.
+ *    `assertQuarantineDirectoryUsable` itself is now built on the same
+ *    `isTreeEntryBlocked` helper — fix round 1/2's own quarantine probe was
+ *    blob-only and shared the identical symlink/gitlink blind spot this
+ *    round closes for `events`; both are fixed together, not just the one
+ *    the reviewer named.
  */
 
 import { createHash, randomBytes } from "node:crypto";

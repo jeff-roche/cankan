@@ -282,22 +282,26 @@ export const EventErrorCodes = {
    * `quarantine/<month>` path (fix round 2: checked at both levels, once
    * per attempt for the former and once per month touched for the latter —
    * see `assertQuarantineDirectoryUsable`). Git cannot represent a path as
-   * both a blob and a directory prefix in one tree, so a blob planted at
-   * either exact path blocks every write this run would otherwise make
-   * under it (fix round 1, Critical 2 — orchestrator security review;
-   * generalized to the per-month path in fix round 2, NEW-1 remediation).
-   * **Deliberately refuses to fall back to rewriting the month file without
-   * its matching audit record** — writing the fix without the quarantine
-   * record would silently delete the offending line with no audit trail,
-   * which is the one thing this module must never do. `details` names the
-   * exact blocked path; the message states the remediation (rebuild the
-   * ref's tree to remove the conflicting entry). **Fix round 2 (NEW-2):
-   * no longer also raised as a speculative relabel of an unrelated
-   * `commitTreeToRef` failure** — a real conflict is now always caught by
-   * one of the two proactive probes above, before the commit is even
-   * attempted, so a `commitTreeToRef` failure that still occurs is never
-   * this code; it propagates as `GIT_COMMAND_FAILED` with its genuine
-   * cause intact.
+   * both a non-tree entry and a directory prefix in one tree, so anything
+   * planted at either exact path that isn't itself a tree — a blob, a
+   * symlink, or a gitlink/submodule — blocks every write this run would
+   * otherwise make under it (fix round 1, Critical 2 — orchestrator
+   * security review, blob only; generalized to the per-month path in fix
+   * round 2, NEW-1 remediation; generalized again in fix round 3 to the
+   * full blob/symlink/gitlink mode check via the shared `isTreeEntryBlocked`
+   * helper, closing a symlink/gitlink gap in fix round 1/2's own blob-only
+   * probe — see Ruling R48). **Deliberately refuses to fall back to
+   * rewriting the month file without its matching audit record** — writing
+   * the fix without the quarantine record would silently delete the
+   * offending line with no audit trail, which is the one thing this module
+   * must never do. `details` names the exact blocked path; the message
+   * states the remediation (rebuild the ref's tree to remove the
+   * conflicting entry). **Fix round 2 (NEW-2): no longer also raised as a
+   * speculative relabel of an unrelated `commitTreeToRef` failure** — a
+   * real conflict is now always caught by one of the two proactive probes
+   * above, before the commit is even attempted, so a `commitTreeToRef`
+   * failure that still occurs is never this code; it propagates as
+   * `GIT_COMMAND_FAILED` with its genuine cause intact.
    */
   EVENT_RECOVERY_QUARANTINE_BLOCKED: "EVENT_RECOVERY_QUARANTINE_BLOCKED",
   /**

@@ -232,10 +232,20 @@ const MAX_ULID_TIME_MS = 281_474_976_710_655;
  */
 export function validateNowForDateFormatting(now: number): void {
   if (!Number.isFinite(now) || now < -MAX_DATE_MS || now > MAX_DATE_MS) {
+    // Fix round 3 (Ruling R31/R32, orchestrator security review): `now`
+    // is not yet known to be a number at this point — that is exactly what
+    // this check just failed to confirm — so interpolating it directly
+    // (`${now}`) or copying it verbatim into `details` risks the same
+    // past-`isCanKanError` shape this file's own `maxExistingBlobBytes`
+    // check below already guards against: confirmed by probe,
+    // `validateNowForDateFormatting(Object.create(null))` throws a raw,
+    // unwrapped `TypeError` ("No default value") from inside the template
+    // literal's own `ToString` coercion, not a `CanKanError`. Mirrors that
+    // check's own `typeof v === "number" ? v : ...` pattern exactly.
     throw new CanKanError(
       EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
-      `now must be within Date's representable range [-${MAX_DATE_MS}, ${MAX_DATE_MS}], got ${now}`,
-      { details: { now, minValue: -MAX_DATE_MS, maxValue: MAX_DATE_MS } },
+      `now must be within Date's representable range [-${MAX_DATE_MS}, ${MAX_DATE_MS}], got ${typeof now === "number" ? now : typeof now}`,
+      { details: { now: typeof now === "number" ? now : null, minValue: -MAX_DATE_MS, maxValue: MAX_DATE_MS } },
     );
   }
 }
@@ -248,10 +258,12 @@ export function validateNowForDateFormatting(now: number): void {
  */
 function validateNowForMinting(now: number): void {
   if (!Number.isFinite(now) || now < 0 || now > MAX_ULID_TIME_MS) {
+    // Fix round 3 (Ruling R31/R32): same fix, same reason, as
+    // `validateNowForDateFormatting` immediately above.
     throw new CanKanError(
       EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
-      `now must be within ulid's encodable range [0, ${MAX_ULID_TIME_MS}], got ${now}`,
-      { details: { now, minValue: 0, maxValue: MAX_ULID_TIME_MS } },
+      `now must be within ulid's encodable range [0, ${MAX_ULID_TIME_MS}], got ${typeof now === "number" ? now : typeof now}`,
+      { details: { now: typeof now === "number" ? now : null, minValue: 0, maxValue: MAX_ULID_TIME_MS } },
     );
   }
 }
@@ -713,15 +725,24 @@ export interface AppendOptions {
    * task-2-report.md).
    *
    * **Its own type is validated (fix round 5, Medium C); its *return
-   * value* already was, indirectly.** A non-function `ulidFactory`
-   * (confirmed by probe: `123`, `"x"`, `{}`) throws a raw, unwrapped
-   * `TypeError` ("... is not a function") the moment `append` tries to
-   * call it — the same past-`isCanKanError` shape closed for `ticket`
-   * (fix round 4) and `since` (fix round 4/5). A function that returns
-   * garbage (`() => "not-a-ulid"`, `() => 12345`) needed no separate fix:
-   * it already lands as `EVENT_APPEND_REJECTED` via `parseEvent`
-   * (Ruling R11), since the minted `id` is validated as part of the exact
-   * bytes about to be committed either way.
+   * value* already was, indirectly — for one of the two ways a return
+   * value can be "garbage" (fix round 3 correction, Ruling R31/R32: the
+   * claim below was true only for the serializable case, stated
+   * unconditionally).** A non-function `ulidFactory` (confirmed by probe:
+   * `123`, `"x"`, `{}`) throws a raw, unwrapped `TypeError` ("... is not a
+   * function") the moment `append` tries to call it — the same
+   * past-`isCanKanError` shape closed for `ticket` (fix round 4) and
+   * `since` (fix round 4/5). A function that returns **serializable**
+   * garbage (`() => "not-a-ulid"`, `() => 12345`) needs no separate fix: it
+   * lands as `EVENT_APPEND_REJECTED` via `parseEvent` (Ruling R11), since
+   * the minted `id` is validated as part of the exact bytes about to be
+   * committed either way. A function that returns **unserializable**
+   * garbage (`() => 1n`, a `BigInt`) does *not* reach `parseEvent` at all —
+   * `JSON.stringify` itself throws first (confirmed by probe:
+   * `JSON.stringify({ id: 1n })` raises "Do not know how to serialize a
+   * BigInt") — and is now caught at that call site and re-thrown as the
+   * same `EVENT_APPEND_REJECTED`, rather than escaping as a raw
+   * `TypeError`.
    */
   readonly ulidFactory?: (seedTime?: number) => string;
   /**
@@ -860,9 +881,15 @@ export async function append(
   adapter: GitAdapter,
   ref: string,
   candidate: EventCandidate,
-  options: AppendOptions = {},
+  options: AppendOptions | null = {},
 ): Promise<AppendedEvent> {
-  return appendCore(adapter, ref, candidate, options, {});
+  // Fix round 3 (Ruling R31/R32, orchestrator security review): a default
+  // parameter does not apply to an explicit `null` (only to `undefined`) —
+  // confirmed by probe, `append(adapter, ref, candidate, null)` previously
+  // threw a raw `TypeError` on `options.now` rather than surfacing through
+  // this module's own validated error path. Same pattern applied to
+  // `recovery.ts`'s `recover`/`diagnose` (fix round 2/3).
+  return appendCore(adapter, ref, candidate, options ?? {}, {});
 }
 
 /** See `AppendHooks`'s doc comment: the module-internal export a test drives directly. `append` is the public surface; it calls this with no hooks. */
@@ -941,10 +968,19 @@ export async function appendCore(
   // attempt immediately) an unvalidated value produces.
   const casMaxAttempts = options.casRetry?.maxAttempts;
   if (casMaxAttempts !== undefined && (!Number.isInteger(casMaxAttempts) || casMaxAttempts < 1 || casMaxAttempts > MAX_CAS_ATTEMPTS)) {
+    // Fix round 3 (Ruling R31/R32): `casMaxAttempts` is not yet known to be
+    // a number here — `Number.isInteger` returns `false`, not a throw, for
+    // any non-number — so interpolating it directly or copying it verbatim
+    // into `details` risks the same past-`isCanKanError` shape as `now`
+    // above. Confirmed by probe: `append(..., { casRetry: { maxAttempts:
+    // Object.create(null) } })` threw a raw, unwrapped `TypeError` ("No
+    // default value") before this fix. Mirrors `maxExistingBlobBytes`'s own
+    // `typeof v === "number" ? v : ...` pattern (this file's existing
+    // convention, not a new helper).
     throw new CanKanError(
       EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
-      `casRetry.maxAttempts must be an integer in [1, ${MAX_CAS_ATTEMPTS}], got ${casMaxAttempts}`,
-      { details: { maxAttempts: casMaxAttempts, max: MAX_CAS_ATTEMPTS } },
+      `casRetry.maxAttempts must be an integer in [1, ${MAX_CAS_ATTEMPTS}], got ${typeof casMaxAttempts === "number" ? casMaxAttempts : typeof casMaxAttempts}`,
+      { details: { maxAttempts: typeof casMaxAttempts === "number" ? casMaxAttempts : null, max: MAX_CAS_ATTEMPTS } },
     );
   }
   // Fix round 5, High B: `casRetry.backoffMs`'s own *type*, checked here —
@@ -992,7 +1028,30 @@ export async function appendCore(
   // log — `parseEvent(JSON.stringify(...))`, not the constructed object
   // directly — so this function can never persist a byte sequence it did
   // not itself validate.
-  const line = JSON.stringify(withId);
+  //
+  // Fix round 3 (Ruling R31/R32, orchestrator security review):
+  // `JSON.stringify` itself can throw, not just return a string
+  // `parseEvent` then rejects — confirmed by probe:
+  // `append(..., { ulidFactory: () => 1n })` mints a `BigInt` id, and
+  // `JSON.stringify` raises a raw, unwrapped `TypeError` ("Do not know how
+  // to serialize a BigInt") *before* `parseEvent` ever runs, escaping past
+  // this function's own `isCanKanError`-shaped error contract entirely.
+  // Caught and re-thrown as the same `EVENT_APPEND_REJECTED` a
+  // schema-rejected candidate already produces — see
+  // `AppendOptions.ulidFactory`'s doc comment, corrected alongside this
+  // fix: "a function that returns garbage needs no separate fix, it lands
+  // as `EVENT_APPEND_REJECTED` via `parseEvent`" was true for
+  // *serializable* garbage only; unserializable garbage (a `BigInt`, a
+  // circular reference) never reached `parseEvent` at all until this catch.
+  let line: string;
+  try {
+    line = JSON.stringify(withId);
+  } catch (cause) {
+    throw new CanKanError(EventErrorCodes.EVENT_APPEND_REJECTED, "event could not be serialized to JSON before append", {
+      cause,
+      details: { reason: "unserializable" },
+    });
+  }
   const parsed = parseEvent(line, { now });
   if (!parsed.ok) {
     throw new CanKanError(EventErrorCodes.EVENT_APPEND_REJECTED, "event failed schema validation before append", {
@@ -1196,6 +1255,24 @@ export interface ReadOptions {
    * than," so `read()` silently returned `[]` on a board that has events.
    * This is the mutual-exclusion guarantee's own failure shape: a caller
    * polling with a malformed cursor concludes a held ticket is unheld.
+   *
+   * **`id` is peer-chosen, exactly like `ts` — validating its *shape* does
+   * not make its *value* trustworthy (fix round 3, Medium, orchestrator
+   * security review).** `isValidEventId` confirms `since` is grammatically
+   * a ULID; it says nothing about whether that specific value was ever
+   * actually assigned by this module's own monotonic generator to a real
+   * event in append order. A peer can mint an id that sorts *before* one
+   * already appended (see `read`'s own "Returned in ULID order" doc
+   * comment) — a caller polling with `since: <a later real id>` after such
+   * an id has been forged earlier in sort order would find that forged
+   * event `id`-greater-than-`since` even though it "arrived" earlier in
+   * real append order, or miss an event whose id happens to sort at or
+   * before `since` despite being genuinely new. **`since` must never gate
+   * a mutual-exclusion decision** — the only cursor safe for that is
+   * `(month, line)` (`EventRecord`'s own stable chain coordinate), not an
+   * `id` comparison of any kind. `since` is offered here purely as an
+   * incremental-polling convenience (skip records already seen), not as an
+   * authority a caller should build correctness on.
    */
   readonly since?: EventId;
   /** Matched case-insensitively: canonicalized the same way `append` canonicalizes `ticket` on write (ADR 0001:751-764), so `read({ ticket: "CK-1" })` finds an event appended as `ck-1`. */
@@ -1209,9 +1286,25 @@ export interface ReadOptions {
  * `options.trailingMonths` months (Ruling R4, fm9) and validated line by
  * line (obligation A/B/C, ADR 0001:716-723, fm8, fm11).
  *
- * **Returned in ULID order** (PLAN.md's done-when) — `id` sorts
- * lexicographically in encounter order because every id is the same fixed
- * 26-character length. **Each record also carries its position in the
+ * **Returned in ULID order** (PLAN.md's done-when) — records are sorted by
+ * `id`'s own string value, lexicographically; the fixed 26-character length
+ * only makes that comparison well-defined without needing to parse each id
+ * apart, it does **not** mean this order matches append (encounter) order
+ * (fix round 3 correction, Medium, orchestrator security review: the
+ * pre-fix wording said "in encounter order," which is false and was itself
+ * this dispatch's own narrowing of a hazard the brief asked to close for
+ * `ts` — swapping one peer-chosen field, `ts`, for another, `id`'s sort
+ * value, and calling it fixed). `id` is minted by whichever peer appends
+ * the event; `isValidEventId`'s grammar check constrains its *shape*, not
+ * its *value* — a peer can mint (or, more precisely, is trusted to mint
+ * only via `ulid`'s own monotonic generator, but nothing here enforces
+ * that) an id like `"0000000000000000000000000A"`, which sorts *first*
+ * regardless of when it was actually appended. See `EventRecord`'s doc
+ * comment for the full "deterministic, not trustworthy" treatment this
+ * already gives chain position, which applies here too: this order is safe
+ * to use for anything that needs peers to agree deterministically, and
+ * unsafe for anything that assumes it reflects real chronology. **Each
+ * record also carries its position in the
  * append-only chain** (Ruling R3): `month`, `line` (zero-based index within
  * that file), assigned as this function walks months oldest-to-newest and
  * lines in file order — the ordering *authority* per ADR 0001:723-725 and
@@ -1239,7 +1332,14 @@ export interface ReadOptions {
  * `ref.ts`'s `initRef`'s job; syncing it from a remote is the sync layer's.
  * An absent ref genuinely has no events yet, and `[]` says exactly that.
  */
-export async function read(adapter: GitAdapter, ref: string, options: ReadOptions = {}): Promise<readonly EventRecord[]> {
+export async function read(adapter: GitAdapter, ref: string, options: ReadOptions | null = {}): Promise<readonly EventRecord[]> {
+  // Fix round 3 (Ruling R31/R32, orchestrator security review): a default
+  // parameter does not apply to an explicit `null` — confirmed by probe,
+  // `read(adapter, ref, null)` previously threw a raw `TypeError` on
+  // `options.now` rather than surfacing through this module's own
+  // validated error path. Same pattern applied to `append` above and to
+  // `recovery.ts`'s `recover`/`diagnose` (fix round 2/3).
+  const opts = options ?? {};
   // Fix round 2 (Low): the fm10 ref gate runs *first* — before either
   // parameter-shape check below. Ordering is observable: a call carrying
   // both a bad ref and a bad window previously reported
@@ -1247,8 +1347,8 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
   // wrong diagnosis to hand a caller who configured the ref wrong (fm10 is
   // the security-relevant gate; the window checks are hygiene).
   const validatedRef = await validateCoordinationRef(ref);
-  const now = options.now ?? Date.now();
-  const trailingMonths = options.trailingMonths ?? DEFAULT_TRAILING_MONTHS;
+  const now = opts.now ?? Date.now();
+  const trailingMonths = opts.trailingMonths ?? DEFAULT_TRAILING_MONTHS;
   // Fix round 1, S1 / fix round 3, M1: validated before any further git
   // invocation and before the month-key loop — a degenerate `trailingMonths`
   // (0, negative, NaN) or a pathologically large one (a hostile
@@ -1264,8 +1364,8 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
   // an unvalidated `since` fails open exactly like an unvalidated
   // `trailingMonths`/`now` did in earlier rounds, but silently rather than
   // by throwing, which makes it the more dangerous of the two shapes.
-  if (options.since !== undefined) {
-    validateSince(options.since);
+  if (opts.since !== undefined) {
+    validateSince(opts.since);
   }
   // Fix round 4, corrected sweep: `ticket` reaches `canonicalizeTicketId`
   // (a bare `.toLowerCase()`) in the filter step below — see
@@ -1273,8 +1373,8 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
   // before any git invocation, consistently with every other option check
   // above, even though the actual consumption happens later in this
   // function.
-  if (options.ticket !== undefined) {
-    validateTicketFilter(options.ticket);
+  if (opts.ticket !== undefined) {
+    validateTicketFilter(opts.ticket);
   }
 
   const head = await adapter.readRef(validatedRef);
@@ -1401,9 +1501,9 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
     }
   }
 
-  const since = options.since;
-  const ticket = options.ticket === undefined ? undefined : canonicalizeTicketId(options.ticket);
-  const actor = options.actor;
+  const since = opts.since;
+  const ticket = opts.ticket === undefined ? undefined : canonicalizeTicketId(opts.ticket);
+  const actor = opts.actor;
 
   const filtered = records.filter((record) => {
     if (since !== undefined && !(record.event.id > since)) {

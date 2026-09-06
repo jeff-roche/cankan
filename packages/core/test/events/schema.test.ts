@@ -672,6 +672,23 @@ describe("obligation 9 — an unrecognized `event` kind is rejected", () => {
 });
 
 // ============================================================================
+// Fix round 3 (Ruling R31/R32, orchestrator security review): an explicit
+// `null` options argument must not throw a raw TypeError
+// ============================================================================
+
+describe("parseEvent — fix round 3: an explicit null options argument is normalized, not a raw TypeError", () => {
+  test("parseEvent(line, null) behaves exactly like parseEvent(line) — never throws", () => {
+    const line = JSON.stringify(envelope({ event: "release" }));
+    // Before the fix: a default parameter does not apply to an explicit
+    // `null` — `options.now` on a `null` options argument threw a raw
+    // `TypeError`, violating this function's own documented contract
+    // ("never throws").
+    const result = parseEvent(line, null);
+    expect(result.ok).toBe(true);
+  });
+});
+
+// ============================================================================
 // Type-level: the public Event union matches the documented per-kind shapes
 // ============================================================================
 

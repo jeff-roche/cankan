@@ -35,4 +35,17 @@ export const StateErrorCodes = {
    * programming error, not an ordinary "not found" outcome to shrug off.
    */
   TICKET_NOT_IN_BOARD_STATE: "STATE_TICKET_NOT_IN_BOARD_STATE",
+  /**
+   * `blockedBy` was asked about a `TicketId` that is **ambiguous**, not
+   * absent — either the id appears in `BoardState.duplicateTicketIds`
+   * (Ruling D1: more than one `StoredTicket` declared it, so it was
+   * excluded from `BoardState.tickets` entirely), or — defence in depth,
+   * unreachable via the real fold but not via a hand-built `BoardState` —
+   * more than one entry in `tickets` itself matches. Deliberately distinct
+   * from `TICKET_NOT_IN_BOARD_STATE` (fix round 6, security/code review):
+   * "missing" and "ambiguous" are opposite failures with opposite remedies,
+   * and a caller catching one code should not have to string-match the
+   * message to tell which actually happened.
+   */
+  TICKET_ID_AMBIGUOUS: "STATE_TICKET_ID_AMBIGUOUS",
 } as const;

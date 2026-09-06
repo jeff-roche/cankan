@@ -4,6 +4,7 @@ import { StateErrorCodes } from "../../src/state/errors";
 import { foldState } from "../../src/state/fold";
 import type { BoardState, TicketState } from "../../src/state/fold";
 import { blockedBy, byStatus, claimedBy } from "../../src/state/queries";
+import type { TicketIdLookupKey } from "../../src/store/index";
 import type { ActorId, TicketId } from "../../src/types";
 import { fixtureEvent, makeStoredTicket } from "./testHelpers";
 
@@ -264,7 +265,7 @@ describe("blockedBy", () => {
     expect(outstanding[0]?.resolvedTicket).toBeUndefined();
   });
 
-  test("Ruling D1 (fix round 5, security review): a duplicated ticket id fails closed, identically regardless of array order", () => {
+  test("Ruling D1 (fix round 5/6, security review): a duplicated ticket id fails closed with a DISTINCT code, identically regardless of array order", () => {
     const lower = makeStoredTicket("ck-1", "To Do");
     const upper = makeStoredTicket("CK-1", "Done");
 
@@ -277,7 +278,12 @@ describe("blockedBy", () => {
         blockedBy(state, "ck-1" as TicketId);
       } catch (error) {
         threw = true;
-        expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.TICKET_NOT_IN_BOARD_STATE);
+        // Fix round 6: TICKET_ID_AMBIGUOUS, never TICKET_NOT_IN_BOARD_STATE
+        // — "ambiguous" and "absent" are opposite facts, and this call site
+        // is exactly the one that used to conflate them (checked
+        // `state.duplicateTicketIds` before falling through to a plain
+        // "not present" throw).
+        expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.TICKET_ID_AMBIGUOUS);
       }
       expect(threw).toBe(true);
     }
@@ -312,7 +318,29 @@ describe("blockedBy", () => {
       blockedBy(state, "ck-1" as TicketId);
     } catch (error) {
       threw = true;
-      expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.TICKET_NOT_IN_BOARD_STATE);
+      expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.TICKET_ID_AMBIGUOUS);
+    }
+    expect(threw).toBe(true);
+  });
+
+  test("Ruling D1 (fix round 6): the duplicateTicketIds check itself, isolated from the >1-matches fallback", () => {
+    // A hand-built `BoardState` where `tickets` has ZERO entries for the
+    // key (as the real fold now always produces) but `duplicateTicketIds`
+    // names it — isolates the NEW check (line checked before the `.filter`
+    // fallback) from the pre-existing `>1 matches` defensive branch.
+    const state: BoardState = {
+      tickets: [],
+      orphanedEvents: [],
+      duplicateTicketIds: [{ ticketId: "ck-1" as TicketIdLookupKey, paths: ["/a.md", "/b.md"] }],
+    };
+
+    let threw = false;
+    try {
+      blockedBy(state, "ck-1" as TicketId);
+    } catch (error) {
+      threw = true;
+      expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.TICKET_ID_AMBIGUOUS);
+      expect(isCanKanError(error) && error.message).toContain("ambiguous");
     }
     expect(threw).toBe(true);
   });

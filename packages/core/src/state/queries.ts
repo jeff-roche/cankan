@@ -218,6 +218,16 @@ function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLook
  * `blocks` deps satisfied. This is Minor today only because no consumer
  * exists yet to violate it.
  *
+ * **The companion constraint this one depends on (fix round 6) lives on
+ * `BoardState.duplicateTicketIds`, not here, but belongs in the same
+ * binding register: no downstream consumer may read a ticket's absence
+ * from `BoardState.tickets` as "does not exist" or "is unclaimed" without
+ * first checking `duplicateTicketIds` for that id.** `blockedBy` itself
+ * already enforces this for its own lookup (see the `TICKET_ID_AMBIGUOUS`
+ * check below) — this is the rule a *different* future consumer of
+ * `BoardState.tickets` would also need to follow, and it is exactly as
+ * binding as the one above.
+ *
  * **Not a mutual-exclusion input** — see `BlockingDependency.resolvedTicket`'s
  * own doc: two peers can legitimately compute a different result here for
  * the same ticket, and neither result decides who holds a claim.
@@ -230,6 +240,24 @@ function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLook
  */
 export function blockedBy(state: BoardState, ticketId: TicketId): readonly BlockingDependency[] {
   const key = normalizeTicketIdForComparison(ticketId);
+
+  // Ruling D1 (fix round 6, security/code review): check
+  // `duplicateTicketIds` BEFORE concluding "not present". Through the real
+  // fold, a duplicated id lands on zero matches below (`foldState` excludes
+  // it from `tickets` entirely) — without this check that would throw the
+  // identical `TICKET_NOT_IN_BOARD_STATE` code and a near-identical message
+  // as a genuinely absent ticket, even though the two are opposite facts
+  // with opposite remedies. `TICKET_ID_AMBIGUOUS` lets a caller tell them
+  // apart without string-matching the message.
+  const duplicate = state.duplicateTicketIds.find((d) => d.ticketId === key);
+  if (duplicate !== undefined) {
+    throw new CanKanError(
+      StateErrorCodes.TICKET_ID_AMBIGUOUS,
+      `ticket ${ticketId} is ambiguous: claimed by ${duplicate.paths.length} ticket files in this checkout, not absent`,
+      { details: { ticketId, paths: duplicate.paths } },
+    );
+  }
+
   // `.filter`, never `.find` (Ruling D1, fix round 5, security review):
   // `foldState` already excludes a duplicate-normalized-id ticket from
   // `state.tickets` entirely (see `partitionByDuplicateId`), so more than
@@ -240,7 +268,10 @@ export function blockedBy(state: BoardState, ticketId: TicketId): readonly Block
   // exactly what this module must never do (the same invariant the
   // alias-cycle fix, Ruling R12, enforces on the event side). Failing
   // closed here costs three lines and closes that hole permanently rather
-  // than trusting the invariant to hold forever upstream.
+  // than trusting the invariant to hold forever upstream. Uses the same
+  // `TICKET_ID_AMBIGUOUS` code as the `duplicateTicketIds` check above —
+  // both are the identical fact (this id is ambiguous), reached by two
+  // different routes.
   const matches = state.tickets.filter((t) => normalizeTicketIdForComparison(t.id) === key);
   if (matches.length === 0) {
     throw new CanKanError(
@@ -251,7 +282,7 @@ export function blockedBy(state: BoardState, ticketId: TicketId): readonly Block
   }
   if (matches.length > 1) {
     throw new CanKanError(
-      StateErrorCodes.TICKET_NOT_IN_BOARD_STATE,
+      StateErrorCodes.TICKET_ID_AMBIGUOUS,
       `ticket ${ticketId} matches more than one entry in this BoardState — refusing to pick one by array order`,
       { details: { ticketId, matchCount: matches.length } },
     );

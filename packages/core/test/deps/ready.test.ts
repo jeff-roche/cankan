@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { DepsErrorCodes } from "../../src/deps/errors";
 import { isReady, readySet } from "../../src/deps/ready";
 import { isCanKanError } from "../../src/errors";
 import { StateErrorCodes } from "../../src/state/errors";
@@ -6,12 +7,15 @@ import { foldState } from "../../src/state/fold";
 import type { ActorId, TicketId } from "../../src/types";
 import { fixtureEvent, makeStoredTicket } from "../state/testHelpers";
 
+/** Every test in this file that doesn't care about flat deps passes this explicitly (Ruling R11: `flatDependenciesFor` is required, no silent "assume none"). */
+const NO_FLAT_DEPS = { flatDependenciesFor: (): readonly string[] => [] };
+
 describe("isReady", () => {
   test("ready when open, unclaimed, no blockers, no excluded labels", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
     const state = foldState([ticket], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
 
-    const verdict = isReady(state, "ck-1" as TicketId);
+    const verdict = isReady(state, "ck-1" as TicketId, NO_FLAT_DEPS);
     expect(verdict).toEqual({ ready: true, reasons: [] });
   });
 
@@ -20,7 +24,7 @@ describe("isReady", () => {
     const closeEvent = fixtureEvent({ event: "close", ticket: "ck-1" }, "2026-01", 0);
     const state = foldState([ticket], [closeEvent], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
 
-    const verdict = isReady(state, "ck-1" as TicketId);
+    const verdict = isReady(state, "ck-1" as TicketId, NO_FLAT_DEPS);
     expect(verdict.ready).toBe(false);
     expect(verdict.reasons).toContainEqual({ kind: "closed" });
   });
@@ -38,7 +42,7 @@ describe("isReady", () => {
       firstSeen: new Map([[claim.event.id, 0]]),
     });
 
-    const verdict = isReady(state, "ck-1" as TicketId);
+    const verdict = isReady(state, "ck-1" as TicketId, NO_FLAT_DEPS);
     expect(verdict.ready).toBe(false);
     expect(verdict.reasons).toContainEqual({ kind: "claimed", actor: "claude-code:alice/wt-a" as ActorId });
   });
@@ -48,7 +52,7 @@ describe("isReady", () => {
     const ticket = makeStoredTicket("ck-1", "To Do", { cankan: { deps: [{ type: "blocks", id: "ck-2" }] } });
     const state = foldState([ticket, blocker], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
 
-    const verdict = isReady(state, "ck-1" as TicketId);
+    const verdict = isReady(state, "ck-1" as TicketId, NO_FLAT_DEPS);
     expect(verdict.ready).toBe(false);
     const reason = verdict.reasons.find((r) => r.kind === "blocked");
     expect(reason).toBeDefined();
@@ -61,6 +65,7 @@ describe("isReady", () => {
     const state = foldState([ticket], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
 
     const verdict = isReady(state, "ck-1" as TicketId, {
+      ...NO_FLAT_DEPS,
       excludedLabels: ["icebox", "needs-design"],
       labelsFor: () => ["icebox"],
     });
@@ -74,7 +79,7 @@ describe("isReady", () => {
     const ticket = makeStoredTicket("ck-1", "To Do", { cankan: { deps: [{ type: "blocks", id: "ck-2" }] } });
     const state = foldState([ticket, blocker], [closeEvent], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
 
-    expect(isReady(state, "ck-1" as TicketId)).toEqual({ ready: true, reasons: [] });
+    expect(isReady(state, "ck-1" as TicketId, NO_FLAT_DEPS)).toEqual({ ready: true, reasons: [] });
   });
 
   test("ready: claimed-but-EXPIRED is ready, not claimed", () => {
@@ -90,7 +95,7 @@ describe("isReady", () => {
       firstSeen: new Map([[claim.event.id, 0]]), // expired long ago
     });
 
-    expect(isReady(state, "ck-1" as TicketId)).toEqual({ ready: true, reasons: [] });
+    expect(isReady(state, "ck-1" as TicketId, NO_FLAT_DEPS)).toEqual({ ready: true, reasons: [] });
   });
 
   test("ready: claimed but NEVER OBSERVED (no firstSeen entry) is also ready, not claimed", () => {
@@ -102,7 +107,7 @@ describe("isReady", () => {
     );
     const state = foldState([ticket], [claim], { now: 0, leaseTtlMs: 1_000_000, firstSeen: new Map() });
 
-    expect(isReady(state, "ck-1" as TicketId)).toEqual({ ready: true, reasons: [] });
+    expect(isReady(state, "ck-1" as TicketId, NO_FLAT_DEPS)).toEqual({ ready: true, reasons: [] });
   });
 
   describe("Ruling R2 — both blockedBy error codes escape isReady, uncaught, separately", () => {
@@ -113,7 +118,7 @@ describe("isReady", () => {
 
       let threw = false;
       try {
-        isReady(state, "ck-1" as TicketId);
+        isReady(state, "ck-1" as TicketId, NO_FLAT_DEPS);
       } catch (error) {
         threw = true;
         expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.TICKET_ID_AMBIGUOUS);
@@ -126,7 +131,7 @@ describe("isReady", () => {
 
       let threw = false;
       try {
-        isReady(state, "ck-nope" as TicketId);
+        isReady(state, "ck-nope" as TicketId, NO_FLAT_DEPS);
       } catch (error) {
         threw = true;
         expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.TICKET_NOT_IN_BOARD_STATE);
@@ -215,6 +220,75 @@ describe("isReady", () => {
     });
   });
 
+  describe("Ruling R12 (fix round 1) — resolveTier1 must NEVER follow displayId/frontmatterAliases/eventAliases: the module's sole security invariant", () => {
+    // Mirrors `attack1.ts` §A near-verbatim: close(ck-z), then
+    // alias{from: ck-ghost, to: ck-z} — the exact composed attack
+    // `state/queries.ts::blockedBy`'s own file comment discloses (push
+    // access to the coordination ref alone, zero repo access, permanent
+    // because there is no `reopen` event kind).
+    function boardWithNeutralizedGhost() {
+      const z = makeStoredTicket("ck-z", "To Do");
+      const closeZ = fixtureEvent({ event: "close", ticket: "ck-z" }, "2026-01", 0);
+      const aliasGhost = fixtureEvent({ event: "alias", ticket: "ck-z", from: "ck-ghost", to: "ck-z" }, "2026-01", 1);
+      return { z, closeZ, aliasGhost };
+    }
+
+    test("a FLAT dependency naming the alias'd-to-closed id is NOT satisfied — the flat path is tier-1 only and must not follow the alias", () => {
+      const { z, closeZ, aliasGhost } = boardWithNeutralizedGhost();
+      const v = makeStoredTicket("ck-v", "To Do"); // no cankan: block at all
+      const state = foldState([v, z], [closeZ, aliasGhost], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+      const verdict = isReady(state, "ck-v" as TicketId, { flatDependenciesFor: () => ["ck-ghost"] });
+
+      expect(verdict.ready).toBe(false);
+      const reason = verdict.reasons.find((r) => r.kind === "blocked");
+      expect(reason?.kind === "blocked" && reason.rawId).toBe("ck-ghost");
+      // Must NOT have resolved through the alias — if this is ever defined,
+      // resolveTier1 has been widened past tier 1 and this test must catch it.
+      expect(reason?.kind === "blocked" && reason.resolvedTicket).toBeUndefined();
+    });
+
+    test("the SAME alias, reached through a TYPED cankan.deps entry, DOES read satisfied — blockedBy's pre-existing, disclosed exposure, pinned here (not a regression to fix)", () => {
+      const { z, closeZ, aliasGhost } = boardWithNeutralizedGhost();
+      const v = makeStoredTicket("ck-v", "To Do", { cankan: { deps: [{ type: "blocks", id: "ck-ghost" }] } });
+      const state = foldState([v, z], [closeZ, aliasGhost], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+      const verdict = isReady(state, "ck-v" as TicketId, NO_FLAT_DEPS);
+
+      // Asserting `ready: true` here pins the asymmetry `ready.ts`'s file
+      // comment claims: the typed half goes through `blockedBy` in full and
+      // is exposed to the alias attack; only the flat half (tested above) is
+      // narrower.
+      expect(verdict).toEqual({ ready: true, reasons: [] });
+    });
+  });
+
+  describe("Ruling R11 (fix round 1) — excludedLabels without labelsFor throws loudly instead of silently disabling every exclusion", () => {
+    test("excludedLabels non-empty, labelsFor absent -> throws DEPS_EXCLUDED_LABELS_WITHOUT_LABELS_FOR", () => {
+      const ticket = makeStoredTicket("ck-1", "To Do");
+      const state = foldState([ticket], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+      let threw = false;
+      try {
+        isReady(state, "ck-1" as TicketId, { ...NO_FLAT_DEPS, excludedLabels: ["icebox"] });
+      } catch (error) {
+        threw = true;
+        expect(isCanKanError(error) && error.code).toBe(DepsErrorCodes.EXCLUDED_LABELS_WITHOUT_LABELS_FOR);
+      }
+      expect(threw).toBe(true);
+    });
+
+    test("excludedLabels EMPTY with labelsFor absent stays legal — no throw", () => {
+      const ticket = makeStoredTicket("ck-1", "To Do");
+      const state = foldState([ticket], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+      expect(isReady(state, "ck-1" as TicketId, { ...NO_FLAT_DEPS, excludedLabels: [] })).toEqual({
+        ready: true,
+        reasons: [],
+      });
+    });
+  });
+
   test("every applicable reason is reported together, not just the first", () => {
     const blocker = makeStoredTicket("ck-2", "In Progress");
     const ticket = makeStoredTicket("ck-1", "Done", { cankan: { deps: [{ type: "blocks", id: "ck-2" }] } });
@@ -231,6 +305,7 @@ describe("isReady", () => {
     });
 
     const verdict = isReady(state, "ck-1" as TicketId, {
+      ...NO_FLAT_DEPS,
       excludedLabels: ["icebox"],
       labelsFor: () => ["icebox"],
     });
@@ -243,6 +318,7 @@ describe("isReady", () => {
     const state = foldState([ticket], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
 
     const verdict = isReady(state, "ck-1" as TicketId, {
+      ...NO_FLAT_DEPS,
       excludedLabels: ["Icebox"],
       labelsFor: () => ["icebox"],
     });
@@ -272,7 +348,7 @@ describe("readySet", () => {
       { now: 0, leaseTtlMs: 1_000_000, firstSeen: new Map([[claim.event.id, 0]]) },
     );
 
-    const sweep = readySet(state);
+    const sweep = readySet(state, NO_FLAT_DEPS);
 
     const golden: Record<string, { readonly ready: boolean; readonly reasonKinds: readonly string[] }> = {
       "ck-ready": { ready: true, reasonKinds: [] },
@@ -282,13 +358,32 @@ describe("readySet", () => {
       "ck-claimed": { ready: false, reasonKinds: ["claimed"] },
     };
 
-    expect(sweep.size).toBe(5);
+    expect(sweep.verdicts.size).toBe(5);
     for (const [id, expected] of Object.entries(golden)) {
-      const verdict = sweep.get(id as TicketId);
+      const verdict = sweep.verdicts.get(id as TicketId);
       expect(verdict?.ready).toBe(expected.ready);
       expect((verdict?.reasons.map((r) => r.kind) as string[] | undefined)?.sort()).toEqual(
         [...expected.reasonKinds].sort(),
       );
     }
+    // No duplicated ids on this fixture board.
+    expect(sweep.ambiguousIds).toEqual([]);
+  });
+
+  describe("Ruling R14 (fix round 1) — readySet surfaces duplicate ticket ids instead of silently omitting them", () => {
+    test("a duplicated ticket id is absent from `verdicts` (it has no BoardState.tickets entry) but present in `ambiguousIds`", () => {
+      const good = makeStoredTicket("ck-good", "To Do");
+      const dupLower = makeStoredTicket("ck-dup", "To Do");
+      const dupUpper = makeStoredTicket("CK-DUP", "Done");
+      const state = foldState([good, dupLower, dupUpper], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+      const sweep = readySet(state, NO_FLAT_DEPS);
+
+      expect([...sweep.verdicts.keys()].map(String)).toEqual(["ck-good"]);
+      expect(sweep.verdicts.has("ck-dup" as TicketId)).toBe(false);
+      expect(sweep.ambiguousIds).toEqual(state.duplicateTicketIds);
+      expect(sweep.ambiguousIds).toHaveLength(1);
+      expect(String(sweep.ambiguousIds[0]?.ticketId)).toBe("ck-dup");
+    });
   });
 });

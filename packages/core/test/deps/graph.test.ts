@@ -228,3 +228,83 @@ describe("wouldCreateCycle — Ruling R4", () => {
     expect(wouldCreateCycle(graph, "api:ck-a" as TicketId, "blocks", a.id)).toBe(false);
   });
 });
+
+describe("Ruling R10 (fix round 1) — indexById/buildGraph fail closed on an id collision, in BOTH directions", () => {
+  // Mirrors `attack4.ts` §K: two DISTINCT input nodes ("ck-1" open, "CK-1"
+  // closed) whose ids collide under normalizeDependencyId.
+  function collidingNodes(order: "open-first" | "closed-first"): DependencyGraphNode[] {
+    const open: DependencyGraphNode = { id: "ck-1" as TicketId, closed: false, deps: [] };
+    const closed: DependencyGraphNode = { id: "CK-1" as TicketId, closed: true, deps: [] };
+    const v: DependencyGraphNode = {
+      id: "v" as TicketId,
+      closed: false,
+      deps: [{ type: "blocks", id: "ck-1" }],
+    };
+    return order === "open-first" ? [open, closed, v] : [closed, open, v];
+  }
+
+  test("buildGraph reports the collided normalized id on ambiguousIds, and never resolves it as a target", () => {
+    const graph = buildGraph(collidingNodes("open-first"));
+
+    expect(graph.ambiguousIds).toEqual(["ck-1"]);
+    const edge = graph.edges.find((e) => e.from === ("v" as TicketId));
+    expect(edge?.to).toBeUndefined();
+  });
+
+  test("blockers() fails CLOSED on the collision — the blocker is reported outstanding, not silently satisfied", () => {
+    const graph = buildGraph(collidingNodes("open-first"));
+
+    const result = blockers(graph, "v" as TicketId);
+    expect(result).toHaveLength(1);
+    expect(result[0]?.to).toBeUndefined();
+  });
+
+  test("the verdict does NOT change when the input node array is reversed (array order must never decide an outcome)", () => {
+    const forward = blockers(buildGraph(collidingNodes("open-first")), "v" as TicketId);
+    const reversed = blockers(buildGraph(collidingNodes("closed-first")), "v" as TicketId);
+
+    expect(forward).toEqual(reversed);
+    expect(forward).toHaveLength(1); // still outstanding either way — not [] for either array order
+  });
+
+  test("wouldCreateCycle REFUSES when the proposed edge's target is an ambiguous id — never treated as a leaf", () => {
+    // "b" blocks "a"; proposing "b" blocks the ambiguous "a"/"A" endpoint
+    // must refuse rather than say "no cycle, proceed" just because this
+    // graph cannot tell which of the two colliding tickets is meant.
+    const a: DependencyGraphNode = { id: "a" as TicketId, closed: false, deps: [] };
+    const aUpper: DependencyGraphNode = { id: "A" as TicketId, closed: false, deps: [] };
+    const b: DependencyGraphNode = { id: "b" as TicketId, closed: false, deps: [{ type: "blocks", id: "a" }] };
+    const graph = buildGraph([a, aUpper, b]);
+
+    expect(graph.ambiguousIds).toEqual(["a"]);
+    expect(wouldCreateCycle(graph, b.id, "blocks", a.id)).toBe(true);
+  });
+
+  test("wouldCreateCycle REFUSES when the proposed edge's SOURCE is an ambiguous id too", () => {
+    const a: DependencyGraphNode = { id: "a" as TicketId, closed: false, deps: [] };
+    const aUpper: DependencyGraphNode = { id: "A" as TicketId, closed: false, deps: [] };
+    const c: DependencyGraphNode = { id: "c" as TicketId, closed: false, deps: [] };
+    const graph = buildGraph([a, aUpper, c]);
+
+    expect(wouldCreateCycle(graph, "a" as TicketId, "blocks", c.id)).toBe(true);
+  });
+});
+
+describe("Ruling R13 (fix round 1) — edgeDedupeKey has no delimiter to collide on", () => {
+  test("two structurally different (type, id) pairs that would collide under a naive `type + colon + id` template stay two distinct edges", () => {
+    // attack2.ts §H: {type:"blocks:x", id:"y"} and {type:"blocks", id:"x:y"}
+    // both templated to "blocks:x:y" pre-fix, silently dropping the second edge.
+    const source = node("a", {
+      deps: [
+        { type: "blocks:x", id: "y" },
+        { type: "blocks", id: "x:y" },
+      ],
+    });
+    const graph = buildGraph([source]);
+
+    expect(graph.edges).toHaveLength(2);
+    // Only the real "blocks"-typed edge (id "x:y", cross-board, unresolved)
+    // gates readiness — "blocks:x" is a different type and never gates.
+    expect(blockers(graph, source.id)).toHaveLength(1);
+  });
+});

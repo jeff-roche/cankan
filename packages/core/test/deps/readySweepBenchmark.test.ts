@@ -50,10 +50,11 @@ describe("R8 — readySet sweep, measured", () => {
     // requires the measured number to be visible, not silently asserted.
     console.log(`[R8 benchmark] readySet over ${TICKET_COUNT} tickets: ${elapsedMs.toFixed(1)}ms`);
 
-    expect(sweep.size).toBe(TICKET_COUNT);
+    expect(sweep.verdicts.size).toBe(TICKET_COUNT);
+    expect(sweep.ambiguousIds).toEqual([]);
     // Every ticket has both an outstanding typed blocker and an outstanding
     // flat one naming a DIFFERENT target (i+1 vs i+2) — never ready.
-    for (const verdict of sweep.values()) {
+    for (const verdict of sweep.verdicts.values()) {
       expect(verdict.ready).toBe(false);
     }
 

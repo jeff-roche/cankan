@@ -1269,7 +1269,20 @@ export async function appendCore(
       // comment). `parentSha` (this attempt's now-proven-stale read) is not
       // reused as `actualParent` here — a fresh `readRef` reports the tip
       // that actually caused the rejection, best-effort.
-      const actualParent = await adapter.readRef(validatedRef);
+      //
+      // Best-effort, not load-bearing: this read exists only to enrich
+      // `details`, and the caller's contract is "expectedParent was stale,
+      // go re-check" regardless of what this second read finds. A `GIT_*`
+      // failure here must not replace `EVENT_APPEND_STALE_PARENT` with an
+      // unrelated error code the caller has no reason to expect from an
+      // `append` call — caught and downgraded to `null` (a legitimate
+      // `RefSha | null` value already) rather than left to propagate.
+      let actualParent: RefSha | null;
+      try {
+        actualParent = await adapter.readRef(validatedRef);
+      } catch {
+        actualParent = null;
+      }
       throw new CanKanError(
         EventErrorCodes.EVENT_APPEND_STALE_PARENT,
         "expectedParent's compare-and-swap was rejected by a concurrent writer; re-read and re-check before appending again",

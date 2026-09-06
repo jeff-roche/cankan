@@ -136,4 +136,5 @@ export const IndexErrorCodes = {
    * the corruption-shaped ones.
    */
   QUERY_FAILED: "INDEX_QUERY_FAILED",
+  STALE: "INDEX_STALE",
 } as const;

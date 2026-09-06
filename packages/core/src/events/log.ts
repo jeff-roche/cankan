@@ -739,6 +739,8 @@ function validateExpectedParent(expectedParent: unknown): void {
 }
 
 export interface AppendOptions {
+  /** Called once after the event has been committed, allowing derived indexes to be dirtied. */
+  readonly onAppend?: () => void;
   /**
    * The clock `append` uses for two things: which `events/<yyyy-mm>.jsonl`
    * file the event is written to (obligation D — never from the event's own
@@ -1017,6 +1019,9 @@ export async function appendCore(
   options: AppendOptions,
   hooks: AppendHooks,
 ): Promise<AppendedEvent> {
+  if (options.onAppend !== undefined && typeof options.onAppend !== "function") {
+    throw new CanKanError(EventErrorCodes.EVENT_APPEND_INVALID_OPTION, "onAppend must be a function");
+  }
   // Fix round 2 (Low, consistent with read()'s own reordering): the fm10
   // ref gate runs before any parameter-shape check, so a call carrying both
   // a bad ref and a bad `now` reports the ref problem, not the clock one.
@@ -1303,6 +1308,15 @@ export async function appendCore(
     });
 
     if (outcome.outcome === "applied") {
+      try {
+        const result = options.onAppend?.();
+        if (result !== undefined && typeof (result as unknown as { then?: unknown }).then === "function") {
+          void (result as unknown as Promise<unknown>).catch(() => undefined);
+        }
+      } catch {
+        // The event is already durable; cache notification cannot turn a
+        // successful append into a retryable failure.
+      }
       return { done: true, value: { event, month, line: priorLineCount } };
     }
     if (expectedParent !== undefined) {

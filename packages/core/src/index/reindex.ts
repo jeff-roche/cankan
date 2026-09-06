@@ -175,6 +175,7 @@ export function reindex(options: ReindexOptions): ReindexResult {
 
     upsertMeta.run("built_at_ms", String(now));
     upsertMeta.run("validity", options.validity ?? null);
+    upsertMeta.run("dirty", "0");
   });
 
   try {

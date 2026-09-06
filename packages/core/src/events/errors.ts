@@ -30,7 +30,7 @@ export const EventErrorCodes = {
   EVENT_APPEND_REJECTED: "EVENT_APPEND_REJECTED",
   /**
    * An `AppendOptions` field (or a value returned by one) was shaped
-   * wrong. Raised before any git invocation, at seven sites:
+   * wrong. Raised before any git invocation, at eight sites:
    * - `maxExistingBlobBytes` (fix round 2, Low; fix round 4, Low 2):
    *   must be `>= 0` (`Number.POSITIVE_INFINITY` — the documented
    *   recovery-write bypass — is explicitly allowed). `typeof v !==
@@ -68,6 +68,14 @@ export const EventErrorCodes = {
    * - `casRetry.sleep` itself (fix round 5, Low D): must be a function —
    *   its behavior once confirmed to be one remains entirely the
    *   caller's own responsibility.
+   * - `expectedParent` (M2.10 slice 0 — `log.ts`'s `validateExpectedParent`):
+   *   must be `undefined`, `null`, or a string matching the repo's SHA
+   *   shape (`^[0-9a-f]{40}$`). A wrong-typed value would otherwise reach
+   *   the retry loop's own `parentSha !== options.expectedParent`
+   *   comparison, which does not throw for a mistyped value — it just
+   *   always compares unequal, misreporting every attempt as
+   *   `EVENT_APPEND_STALE_PARENT` ("the ref moved") instead of what
+   *   actually happened ("the caller's input was never valid").
    */
   EVENT_APPEND_INVALID_OPTION: "EVENT_APPEND_INVALID_OPTION",
   /**

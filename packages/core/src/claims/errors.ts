@@ -29,23 +29,27 @@
  */
 export const ClaimErrorCodes = {
   /**
-   * `claim()`'s ticket-resolution step (`resolveTicket`, `claim.ts`) found
-   * no ticket in `BoardState.tickets` whose `id` or `displayId` matches the
-   * caller's `ticket` argument under `normalizeTicketIdForComparison`.
-   * **Never raised for an alias match** — this module resolves by `id` and
-   * `displayId` only (see `claim.ts`'s own doc comment on why alias
-   * resolution is out of scope for a write).
+   * `resolveTicket`'s (`claim.ts`) ticket-resolution step — shared by
+   * `claim()`, `renew()`, and `release()`, every entry point that resolves a
+   * caller-supplied `ticket` string (`expireStale()` does not: it sweeps
+   * already-known tickets, never a caller query) — found no ticket in
+   * `BoardState.tickets` whose `id` or `displayId` matches the caller's
+   * `ticket` argument under `normalizeTicketIdForComparison`. **Never raised
+   * for an alias match** — this module resolves by `id` and `displayId`
+   * only (see `claim.ts`'s own doc comment on why alias resolution is out of
+   * scope for a write).
    */
   TICKET_NOT_FOUND: "CLAIM_TICKET_NOT_FOUND",
   /**
-   * `claim()`'s ticket-resolution step found the caller's `ticket` argument
-   * inside `BoardState.duplicateTicketIds` — more than one on-disk ticket
-   * file declares this normalized id, so there is no single ticket safe to
-   * claim. Checked **before** matching against `BoardState.tickets` (Ruling
-   * D1: an id excluded from `tickets` because it is ambiguous must never be
-   * read as "not found," which this module could otherwise silently
-   * mis-resolve as a request to create/claim something that does not
-   * exist).
+   * `resolveTicket`'s (`claim.ts`) ticket-resolution step — shared by
+   * `claim()`, `renew()`, and `release()`, the same as `TICKET_NOT_FOUND`
+   * above — found the caller's `ticket` argument inside
+   * `BoardState.duplicateTicketIds` — more than one on-disk ticket file
+   * declares this normalized id, so there is no single ticket safe to act
+   * on. Checked **before** matching against `BoardState.tickets` (Ruling D1:
+   * an id excluded from `tickets` because it is ambiguous must never be read
+   * as "not found," which this module could otherwise silently mis-resolve
+   * as a request to create/claim something that does not exist).
    */
   TICKET_AMBIGUOUS: "CLAIM_TICKET_AMBIGUOUS",
   /**
@@ -59,20 +63,21 @@ export const ClaimErrorCodes = {
    */
   INVALID_LEASE_DURATION: "CLAIM_INVALID_LEASE_DURATION",
   /**
-   * A `claim()` parameter (or one of its sub-fields) was shaped wrong,
-   * discovered before any git invocation — currently: `ClaimParams.casRetry`
-   * itself must not be `null`; its `maxAttempts`, if supplied, must be an
-   * integer `>= 2` (the reclaim path — `expire` then `claim` — spends one
-   * attempt each, so `maxAttempts: 1` would always fail an idle repo with a
-   * confusing `GIT_CAS_CONTENTION_EXCEEDED` instead of ever completing a
-   * legitimate reclaim) and at most the same upper bound `events/log.ts`
-   * applies to its own `casRetry.maxAttempts`; its `backoffMs`/`sleep`, if
-   * supplied, must be functions, and any value `backoffMs` returns must be a
-   * finite, non-negative number within the same bound `events/log.ts`
-   * enforces on its own `backoffMs` — `withCasRetry` (`git/retry.ts`)
-   * validates none of this itself, and this module calls it directly
-   * (unlike `append`, which validates a caller's `casRetry` before ever
-   * forwarding it).
+   * A parameter (or one of its sub-fields) to `claim()`, `renew()`,
+   * `release()`, or `expireStale()` was shaped wrong, discovered before any
+   * git invocation — currently: `casRetry` itself must not be `null`; its
+   * `maxAttempts`, if supplied, must be an integer `>= 2` (the reclaim
+   * path — `expire` then `claim` — spends one attempt each, so
+   * `maxAttempts: 1` would always fail an idle repo with a confusing
+   * `GIT_CAS_CONTENTION_EXCEEDED` instead of ever completing a legitimate
+   * reclaim) and at most the same upper bound `events/log.ts` applies to its
+   * own `casRetry.maxAttempts`; its `backoffMs`/`sleep`, if supplied, must
+   * be functions, and any value `backoffMs` returns must be a finite,
+   * non-negative number within the same bound `events/log.ts` enforces on
+   * its own `backoffMs` — `withCasRetry` (`git/retry.ts`) validates none of
+   * this itself, and `validateCasRetry` (`claim.ts`), shared by all four
+   * entry points, calls it directly (unlike `append`, which validates a
+   * caller's `casRetry` before ever forwarding it).
    */
   INVALID_OPTION: "CLAIM_INVALID_OPTION",
 } as const;

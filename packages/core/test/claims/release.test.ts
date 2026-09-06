@@ -354,3 +354,75 @@ test("releaseCore accepts a hooks object with no-op default behavior (mirrors cl
     expect(result.attempts).toBe(1);
   });
 });
+
+// ============================================================================
+// KNOWN GAP (documenting test, not a desired property): discard is not
+// durable in steady state.
+//
+// `state/fold.ts`'s `observeAndFold` builds its `idsToObserve` set from
+// EVERY claim/takeover/renew in the read window whose ticket joins a known
+// `StoredTicket` (Rulings I3/D1 -- those rulings exist only to keep
+// orphaned and duplicate-id events out). There is no run-boundary filter and
+// no liveness filter: a lease-bearing event that belongs to an already-
+// terminated run is re-observed exactly the same as one that belongs to the
+// current live run. So the very next fold over the same window -- for ANY
+// ticket, not even necessarily the one whose lease was just released --
+// recreates an already-discarded record with a fresh `firstSeen`.
+//
+// `computeDiscardRun` (this module) always resets its accumulator at the
+// last `release`/`close`/`expire` it sees, so a resurrected record now sits
+// BEFORE that terminator in every future walk -- no discard call this
+// module ever makes again can reach it. It becomes a permanent orphan.
+//
+// **This is not a mutual-exclusion defect**: `resolveLeaseAnchor`
+// (`state/fold.ts`) clears the anchor on the `release`/`close`/`expire`
+// regardless of `firstSeen`, so a resurrected record does not resurrect the
+// LEASE -- nothing can be double-claimed because of this.
+//
+// **It does defeat the bound ADR 0001 failure mode 7 requires `discard()`
+// to provide**: "the store is otherwise unbounded, growing by one record
+// per lease-bearing event id, and a peer with push access drives that
+// growth" -- through no fault of this module's own discard walk, which does
+// exactly what the brief specifies. The fix belongs in
+// `state/fold.ts`'s `observeAndFold`: it would need to observe only ids
+// inside each ticket's CURRENTLY-OPEN run (the same reset-on-terminator walk
+// `computeDiscardRun` already performs), not every lease-bearing event in
+// the window unconditionally. `state/` is not this lane's folder --
+// deliberately not attempted here; reported to the controller instead.
+//
+// This test PINS the current, known-defective behaviour as a canary. When
+// `state/fold.ts` is fixed, this test's final assertion flips from
+// `.not.toBeNull()` to what would then be `null`, and it FAILS LOUDLY --
+// that failure is the point: it tells whoever lands the fix exactly what
+// changed and why this assertion existed.
+// ============================================================================
+
+test("KNOWN GAP: a discarded observation is resurrected by the next fold (fix belongs to state/fold.ts, see report)", async () => {
+  await withTestBoard(async ({ board }) => {
+    await writeFixtureTickets(board.ticketsDir, [
+      fixtureTicket("ck-gap-released", "Released"),
+      fixtureTicket("ck-gap-other", "Unrelated ticket"),
+    ]);
+    const actor = actorId("actor-gap-released");
+    const adapter = await createGitAdapter(board.root);
+    const boardKey = await boardKeyFor(adapter);
+
+    const claimed = await claim({ board, ticket: "ck-gap-released", actor, now: NOW });
+    await release({ board, ticket: "ck-gap-released", actor, now: NOW + 60_000 });
+
+    // The discard walk did its job: the id is gone immediately after
+    // release, exactly as tests 1/4/5/6 above already prove.
+    expect(await firstSeen(boardKey, claimed.eventId)).toBeNull();
+
+    // ONE more fold over the same window -- for a completely UNRELATED
+    // ticket, not even "ck-gap-released" itself -- is enough to bring it
+    // back, because `observeAndFold` re-observes every lease-bearing event
+    // in the window for every known ticket, unconditionally.
+    await claim({ board, ticket: "ck-gap-other", actor: actorId("actor-gap-other"), now: NOW + 120_000 });
+
+    // THE DEFECT, PINNED: the discarded id is back, with a fresh
+    // `firstSeen`, and is now permanently unreachable by any future discard
+    // walk this module could ever run.
+    expect(await firstSeen(boardKey, claimed.eventId)).not.toBeNull();
+  });
+});

@@ -699,3 +699,59 @@ output.
   Backlog.md's own allocator will absorb such an ID as its numeric
   watermark and mint a colliding next ID on the very next
   `backlog task create`.
+
+### Amendment 2026-09-06: tickets_dir containment ownership
+
+**Applied 2026-09-06, M2.5 (slice 1B).** This ADR's Consequences section
+(`:526-529` in the pre-amendment file) assigns the four-step `tickets_dir`
+containment list to **M2.2**. That assignment did not survive contact: step
+(a) needs the board root and `tickets_dir` itself, and M2.2's modules
+(`ticket/id.ts`, `ticket/filename.ts`) are never handed either one. The
+actual ownership, verified against the code:
+
+- **Step (d)** (the constructed basename has no path separator and is
+  neither a single nor a double dot) shipped in **M2.2 as specified** —
+  `ticket/filename.ts:199-220`'s `assertSafeId`/`assertSafeFilename`,
+  reached via `buildTicketFilename`.
+- **Steps (a) and (b)** (string-arithmetic containment under root plus
+  `.git` exclusion, and a realpath re-check of whatever part of
+  `tickets_dir` already exists) shipped in **M2.4**, in
+  `board/ref.ts`'s `buildBoardRef` — not M2.2 and not M2.5.
+  `buildBoardRef` performs no filesystem writes at all, so the ADR's
+  "before creating any directory" ordering is structural there rather than
+  something that had to be sequenced around a `mkdir`.
+- **Step (b)'s write-time half** (re-asserting containment once a write is
+  actually about to happen, since `tickets_dir` can be replaced by a
+  symlink between `buildBoardRef`'s resolve-time check and any later
+  write) and **step (c)** (excluding the repository's real git directory,
+  not merely a directory named `.git`) shipped in **M2.5** (`store/`),
+  because step (b) is inherently write-time and step (c) needs a git
+  directory that only a caller holding a `GitAdapter` can supply — M2.2's
+  modules have neither.
+
+`board/ref.ts`'s own file header got two things wrong along the way,
+corrected here so a future reader does not repeat either:
+
+- `board/ref.ts:120` claims step (d) "belongs to M2.5." It does not — step
+  (d) shipped in M2.2, per above; that comment was wrong when written.
+- `board/ref.ts:103-119` reasoned that the step (c) gap had "no known
+  unblocked exploit," on the theory that a linked worktree's real
+  git-common-dir always lives outside the board root and is therefore
+  already excluded by "must lie beneath root." **That reasoning is false,
+  and was disproved by execution, not by further reasoning:** for a
+  repository created with `git init --separate-git-dir=./innergit .`,
+  `git rev-parse --git-dir` and `--git-common-dir` both resolve to
+  `<root>/innergit` — confirmed directly with git 2.55.0,
+  `--path-format=absolute` — which lies *beneath* the board root and whose
+  first path segment is `innergit`, not `.git`, so the by-name check in
+  `board/ref.ts` cannot see it at all. A checked-in
+  `tickets_dir: innergit/refs/cankan-evil` passes both step (a) and step
+  (b) honestly and lands ticket writes inside the repository's real git
+  directory. `tickets_dir` is checked-in, repo-level config, so this is a
+  hostile-clone defence, not a hypothetical; M2.5's store-level `gitDirs`
+  containment check (reusing `board/ref.ts`'s own exported `isContained`)
+  is what closes it. A future reader must not reuse the disproved
+  reasoning above to conclude the gap is safe to leave open elsewhere.
+
+Retained as the record of what changed and why; line numbers refer to the
+pre-amendment file.

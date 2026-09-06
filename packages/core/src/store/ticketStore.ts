@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
+import { isContained } from "../board/index";
 import { CanKanError, ErrorCodes, isCanKanError } from "../errors";
 import {
   buildTicketFilename,
@@ -41,8 +42,23 @@ import { StoreErrorCodes } from "./errors";
  * filename)` (or the archive subdirectory) where `filename` came from
  * `buildTicketFilename()` or a `readdir()` entry — never a raw caller
  * string — and `assertSafeTicketPath` is the one function every such path
- * passes through before any I/O. Kept in one place so 1B can extend it
- * (step (c), the `gitDirs` containment check) without chasing call sites.
+ * passes through before any I/O.
+ *
+ * ## Step (b)'s write-time half, and step (c) — `assertTicketsDirContained` (1B, Ruling R9)
+ *
+ * ADR 0002 steps (a) and (b) are otherwise `board/ref.ts`'s job
+ * (`buildBoardRef`, at *resolve* time, read-only). But `resolveBoard()`
+ * canonicalizes and containment-checks `board.ticketsDir` once; between
+ * then and a write, `ticketsDir` can have been replaced by a symlink
+ * pointing outside the board, or a caller can hand this module a
+ * hand-built `BoardRef` that never went through `buildBoardRef` at all.
+ * `assertTicketsDirContained` is the single guard `write()`, `remove()`,
+ * and `archive()` all funnel through (via `openTicketStore`'s returned
+ * closures) before doing anything else, so the check exists in exactly one
+ * place rather than three. It also owns step (c) — rejecting a
+ * `ticketsDir` equal to or beneath any of the `gitDirs` this module was
+ * opened with — reusing `board/ref.ts`'s exported `isContained` rather
+ * than re-deriving a second copy (Ruling R5).
  */
 
 // ---- the public shape --------------------------------------------------
@@ -129,6 +145,14 @@ export interface TicketStore {
   /**
    * Deletes the ticket resolved by `lookup` (same resolution as `get()`).
    * `StoreErrorCodes.TICKET_NOT_FOUND` if `get()` finds no match.
+   *
+   * Doc note (1B, deferred from 1A's review): a ticket whose frontmatter is
+   * currently malformed is unreachable here — `get()` (and therefore
+   * `remove()`) resolves through `list()`, which only sees successfully-
+   * parsed tickets, while `write()` matches on-disk **filenames** instead.
+   * This is correct per spec and intentional, just surprising to a future
+   * reader: a malformed ticket can be overwritten by `write()` but not
+   * deleted by `remove()`, until its frontmatter parses again.
    */
   remove(lookup: string): Promise<void>;
   /**
@@ -149,6 +173,12 @@ export interface TicketStore {
    * existing archived file. The same last-writer-wins policy `write()`
    * applies to a same-path overwrite; this module does not build claim
    * semantics (that is the event log's job).
+   *
+   * Doc note (1B, deferred from 1A's review): the same reachability gap
+   * documented on `remove()` applies here — `archive()` resolves through
+   * `get()`, so a ticket whose frontmatter is currently malformed cannot be
+   * archived until it parses again, even though `write()` could still find
+   * and overwrite it by filename.
    */
   archive(lookup: string): Promise<StoredTicket>;
 }
@@ -162,26 +192,48 @@ export interface OpenTicketStoreOptions {
    * 0002 step (c). Required, with an explicit empty array as the escape
    * hatch for "no git directory" — the same shape `loadBoardConfig`/
    * `loadConfig` established for "a field a caller can simply forget
-   * becomes a silently-skipped security check" (Ruling R3). Consumed by
-   * slice 1B; in 1A this is validated and otherwise unused.
+   * becomes a silently-skipped security check" (Ruling R3). Each entry
+   * must already be canonical (`fs.realpath`'d), not merely absolute — see
+   * `assertValidGitDirs`.
    */
   readonly gitDirs: readonly string[];
 }
 
 /**
  * Opens a ticket store over `options.board`'s tickets directory. Never
- * touches the filesystem itself — every method call does its own I/O, and
- * none of them create `ticketsDir` (Ruling R4).
+ * touches the filesystem itself at open time beyond validating `gitDirs`
+ * (1B tightened that validation to require each entry to already be
+ * canonical, which needs `fs.realpath` — see `assertValidGitDirs`); every
+ * method call does its own I/O, and none of them create `ticketsDir`
+ * (Ruling R4).
+ *
+ * `write()`, `remove()`, and `archive()` — the write paths — all funnel
+ * through `guardWrite()` (a closure over this call's `board`/`gitDirs`)
+ * before doing anything else, so ADR 0002 step (b)'s write-time half and
+ * step (c) are enforced from exactly one place (`assertTicketsDirContained`,
+ * 1B Ruling R9) rather than three separate copies. `list()`/`get()` are
+ * read-only and do not run it.
  */
 export async function openTicketStore(options: OpenTicketStoreOptions): Promise<TicketStore> {
-  assertValidGitDirs(options.gitDirs);
-  const ticketsDir = options.board.ticketsDir;
+  await assertValidGitDirs(options.gitDirs);
+  const { board, gitDirs } = options;
+  const ticketsDir = board.ticketsDir;
+  const guardWrite = (): Promise<void> => assertTicketsDirContained(ticketsDir, board.root, gitDirs);
   return {
     list: () => listTickets(ticketsDir),
     get: (lookup) => getTicket(ticketsDir, lookup),
-    write: (ticket) => writeTicket(ticketsDir, ticket),
-    remove: (lookup) => removeTicket(ticketsDir, lookup),
-    archive: (lookup) => archiveTicket(ticketsDir, lookup),
+    write: async (ticket) => {
+      await guardWrite();
+      return writeTicket(ticketsDir, ticket);
+    },
+    remove: async (lookup) => {
+      await guardWrite();
+      return removeTicket(ticketsDir, lookup);
+    },
+    archive: async (lookup) => {
+      await guardWrite();
+      return archiveTicket(ticketsDir, lookup);
+    },
   };
 }
 
@@ -193,14 +245,22 @@ export async function openTicketStore(options: OpenTicketStoreOptions): Promise<
  * making the field required rather than defaulting it. Checked eagerly so
  * the failure is loud and immediate, not a mystery inside 1B's later logic.
  *
- * Each entry is further required to be a non-empty, absolute path (fix
- * round 1, Minor 2): 1B's ADR 0002 step (c) containment check consumes
- * this array directly, and a relative or otherwise malformed entry would
- * silently fail to match anything it should — a security check that
- * quietly does nothing is worse than one that is visibly absent. Tightened
- * now, while this seam is still open, rather than left for 1B to discover.
+ * Each entry is further required to be **canonical** — `fs.realpath`'d,
+ * not merely absolute (1B, work item 2b.1, tightened from "absolute" alone
+ * in fix round 1 Minor 2). `OpenTicketStoreOptions.gitDirs`'s own doc
+ * comment already promises canonical paths, and `assertTicketsDirContained`
+ * (1B's step (c) check) compares each entry against the already-canonical
+ * `board.ticketsDir` via `isContained` — an absolute-but-non-canonical
+ * entry (a macOS `/var/folders/...` git directory that was never
+ * realpath'd, say) would silently fail to match anything it should, which
+ * is exactly the "security check that quietly does nothing" this guard
+ * exists to prevent, one layer down. Verified by `fs.realpath`-ing each
+ * entry and requiring the result to equal the entry itself; a path that
+ * does not exist, or that resolves to something else, is rejected the same
+ * way a relative or empty entry already was. This makes the function
+ * asynchronous (fix round 1's version was synchronous).
  */
-function assertValidGitDirs(gitDirs: readonly string[]): void {
+async function assertValidGitDirs(gitDirs: readonly string[]): Promise<void> {
   if (!Array.isArray(gitDirs)) {
     throw new CanKanError(
       ErrorCodes.USAGE,
@@ -210,6 +270,17 @@ function assertValidGitDirs(gitDirs: readonly string[]): void {
   for (const dir of gitDirs) {
     if (typeof dir !== "string" || dir.length === 0 || !isAbsolute(dir)) {
       throw new CanKanError(ErrorCodes.USAGE, "Every gitDirs entry must be a non-empty, absolute path");
+    }
+    let real: string;
+    try {
+      real = await realpath(dir);
+    } catch (err) {
+      throw new CanKanError(ErrorCodes.USAGE, "Every gitDirs entry must be an existing, canonical path", {
+        cause: err,
+      });
+    }
+    if (real !== dir) {
+      throw new CanKanError(ErrorCodes.USAGE, "Every gitDirs entry must already be canonical (fs.realpath'd)");
     }
   }
 }
@@ -233,6 +304,12 @@ function ticketsDirUnavailableError(cause: unknown): CanKanError {
 
 function unsafeTicketPathError(reason: string): CanKanError {
   return new CanKanError(StoreErrorCodes.UNSAFE_TICKET_PATH, `Ticket path rejected: ${reason}`, {
+    details: { reason },
+  });
+}
+
+function unsafeTicketsDirError(reason: string): CanKanError {
+  return new CanKanError(StoreErrorCodes.TICKETS_DIR_UNSAFE, `Tickets directory rejected: ${reason}`, {
     details: { reason },
   });
 }
@@ -265,6 +342,56 @@ function rethrowAsIoFailure(err: unknown): never {
 
 function isEnoent(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && (err as { code?: unknown }).code === "ENOENT";
+}
+
+/**
+ * ADR 0002 step (b)'s write-time half, and step (c) (1B, Ruling R9) — the
+ * single guard `write()`, `remove()`, and `archive()` all funnel through
+ * (see `openTicketStore`'s `guardWrite` closure) before touching the
+ * filesystem, so the check lives in exactly one place instead of being
+ * re-derived three times.
+ *
+ * `resolveBoard()`/`buildBoardRef` canonicalize and containment-check
+ * `board.ticketsDir` once, at *resolve* time. Between then and this call,
+ * `ticketsDir` can have been replaced by a symlink pointing outside the
+ * board — string arithmetic alone cannot see that, which is exactly what
+ * step (b)'s write-time half exists to catch — or this module can simply
+ * have been handed a hand-built `BoardRef` that never went through
+ * `buildBoardRef` at all, the defence-in-depth case this function backs up.
+ *
+ * `boardRoot` is trusted as already canonical (the `BoardRef` contract);
+ * only `ticketsDir` is realpath'd again here, since it is the value that
+ * can have changed since resolve time. `gitDirs` are required canonical by
+ * `assertValidGitDirs`, so every `isContained` comparison below compares
+ * canonical to canonical.
+ *
+ * **Stated honestly, not overclaimed: this narrows the TOCTOU window, it
+ * does not close it.** The filesystem can still change between this
+ * `realpath` call and the `rename`/`unlink`/`mkdir` call that runs after it
+ * in the caller. What this closes is a `ticketsDir` that is *already*
+ * unsafe at the moment this runs — the checked-in-symlink and hand-built-
+ * `BoardRef` cases, neither of which requires winning a race at all.
+ */
+async function assertTicketsDirContained(
+  ticketsDir: string,
+  boardRoot: string,
+  gitDirs: readonly string[],
+): Promise<void> {
+  let real: string;
+  try {
+    real = await realpath(ticketsDir);
+  } catch (err) {
+    if (isEnoent(err)) throw ticketsDirMissingError();
+    throw ticketsDirUnavailableError(err);
+  }
+  if (!isContained(boardRoot, real)) {
+    throw unsafeTicketsDirError("resolves outside the board root");
+  }
+  for (const gitDir of gitDirs) {
+    if (isContained(gitDir, real)) {
+      throw unsafeTicketsDirError("resolves inside a git directory");
+    }
+  }
 }
 
 /**
@@ -632,6 +759,20 @@ async function removeTicket(ticketsDir: string, lookup: string): Promise<void> {
  * symlink inside that window can still win the race. Nothing here closes
  * that; what it closes is the checked-in-symlink attack, which requires no
  * race at all and is the one a hostile repository can actually mount.
+ *
+ * `mkdir(archiveDir)` below is called **without** `{ recursive: true }`
+ * (1B, work item 2b.2 — a fix-round-1 review finding on this same
+ * function): `recursive: true` was demonstrated to succeed silently
+ * against a planted symlink in a narrower race than this — the exact
+ * silent-success behaviour the original Critical exploited — while a plain
+ * `mkdir` fails outright (`EEXIST`) if anything is already there. The
+ * parent (`ticketsDir`) is already known to exist by the time this runs
+ * (`assertTicketsDirContained`'s guard, and every caller's own
+ * `assertTicketsDirUsable`/`getTicket` before it), so recursion buys
+ * nothing here. This closes the `lstat`→`mkdir` race window one step
+ * earlier, in the kernel, rather than relying solely on the `realpath`
+ * check below to catch it after the fact — the residual window is the same
+ * either way; this is defence in depth, not a distinct bug fix.
  */
 async function ensureArchiveDir(ticketsDir: string): Promise<string> {
   const archiveDir = join(ticketsDir, ARCHIVE_DIR_NAME);
@@ -645,7 +786,7 @@ async function ensureArchiveDir(ticketsDir: string): Promise<string> {
     throw unsafeTicketPathError("archive already exists and is not a real directory");
   }
   if (existing === undefined) {
-    await mkdir(archiveDir, { recursive: true });
+    await mkdir(archiveDir);
   }
   const real = await realpath(archiveDir);
   if (real !== join(ticketsDir, ARCHIVE_DIR_NAME)) {

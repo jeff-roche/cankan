@@ -21,6 +21,15 @@
  * the one normalizer here means a third independent `.toLowerCase()` never
  * gets written.
  *
+ * `CankanBlock`, `ParsedTicket`, and `TicketFrontmatter` (1B, Ruling R18)
+ * are re-exported for the same reason: `StoredTicket.ticket` is typed
+ * `ParsedTicket`, whose `frontmatter` is `TicketFrontmatter` with an
+ * optional `cankan: CankanBlock`, and M2.8 must be able to name those types
+ * (a helper signature, a typed local) without reaching past its own
+ * `Depends on` list (#28 and #30, not #25) for an illegal `ticket/` import
+ * or a hand-copied structural type that would silently drift from the
+ * schema. Types only — no new runtime export accompanies these.
+ *
  * ---- deliberately withheld ---------------------------------------------
  *
  * - `assertSafeTicketPath` and `buildTempTicketFilename` (`ticketStore.ts`)
@@ -41,4 +50,4 @@ export type { ListTicketsResult, OpenTicketStoreOptions, SkippedTicket, StoredTi
 export { openTicketStore } from "./ticketStore";
 
 export { normalizeTicketIdForComparison } from "../ticket/index";
-export type { TicketIdLookupKey } from "../ticket/index";
+export type { CankanBlock, ParsedTicket, TicketFrontmatter, TicketIdLookupKey } from "../ticket/index";

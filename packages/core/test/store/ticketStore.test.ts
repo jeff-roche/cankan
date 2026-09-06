@@ -289,6 +289,37 @@ describe("ticketStore — symlinks in the tickets directory", () => {
       expect(getResult).toBeUndefined();
     });
   });
+
+  test("a checked-in `archive` symlink to an outside directory cannot be used to move a ticket out of the repo (fix round 1, Critical)", async () => {
+    await withTestBoard(async ({ board }) => {
+      const store = await openStore(board);
+      const written = await store.write(newTicket("ck-1", "Real"));
+
+      const victimDir = await mkdtemp(join(tmpdir(), "cankan-store-victim-"));
+      try {
+        // The attack: `archive` is not a real directory, it is a symlink
+        // pointing entirely outside `ticketsDir` -- exactly what a hostile
+        // checked-in `git symlink` (mode 120000) would look like once
+        // checked out.
+        const archiveLink = join(board.ticketsDir, "archive");
+        await symlink(victimDir, archiveLink);
+
+        await expectRejectsWithCode(() => store.archive("ck-1"), StoreErrorCodes.UNSAFE_TICKET_PATH);
+
+        // The ticket never moved.
+        const stillThere = await store.get("ck-1");
+        expect(stillThere?.path).toBe(written.path);
+        const onDisk = await readFile(written.path, "utf8");
+        expect(onDisk.length).toBeGreaterThan(0);
+
+        // Nothing landed in the victim directory outside the repo.
+        const victimEntries = await readdir(victimDir);
+        expect(victimEntries).toEqual([]);
+      } finally {
+        await rm(victimDir, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 // ---- step (d) defence in depth ----------------------------------------------
@@ -309,9 +340,10 @@ describe("ticketStore — step (d) defence in depth", () => {
     });
   });
 
-  test("assertSafeTicketPath rejects a path separator, a backslash, a single dot, and a double dot -- and nothing is written", () => {
+  test("assertSafeTicketPath rejects a path separator, a backslash, a single dot, a double dot, the empty string, a NUL byte, and .git (case-insensitively) -- and nothing is written", () => {
     const dir = "/tmp/does-not-matter-for-this-assertion";
-    for (const hostile of ["sub/dir.md", "sub\\dir.md", ".", ".."]) {
+    const hostileNames = ["sub/dir.md", "sub\\dir.md", ".", "..", "", "ck-1\0.md", ".git", ".GIT"];
+    for (const hostile of hostileNames) {
       let threw = false;
       try {
         assertSafeTicketPath(dir, hostile);
@@ -321,6 +353,11 @@ describe("ticketStore — step (d) defence in depth", () => {
       }
       expect(threw).toBe(true);
     }
+
+    // "GIT" alone (no leading dot) is not the git-metadata name and is a
+    // perfectly safe basename -- confirms the ".git" branch above is
+    // matching the intended shape, not accidentally rejecting everything.
+    expect(assertSafeTicketPath(dir, "GIT")).toBe(join(dir, "GIT"));
   });
 });
 
@@ -486,6 +523,16 @@ describe("openTicketStore — gitDirs is required, with an explicit empty-array 
         () => openTicketStore({ board, gitDirs: undefined as unknown as readonly string[] }),
         ErrorCodes.USAGE,
       );
+    });
+  });
+
+  test("a relative or empty-string gitDirs entry is rejected with USAGE (fix round 1, Minor 2) -- 1B's containment check must never silently no-op on a malformed entry", async () => {
+    await withTestBoard(async ({ board }) => {
+      await expectRejectsWithCode(
+        () => openTicketStore({ board, gitDirs: ["relative/path/.git"] }),
+        ErrorCodes.USAGE,
+      );
+      await expectRejectsWithCode(() => openTicketStore({ board, gitDirs: [""] }), ErrorCodes.USAGE);
     });
   });
 });

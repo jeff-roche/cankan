@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, open, readFile, readdir, rename, rm, stat, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, unlink } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { CanKanError, ErrorCodes, isCanKanError } from "../errors";
 import {
   buildTicketFilename,
@@ -192,6 +192,13 @@ export async function openTicketStore(options: OpenTicketStoreOptions): Promise<
  * 1B's containment check with `undefined`, defeating the whole point of
  * making the field required rather than defaulting it. Checked eagerly so
  * the failure is loud and immediate, not a mystery inside 1B's later logic.
+ *
+ * Each entry is further required to be a non-empty, absolute path (fix
+ * round 1, Minor 2): 1B's ADR 0002 step (c) containment check consumes
+ * this array directly, and a relative or otherwise malformed entry would
+ * silently fail to match anything it should — a security check that
+ * quietly does nothing is worse than one that is visibly absent. Tightened
+ * now, while this seam is still open, rather than left for 1B to discover.
  */
 function assertValidGitDirs(gitDirs: readonly string[]): void {
   if (!Array.isArray(gitDirs)) {
@@ -199,6 +206,11 @@ function assertValidGitDirs(gitDirs: readonly string[]): void {
       ErrorCodes.USAGE,
       "gitDirs must be an array — pass [] to assert there is no git directory",
     );
+  }
+  for (const dir of gitDirs) {
+    if (typeof dir !== "string" || dir.length === 0 || !isAbsolute(dir)) {
+      throw new CanKanError(ErrorCodes.USAGE, "Every gitDirs entry must be a non-empty, absolute path");
+    }
   }
 }
 
@@ -294,8 +306,24 @@ async function assertTicketsDirUsable(ticketsDir: string): Promise<void> {
  *
  * Throws `StoreErrorCodes.UNSAFE_TICKET_PATH` and returns nothing on
  * failure — the caller writes nothing.
+ *
+ * The rule set mirrors `ticket/filename.ts`'s `unsafeStructuralReason` (fix
+ * round 1, Minor 1): this function is documented as this module's own
+ * defence-in-depth backstop, and was found to be strictly *weaker* than the
+ * check it backs up — a NUL byte and the empty string both passed every
+ * branch here (the empty string only failed, incidentally, at the final
+ * `dirname` check; a NUL byte failed nothing at all). Neither is reachable
+ * through the public API today (a `readdir` entry cannot contain a NUL byte,
+ * and `buildTicketFilename` already rejects one), but a backstop that is
+ * weaker than the thing it backs up is not defence in depth.
  */
 export function assertSafeTicketPath(dir: string, filename: string): string {
+  if (filename.length === 0) {
+    throw unsafeTicketPathError("is empty");
+  }
+  if (filename.includes("\0")) {
+    throw unsafeTicketPathError("contains a NUL byte");
+  }
   if (filename !== basename(filename)) {
     throw unsafeTicketPathError("is not a bare filename");
   }
@@ -304,6 +332,9 @@ export function assertSafeTicketPath(dir: string, filename: string): string {
   }
   if (filename === "." || filename === "..") {
     throw unsafeTicketPathError("is a single or double dot");
+  }
+  if (filename.toLowerCase() === ".git") {
+    throw unsafeTicketPathError("is the git-metadata directory name");
   }
   const resolved = join(dir, filename);
   if (dirname(resolved) !== dir) {
@@ -391,6 +422,19 @@ async function atomicWriteFile(targetPath: string, content: string): Promise<voi
  * ticket, which would otherwise be followed and its target parsed as
  * frontmatter — an arbitrary-file-read out of the tickets directory, driven
  * by checked-in repo content.
+ *
+ * **Unbounded in entry count and total bytes (fix round 1, Minor 3 —
+ * controller ruling: documented, not capped, in this slice).** This
+ * function reads and parses every ticket-shaped entry in `ticketsDir` and
+ * retains each one's full `source.raw`; `get()`, `remove()` and
+ * `archive()` each call it in full just to resolve a single lookup. A
+ * single file's size is bounded upstream (`ticket/frontmatter.ts`'s
+ * `MAX_RAW_LENGTH`/`MAX_FRONTMATTER_LENGTH`), but nothing here bounds how
+ * many ticket-shaped files exist or their aggregate size — both are
+ * driven entirely by checked-in repository content. A cap is a behaviour
+ * change (it could reject a legitimately large board) and choosing the
+ * number is a product decision outside this task's scope — routed to a
+ * follow-up rather than guessed at here.
  */
 async function listTickets(ticketsDir: string): Promise<ListTicketsResult> {
   await assertTicketsDirUsable(ticketsDir);
@@ -501,7 +545,17 @@ async function writeTicket(ticketsDir: string, ticket: ParsedTicket): Promise<St
   // `parseTicketFile` directly would. (`serializeTicketFile`, by contrast,
   // returns `ticket.source.raw` completely unvalidated — confirmed by
   // reading `ticket/frontmatter.ts` directly — so it is not this
-  // function's enforcement point.)
+  // function's enforcement point.) `ticket.source.path` reaches only this
+  // `parseTicketFile` call's optional error-message argument — never a path
+  // or write decision. **This is deliberately stronger than a mere
+  // provenance check** (fix round 1: security review confirmed this design
+  // is sound): it validates the *bytes*, so a hand-built
+  // `{ frontmatter, source }` whose `source.raw` genuinely parses is
+  // accepted and written correctly, even though it never actually passed
+  // through `parseTicketFile` before reaching here — the brief's originally
+  // assumed `requireSplit`-based provenance check would have rejected that
+  // object regardless of whether its bytes were fine, which is a strictly
+  // weaker guarantee than checking the bytes themselves.
   const canonical = parseTicketFile(ticket.source.raw, ticket.source.path);
   const content = canonical.source.raw;
   const id = canonical.frontmatter.id;
@@ -541,18 +595,73 @@ async function removeTicket(ticketsDir: string, lookup: string): Promise<void> {
   }
 }
 
+/**
+ * Creates (if needed) and validates the archive subdirectory — the one
+ * directory this module creates (Ruling R4): it lives inside the
+ * already-validated `ticketsDir`, so this opens no new containment question
+ * the way creating `ticketsDir` itself would. **Except** it did open one
+ * (fix round 1, Critical, found by security review): `mkdir(archiveDir,
+ * { recursive: true })` silently succeeds when `archive` already exists as
+ * a *symlink* to a directory — it stats, sees a directory, and returns —
+ * after which the subsequent `rename()` resolves that symlink and lands
+ * the ticket wherever it points, **outside** `ticketsDir` entirely.
+ * Verified against a real store: a checked-in `.cankan/tickets/archive` ->
+ * `/tmp/victim` symlink (git stores and checks out a symlink verbatim,
+ * mode `120000`) let `archive()` move a ticket clean out of the repo,
+ * silently overwriting anything already at the destination — the attacker
+ * controls both the destination directory and the filename.
+ * `assertSafeTicketPath` cannot catch this on its own: it is purely
+ * lexical (string joins and a `dirname` compare) and never resolves a
+ * single path component.
+ *
+ * Guarded two ways, both inside this one function so 1B extends a single
+ * choke point rather than chasing call sites:
+ * - `lstat` (not `stat`) before creating anything: `ENOENT` means "safe to
+ *   create"; anything that already exists and is not a **real** directory
+ *   (a symlink, a file, a FIFO, ...) is rejected outright, before anything
+ *   is created or moved.
+ * - After `mkdir`, `realpath(archiveDir)` must equal
+ *   `join(ticketsDir, ARCHIVE_DIR_NAME)` **exactly** — exact equality,
+ *   not containment, is correct here because `BoardRef.ticketsDir` is
+ *   already canonical by contract (`board/ref.ts`), so the expected value
+ *   is already in its final, symlink-resolved form.
+ *
+ * **Residual gap, stated honestly, not overclaimed:** there is a TOCTOU
+ * window between this check and the `rename` call in `archiveTicket` — a
+ * local process running as the same user that swaps a real directory for a
+ * symlink inside that window can still win the race. Nothing here closes
+ * that; what it closes is the checked-in-symlink attack, which requires no
+ * race at all and is the one a hostile repository can actually mount.
+ */
+async function ensureArchiveDir(ticketsDir: string): Promise<string> {
+  const archiveDir = join(ticketsDir, ARCHIVE_DIR_NAME);
+  let existing: Awaited<ReturnType<typeof lstat>> | undefined;
+  try {
+    existing = await lstat(archiveDir);
+  } catch (err) {
+    if (!isEnoent(err)) throw err;
+  }
+  if (existing !== undefined && !existing.isDirectory()) {
+    throw unsafeTicketPathError("archive already exists and is not a real directory");
+  }
+  if (existing === undefined) {
+    await mkdir(archiveDir, { recursive: true });
+  }
+  const real = await realpath(archiveDir);
+  if (real !== join(ticketsDir, ARCHIVE_DIR_NAME)) {
+    throw unsafeTicketPathError("archive does not resolve to the expected directory");
+  }
+  return archiveDir;
+}
+
 async function archiveTicket(ticketsDir: string, lookup: string): Promise<StoredTicket> {
   const found = await getTicket(ticketsDir, lookup);
   if (found === undefined) throw ticketNotFoundError();
 
-  const archiveDir = join(ticketsDir, ARCHIVE_DIR_NAME);
   const filename = basename(found.path);
   let destPath: string;
   try {
-    // The one directory this module creates (Ruling R4): it lives inside
-    // the already-validated `ticketsDir`, so this opens no new containment
-    // question the way creating `ticketsDir` itself would.
-    await mkdir(archiveDir, { recursive: true });
+    const archiveDir = await ensureArchiveDir(ticketsDir);
     destPath = assertSafeTicketPath(archiveDir, filename);
     await rename(found.path, destPath);
   } catch (err) {

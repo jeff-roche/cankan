@@ -194,7 +194,14 @@ export const EventErrorCodes = {
    * `EVENT_RECOVERY_QUARANTINE_BLOCKED` already establishes for the
    * analogous `quarantine/` prefix) — this module cannot safely replace the
    * entry itself, since doing so would discard whatever is nested under it
-   * with no audit trail.
+   * with no audit trail. **Fix round 3 follow-up:** `ref.ts`'s
+   * `checkRefUsability` raises this same code too — not standalone, but as
+   * the `cause` wrapped inside `EVENT_REF_UNUSABLE` — after `initRef` was
+   * found to share the identical fail-open shape one function over: its
+   * own existing usability probe reads a path *nested under* `events`
+   * (`events/.cankan-ref-usability-probe`), which also silently resolves
+   * as "not found" under a blocked `events` prefix, the same mechanism
+   * this code exists to close for `read()`.
    */
   EVENT_LOG_EVENTS_PREFIX_BLOCKED: "EVENT_LOG_EVENTS_PREFIX_BLOCKED",
   /**

@@ -39,6 +39,62 @@ import { monthKeyUtc, validateNowForDateFormatting } from "./log";
  */
 const USABILITY_PROBE_PATH = "events/.cankan-ref-usability-probe";
 
+/**
+ * The bare top-level path every `events/<yyyy-mm>.jsonl` month file (and
+ * `USABILITY_PROBE_PATH` itself) lives under. Named separately from
+ * `USABILITY_PROBE_PATH` because the two are probed for different reasons
+ * — see `isEventsPrefixBlocked`'s doc comment.
+ */
+const EVENTS_PREFIX = "events";
+
+/**
+ * Fix round 3 follow-up (Ruling R48, orchestrator-directed — the reviewer
+ * explicitly extended this dispatch's file grant to cover this function
+ * after accepting the rest of fix round 3): `checkRefUsability`'s existing
+ * probe reads `USABILITY_PROBE_PATH` (`events/.cankan-ref-usability-probe`),
+ * a path *nested under* `events`, not `events` itself. When a blob,
+ * symlink, or gitlink is planted at the bare `events` path instead of a
+ * real directory, `ls-tree` finds no entry at all under a prefix that
+ * isn't a directory — the nested probe path simply "doesn't exist," the
+ * same as it would on a genuinely healthy, empty board — so the existing
+ * probe alone cannot tell "healthy and empty" apart from "poisoned." This
+ * is the exact mechanism Ruling R48 already closed for `read()`
+ * (`log.ts`) and `diagnose()`/`recover()` (`recovery.ts`): confirmed by
+ * direct probe that `initRef` reported `usable`/success for all three
+ * shapes even though `read()` against the identical board already threw
+ * `EVENT_LOG_EVENTS_PREFIX_BLOCKED`. Left open, this would have meant
+ * `initRef()` reports a poisoned board healthy, after which every later
+ * `append` fails forever with a real directory/file conflict — the same
+ * class of permanent, silent wedge Ruling R48 exists to prevent, just one
+ * function over.
+ *
+ * **Copied, not imported, from `log.ts`'s `isEventsPrefixBlocked`** — this
+ * file's own established "different ownership boundary" convention (see
+ * this file's header, and `recovery.ts`'s header, for the identical
+ * precedent already set for `trailingMonthKeysOldestFirst`/`monthPath`/
+ * etc.). A real blob at `events` makes `readBlobFromRef` return its
+ * content directly (non-null, no throw) — blocked. A directory, a
+ * symlink, or a gitlink at the exact path all make `readBlobFromRef`
+ * throw `GIT_BLOB_AMBIGUOUS` (the adapter's own `mode === "100644"` check
+ * does not distinguish *which* non-blob shape it found) — but only a
+ * directory (`details.mode === "040000"`) is healthy; a symlink or
+ * gitlink sharing that exact error code is fail-closed as blocked, never
+ * positively confirmed healthy.
+ */
+async function isEventsPrefixBlocked(adapter: GitAdapter, validatedRef: string): Promise<boolean> {
+  let existing: string | null;
+  try {
+    existing = await adapter.readBlobFromRef(validatedRef, EVENTS_PREFIX);
+  } catch (cause) {
+    if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
+      const mode = cause.details?.mode;
+      return !(typeof mode === "string" && mode === "040000");
+    }
+    throw cause;
+  }
+  return existing !== null; // A real blob (non-null content, no throw) is blocked.
+}
+
 /** `checkRefUsability`'s result — see that function's doc comment for what each value means and how `initRefCore` reacts to it. */
 type RefUsability = "usable" | "absent" | "unusable";
 
@@ -116,6 +172,15 @@ interface RefUsabilityResult {
  * unexpected) — only `GIT_BLOB_AMBIGUOUS` and `GIT_REF_NOT_FOUND` have a
  * proven benign explanation.
  *
+ * **Fix round 3 follow-up (Ruling R48):** before any of the above, this
+ * function first probes the bare `events` prefix itself via
+ * `isEventsPrefixBlocked` — see that function's doc comment for why the
+ * probe below, on its own, cannot detect this shape. A blocked `events`
+ * prefix is reported `"unusable"`, with `cause` carrying a
+ * `EVENT_LOG_EVENTS_PREFIX_BLOCKED` error (the same code `log.ts`'s
+ * `read()` raises for the identical condition) naming the blocked path and
+ * a remediation.
+ *
  * **Known residual gap, out of this fix's reach (Orchestrator Ruling
  * R19).** A ref planted at a raw **tree**, or at **any annotated tag**
  * (fix round 2 doc correction: not only one peeling to a tree — verified
@@ -138,7 +203,50 @@ interface RefUsabilityResult {
  * ref, which is worse than leaving this one case undetected until the
  * M2.6 addition lands.
  */
-async function checkRefUsability(adapter: GitAdapter, validatedRef: string): Promise<RefUsabilityResult> {
+async function checkRefUsability(adapter: GitAdapter, validatedRef: string, resolvedSha: string): Promise<RefUsabilityResult> {
+  try {
+    if (await isEventsPrefixBlocked(adapter, validatedRef)) {
+      return {
+        usability: "unusable",
+        cause: new CanKanError(
+          EventErrorCodes.EVENT_LOG_EVENTS_PREFIX_BLOCKED,
+          `the top-level "${EVENTS_PREFIX}" path does not resolve to a usable directory (a file, symlink, or gitlink is planted there instead); refusing to report this ref usable`,
+          {
+            details: {
+              ref: validatedRef,
+              sha: resolvedSha,
+              path: EVENTS_PREFIX,
+              remediation: `inspect the tree (e.g. \`git ls-tree ${validatedRef}\`) and rebuild it (git read-tree / git rm --cached ${EVENTS_PREFIX} / commit-tree / update-ref) to remove the entry planted at "${EVENTS_PREFIX}"`,
+            },
+          },
+        ),
+      };
+    }
+  } catch (cause) {
+    // `isEventsPrefixBlocked` only interprets `GIT_BLOB_AMBIGUOUS` itself
+    // (mode-checked, per its own doc comment) and rethrows anything else
+    // unexamined. Two genuinely benign shapes reach here as a result: the
+    // ref vanishing between `initRefCore`'s own `readRef` and this probe
+    // (`GIT_REF_NOT_FOUND` — fix round 3, L2's exact TOCTOU window,
+    // reported `"absent"` immediately, matching the probe below's
+    // identical handling of the same code), and `validatedRef` resolving
+    // to something that isn't tree-ish *at all* — e.g. a ref planted
+    // straight at a blob — which makes `ls-tree` fail identically
+    // regardless of which path is probed (confirmed by direct probe:
+    // `readBlobFromRef` against both `"events"` and `USABILITY_PROBE_PATH`
+    // throws the identical `GIT_COMMAND_FAILED` when `validatedRef`
+    // resolves to a blob — not merely inferred from the second probe's own
+    // behavior). That second case is deliberately NOT reported here:
+    // falling through lets the probe below run its own, identical
+    // `readBlobFromRef` call and
+    // reach the exact same failure on its own terms, so both probes
+    // converge on one consistent `"unusable"` result (with the real cause
+    // attached) rather than this one reporting a different, premature
+    // verdict from a path collision that was never the actual defect.
+    if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_REF_NOT_FOUND) {
+      return { usability: "absent" };
+    }
+  }
   try {
     await adapter.readBlobFromRef(validatedRef, USABILITY_PROBE_PATH);
     return { usability: "usable" };
@@ -274,7 +382,7 @@ export async function initRefCore(
     // Fix round 1, S3 / fix round 3, L2: confirm the ref is usable before
     // reporting success — see `checkRefUsability`'s doc comment for what
     // each outcome means.
-    const { usability, cause } = await checkRefUsability(adapter, validatedRef);
+    const { usability, cause } = await checkRefUsability(adapter, validatedRef, existing);
     if (usability === "usable") {
       return;
     }
@@ -338,7 +446,7 @@ export async function initRefCore(
   // — the same single-attempt reasoning applies a second time rather than
   // this function growing a retry loop to chase an increasingly
   // pathological race.
-  const winnerResult = await checkRefUsability(adapter, validatedRef);
+  const winnerResult = await checkRefUsability(adapter, validatedRef, winner);
   if (winnerResult.usability === "unusable") {
     // Fix round 4, Low 1: see the identical note at the other call site above.
     throw refUnusableError(validatedRef, winner, winnerResult.cause);

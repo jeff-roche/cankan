@@ -190,24 +190,12 @@ export interface OpenTicketStoreOptions {
   readonly board: BoardRef;
   /**
    * Absolute, canonical paths of the repository's git directories, for ADR
-   * 0002 step (c). **At least one entry is required, for every board,
-   * with no exemption** (fix round 3, Important — see `assertValidGitDirs`
-   * for the full history of why an exemption is not safe here).
-   *
-   * 1A's Ruling R3 and fix round 2 each tried a narrower escape hatch
-   * instead of this flat requirement — an empty array meaning "no git
-   * directory" (Ruling R3), then an empty array exempted only for
-   * `kind: "personal"` (fix round 2) — and each was found to reopen ADR
-   * 0002 step (c) entirely: a hostile `tickets_dir` resolving inside the
-   * repository's real git directory (the `git init --separate-git-dir`
-   * reproduction, R2) passes cleanly whenever `gitDirs` is empty, since
-   * the by-name `.git` check lives only in `board/ref.ts` and neither a
-   * hand-built `BoardRef` nor the `kind` label it carries changes that.
-   * Every caller of this function must supply the git directory it is
-   * asking this store to defend against, including a caller opening the
-   * personal board — see `assertValidGitDirs`'s doc comment for why "a
-   * personal-board caller never holds a `GitAdapter`" turned out to be
-   * false.
+   * 0002 step (c). At least one entry is required for every board, with no
+   * exemption — an empty array, and later a `kind`-keyed exemption from
+   * requiring one, have each independently been shown to reopen step (c)
+   * entirely (a hostile `tickets_dir` landing writes inside the
+   * repository's real git directory; see the ADR 0002 amendment for that
+   * history). See `assertValidGitDirs` for what each entry must satisfy.
    */
   readonly gitDirs: readonly string[];
 }
@@ -227,17 +215,15 @@ export interface OpenTicketStoreOptions {
  * 1B Ruling R9) rather than three separate copies. `list()`/`get()` are
  * read-only and do not run it.
  *
- * `guardWrite()` returns the `realpath`'d `ticketsDir` it just validated
- * (fix round 2, Minor 1), and every write path is called with *that* value,
- * never the original captured string. This is deliberate, not
- * cosmetic: passing the raw `ticketsDir` through would leave the final
- * path component re-traversable — a symlink swapped into place in the
- * instant after the guard's `realpath` call but before the actual I/O
- * would still be followed by `open`/`rename`/`unlink`/`mkdir`, quietly
- * defeating the guard. Passing the already-resolved value down makes that
- * specific re-point structurally impossible rather than merely checked,
- * narrowing the residual TOCTOU window to an *ancestor* directory swap
- * (see `assertTicketsDirContained`'s own comment for that window's shape).
+ * `guardWrite()` returns the `realpath`'d `ticketsDir` it just validated,
+ * and every write path is called with *that* value, never the original
+ * captured string: passing the raw string through would leave the final
+ * path component re-traversable by a symlink swapped in between the
+ * guard's `realpath` call and the actual I/O, quietly defeating the guard.
+ * Passing the resolved value down makes that specific re-point
+ * structurally impossible rather than merely checked, narrowing the
+ * residual TOCTOU window to an *ancestor* directory swap (see
+ * `assertTicketsDirContained`'s own comment for that window's shape).
  */
 export async function openTicketStore(options: OpenTicketStoreOptions): Promise<TicketStore> {
   const { board, gitDirs } = options;
@@ -263,72 +249,47 @@ export async function openTicketStore(options: OpenTicketStoreOptions): Promise<
 }
 
 /**
- * `gitDirs` is required, not optional, in `OpenTicketStoreOptions` — but
- * TypeScript's guarantee is compile-time only. A JS caller (or one that
- * skips type-checking) omitting it entirely would otherwise silently reach
- * 1B's containment check with `undefined`, defeating the whole point of
- * making the field required rather than defaulting it. Checked eagerly so
- * the failure is loud and immediate, not a mystery inside 1B's later logic.
+ * Validates `gitDirs` before this store trusts it for ADR 0002 step (c).
+ * Required (not optional) in `OpenTicketStoreOptions` so a JS caller that
+ * skips type-checking cannot silently reach the containment check with
+ * `undefined`, defeating the point of making the field required at all.
  *
- * **At least one entry is required, for every board, with no exemption**
- * (fix round 3, Important — the third and, this time, structural attempt
- * at this same guarantee):
+ * At least one entry is required, for every board, with no exemption —
+ * deliberately *not* keyed on any caller-supplied value (not `kind`, not
+ * any other field a caller could get wrong): two earlier, narrower
+ * versions of this same guarantee (an empty-array escape hatch, then a
+ * `kind`-keyed exemption from it) were each independently bypassed, and a
+ * check keyed on a value the caller controls can always be defeated by
+ * supplying a different value. See the ADR 0002 amendment for that
+ * history.
  *
- * - **Ruling R3** (1A) first made `gitDirs` a required field with `[]` as
- *   an explicit "no git directory" escape hatch.
- * - **Fix round 2** found `[]` disables step (c) *entirely* for a repo
- *   board — not merely "no extra git directory to exclude," but zero
- *   git-directory defence at all, since the by-name `.git` check lives
- *   only in `board/ref.ts` and a hand-built `BoardRef` skips it. That
- *   round's fix exempted only `kind === "personal"` from the non-empty
- *   requirement, reasoning that a caller opening the personal board is
- *   never expected to also hold a `GitAdapter` for it.
- * - **Fix round 3** found that reasoning false, and the exemption itself
- *   exploitable two different ways. First, false: `personal.ts`'s own
- *   file header documents that any caller who has reached a *usable*
- *   personal board (`needsGitInit: false`, or a caller that has already
- *   run `git init` in response to `needsGitInit: true`) has, by
- *   construction, already had to hold `git/index.ts` to get there — so it
- *   always has a `GitAdapter` available for exactly the case where a real
- *   `gitDirs` matters. Second, exploitable: the security reviewer
- *   reproduced the original step (c) gap *verbatim* by simply labelling
- *   the same hostile board `kind: "personal"` instead of `"repo"` — and,
- *   separately, showed the `kind`-keyed check itself could be bypassed by
- *   any value that is not the exact literal string `"repo"`
- *   (`undefined`, `null`, `""`, `"Repo"`, ...), since `BoardKind` is a
- *   compile-time-only type with no runtime validation anywhere upstream
- *   of this function — precisely the class of bad value this function's
- *   very first paragraph above already exists to catch for `gitDirs`
- *   itself, just not yet applied to the parameter the exemption was keyed
- *   on.
+ * Each entry must additionally be: a non-empty, absolute string; already
+ * **canonical** (`fs.realpath(dir) === dir`) — a non-canonical entry (a
+ * macOS `/var/folders/...` path that was never realpath'd, say) would
+ * silently fail to match the already-canonical `ticketsDir` it is compared
+ * against in `assertTicketsDirContained`; a real, existing **directory**,
+ * not a file — a `--separate-git-dir` repository's `.git` is a *file*, and
+ * `fs.realpath` of a file succeeds and equals itself just as readily as a
+ * directory does, so this check is required, not redundant with the one
+ * before it; and contain a **`HEAD`** entry, present under
+ * `gitCommonDir()`'s result for every repo shape (normal,
+ * `--separate-git-dir`, linked worktree, bare) — this is what rejects an
+ * arbitrary unrelated existing directory, which the checks above alone
+ * would accept. Every failure surfaces as `ErrorCodes.USAGE`, without
+ * distinguishing "does not exist" from "exists but is wrong" in the error
+ * code (fail-closed either way; the message says which rule failed).
  *
- * The fix removes the exemption, and the `kind` parameter that carried
- * it, entirely — rather than validating `kind` at runtime — because a
- * check that cannot be keyed on a bad value cannot be bypassed by one:
- * this closes the whole class (every current and future `BoardKind`, and
- * anything a JS caller could pass instead of one) at once, rather than
- * chasing each bad value individually the way a runtime `kind` guard
- * would have needed to.
- *
- * Each entry is further required to be **canonical** — `fs.realpath`'d,
- * not merely absolute (1B, work item 2b.1, tightened from "absolute" alone
- * in fix round 1 Minor 2). `OpenTicketStoreOptions.gitDirs`'s own doc
- * comment already promises canonical paths, and `assertTicketsDirContained`
- * (1B's step (c) check) compares each entry against the already-canonical
- * `board.ticketsDir` via `isContained` — an absolute-but-non-canonical
- * entry (a macOS `/var/folders/...` git directory that was never
- * realpath'd, say) would silently fail to match anything it should, which
- * is exactly the "security check that quietly does nothing" this guard
- * exists to prevent, one layer down. Verified by `fs.realpath`-ing each
- * entry and requiring the result to equal the entry itself; a path that
- * does not exist, or that resolves to something else, is rejected the same
- * way a relative or empty entry already was — the failure surfaces as
- * `ErrorCodes.USAGE` either way (fail-closed either reading is correct;
- * the message says "existing, canonical, and accessible" rather than
- * implying non-existence specifically, since a permission error
- * (`EACCES`) reaches this same branch and is not "the path doesn't
- * exist," fix round 2 Minor 4). This makes the function asynchronous
- * (fix round 1's version was synchronous).
+ * **Residual, stated plainly, not overclaimed:** these checks confirm each
+ * `gitDirs` entry is *a* real git directory. They do not confirm it
+ * belongs to *this* board's own repository — a different repository's
+ * real git directory passes every check here. Closing that fully requires
+ * this store to derive `gitDirs` itself (or accept a `GitAdapter`
+ * directly), which needs `git/index.ts` (M2.6) — outside M2.5's `Depends
+ * on` list (PLAN.md), so it is deferred to the lane that wires this
+ * store's first real caller, where a `GitAdapter` is legitimately in
+ * scope, rather than closed here by importing around the dependency list.
+ * A future reader must not mistake the checks above for a finished
+ * defence against every hostile `gitDirs` value.
  */
 async function assertValidGitDirs(gitDirs: readonly string[]): Promise<void> {
   if (!Array.isArray(gitDirs)) {
@@ -356,6 +317,36 @@ async function assertValidGitDirs(gitDirs: readonly string[]): Promise<void> {
     }
     if (real !== dir) {
       throw new CanKanError(ErrorCodes.USAGE, "Every gitDirs entry must already be canonical (fs.realpath'd)");
+    }
+    // Rung (a): a directory, not a file. `fs.realpath` above succeeds
+    // identically for a file (a `--separate-git-dir` repo's `.git` is one)
+    // as for a directory, so that check alone accepts exactly the value
+    // ADR 0002 step (c) exists to reject.
+    let info: Awaited<ReturnType<typeof stat>>;
+    try {
+      info = await stat(dir);
+    } catch (err) {
+      throw new CanKanError(ErrorCodes.USAGE, "Every gitDirs entry must be an accessible directory", {
+        cause: err,
+      });
+    }
+    if (!info.isDirectory()) {
+      throw new CanKanError(
+        ErrorCodes.USAGE,
+        "Every gitDirs entry must be a directory, not a file (a --separate-git-dir repository's .git is a file -- pass gitCommonDir() instead)",
+      );
+    }
+    // Rung (b): looks like a git directory. Does not confirm it is *this*
+    // board's git directory -- see this function's doc comment's Residual
+    // paragraph.
+    try {
+      await stat(join(dir, "HEAD"));
+    } catch (err) {
+      throw new CanKanError(
+        ErrorCodes.USAGE,
+        "Every gitDirs entry must contain a HEAD entry -- it does not look like a git directory",
+        { cause: err },
+      );
     }
   }
 }
@@ -859,79 +850,48 @@ async function removeTicket(ticketsDir: string, lookup: string): Promise<void> {
 
 /**
  * Creates (if needed) and validates the archive subdirectory — the one
- * directory this module creates (Ruling R4): it lives inside the
- * already-validated `ticketsDir`, so this opens no new containment question
- * the way creating `ticketsDir` itself would. **Except** it did open one
- * (fix round 1, Critical, found by security review): `mkdir(archiveDir,
- * { recursive: true })` silently succeeds when `archive` already exists as
- * a *symlink* to a directory — it stats, sees a directory, and returns —
- * after which the subsequent `rename()` resolves that symlink and lands
- * the ticket wherever it points, **outside** `ticketsDir` entirely.
- * Verified against a real store: a checked-in `.cankan/tickets/archive` ->
- * `/tmp/victim` symlink (git stores and checks out a symlink verbatim,
- * mode `120000`) let `archive()` move a ticket clean out of the repo,
- * silently overwriting anything already at the destination — the attacker
- * controls both the destination directory and the filename.
- * `assertSafeTicketPath` cannot catch this on its own: it is purely
- * lexical (string joins and a `dirname` compare) and never resolves a
- * single path component.
+ * directory this module creates (Ruling R4). It lives inside the
+ * already-validated `ticketsDir`, so no new containment question opens the
+ * way creating `ticketsDir` itself would, **provided** `archive` cannot be
+ * a symlink out of it: `mkdir(archiveDir, { recursive: true })` succeeds
+ * silently against an existing symlink-to-a-directory, after which
+ * `archiveTicket`'s `rename()` follows that symlink and lands the ticket
+ * outside `ticketsDir` entirely. `assertSafeTicketPath` cannot catch this;
+ * it is purely lexical and never resolves a path component.
  *
- * Guarded two ways, both inside this one function so 1B extends a single
- * choke point rather than chasing call sites:
+ * Guarded two ways, both inside this one choke point:
  * - `lstat` (not `stat`) before creating anything: `ENOENT` means "safe to
- *   create"; anything that already exists and is not a **real** directory
- *   (a symlink, a file, a FIFO, ...) is rejected outright, before anything
- *   is created or moved.
+ *   create"; anything else that is not a **real** directory (a symlink, a
+ *   file, a FIFO, ...) is rejected outright, before anything is created or
+ *   moved. `mkdir` below is called **without** `{ recursive: true }` for
+ *   the same reason — `recursive: true` is what succeeds silently against
+ *   a planted symlink; a plain `mkdir` fails outright (`EEXIST`) instead.
+ *   The parent is already known to exist by this point, so recursion buys
+ *   nothing here.
  * - After `mkdir`, `realpath(archiveDir)` must equal
- *   `join(ticketsDir, ARCHIVE_DIR_NAME)` **exactly** — exact equality,
- *   not containment, is correct here because `BoardRef.ticketsDir` is
- *   already canonical by contract (`board/ref.ts`), so the expected value
- *   is already in its final, symlink-resolved form.
+ *   `join(ticketsDir, ARCHIVE_DIR_NAME)` **exactly** (not containment) —
+ *   `BoardRef.ticketsDir` is already canonical by contract, so the
+ *   expected value is already in its final, symlink-resolved form.
  *
- * **Residual gap, stated honestly, not overclaimed:** there is a TOCTOU
- * window between this check and the `rename` call in `archiveTicket` — a
- * local process running as the same user that swaps a real directory for a
- * symlink inside that window can still win the race. Nothing here closes
- * that; what it closes is the checked-in-symlink attack, which requires no
- * race at all and is the one a hostile repository can actually mount.
+ * **Residual gap, stated honestly:** a TOCTOU window remains between this
+ * check and `archiveTicket`'s `rename` — a local process running as the
+ * same user that swaps a real directory for a symlink inside that window
+ * still wins the race. What closes here is the checked-in-symlink attack,
+ * which needs no race at all and is the one a hostile repository can
+ * actually mount.
  *
- * `mkdir(archiveDir)` below is called **without** `{ recursive: true }`
- * (1B, work item 2b.2 — a fix-round-1 review finding on this same
- * function): `recursive: true` was demonstrated to succeed silently
- * against a planted symlink in a narrower race than this — the exact
- * silent-success behaviour the original Critical exploited — while a plain
- * `mkdir` fails outright (`EEXIST`) if anything is already there. The
- * parent (`ticketsDir`) is already known to exist by the time this runs
- * (`assertTicketsDirContained`'s guard, and every caller's own
- * `assertTicketsDirUsable`/`getTicket` before it), so recursion buys
- * nothing here. This closes the `lstat`→`mkdir` race window one step
- * earlier, in the kernel, rather than relying solely on the `realpath`
- * check below to catch it after the fact — the residual window is the same
- * either way; this is defence in depth, not a distinct bug fix.
- *
- * **The `realpath(archiveDir)` equality check's coverage status, stated
- * precisely (fix round 3, Minor — do not delete this check as dead code,
- * and do not assume a passing suite still exercises it deterministically):**
- * fix round 2's Minor 1 made every caller of this function receive an
+ * **Coverage status of the `realpath` equality check (do not delete it as
+ * dead code, and do not assume a passing suite still exercises it
+ * deterministically):** every caller of this function now receives an
  * already-`realpath`'d `ticketsDir` (`openTicketStore`'s `guardWrite()`
- * closure resolves it once, up front, and passes the resolved value down
- * to `writeTicket`/`removeTicket`/`archiveTicket`), which made the
- * *hand-built-non-canonical-`ticketsDir`* route to this branch structurally
- * unreachable — there is, as of that fix, no test in this suite that
- * deterministically drives a mismatch here anymore. That does **not** mean
- * this check is decorative. It is the *only* defence against a second,
- * narrower race than the `lstat`/`isDirectory` branch above can see: a
- * symlink swapped into `archive` in the instant *between* this function's
- * own `lstat` call and its `realpath` call — after the existence check has
- * already passed, before this equality check runs. The `lstat`/
- * `isDirectory` branch cannot catch that window at all, by construction
- * (it runs once, earlier); this branch is what catches it. Separately,
- * this branch would also catch a plain non-canonical `ticketsDir` passed
- * in directly, the way fix round 1's original test drove it — Minor 1 is
- * why no *current* caller does that (every caller of this internal
- * function already resolves `ticketsDir` first), not a guarantee that
- * will always hold for every future caller this function might gain. Keep
- * it.
+ * resolves it once and passes the resolved value down), so no test in this
+ * suite currently drives a mismatch here. That does not make the check
+ * decorative — it is the *only* defence against a symlink swapped into
+ * `archive` in the instant between this function's own `lstat` and its
+ * `realpath` call, a window the `lstat`/`isDirectory` branch above cannot
+ * see by construction (it runs once, earlier). It would also catch a
+ * plain non-canonical `ticketsDir` passed in directly, should a future
+ * caller of this internal function stop pre-resolving it. Keep it.
  */
 async function ensureArchiveDir(ticketsDir: string): Promise<string> {
   const archiveDir = join(ticketsDir, ARCHIVE_DIR_NAME);

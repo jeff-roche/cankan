@@ -53,12 +53,17 @@ function newTicket(id: string, title: string, options: { status?: string; cankan
  * exercises them has to. Wrapped in `withEnv` because `buildBoardRef` reads
  * config through `loadConfig`, which reads XDG paths even when this test
  * never sets any (Mandatory hygiene: never touch the real `~/.config`).
+ * `env: hermeticEnv()` (fix round 4, Minor) so `loadConfig`'s `options.env
+ * ?? process.env` fallback never leaks a real `CANKAN_*` var the operator
+ * or CI happens to have exported -- `withEnv` itself only ever redirects
+ * `HOME`/`XDG_*`, the same gap the personal-board test's own fix already
+ * closed one call site earlier.
  */
 async function withTestBoard(fn: (ctx: { board: BoardRef; repo: TempRepo }) => Promise<void>): Promise<void> {
   await withEnv(undefined, async () => {
     const repo = await makeTempRepo();
     try {
-      const board = await buildBoardRef({ kind: "repo", name: "test-board", root: repo.dir });
+      const board = await buildBoardRef({ kind: "repo", name: "test-board", root: repo.dir, env: hermeticEnv() });
       await mkdir(board.ticketsDir, { recursive: true });
       await fn({ board, repo });
     } finally {
@@ -72,7 +77,7 @@ async function withUninitializedBoard(fn: (board: BoardRef) => Promise<void>): P
   await withEnv(undefined, async () => {
     const repo = await makeTempRepo();
     try {
-      const board = await buildBoardRef({ kind: "repo", name: "test-board", root: repo.dir });
+      const board = await buildBoardRef({ kind: "repo", name: "test-board", root: repo.dir, env: hermeticEnv() });
       await fn(board);
     } finally {
       await repo.cleanup();
@@ -655,6 +660,31 @@ describe("openTicketStore — gitDirs is required for every board, with no per-k
       }
     });
   });
+
+  test("a gitDirs entry that is a real, canonical, existing directory but not a git directory (no HEAD entry) is rejected with USAGE (fix round 4, Important, rung (b))", async () => {
+    await withTestBoard(async ({ board }) => {
+      const unrelated = await realpath(await mkdtemp(join(tmpdir(), "cankan-store-gitdirs-unrelated-")));
+      try {
+        await expectRejectsWithCode(() => openTicketStore({ board, gitDirs: [unrelated] }), ErrorCodes.USAGE);
+      } finally {
+        await rm(unrelated, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("a gitDirs entry that is a file, not a directory, is rejected with USAGE (fix round 4, Important, rung (a))", async () => {
+    await withTestBoard(async ({ board }) => {
+      const dir = await mkdtemp(join(tmpdir(), "cankan-store-gitdirs-file-"));
+      try {
+        const filePath = join(dir, "not-a-directory");
+        await writeFile(filePath, "gitdir: /somewhere\n", "utf8");
+        const real = await realpath(filePath);
+        await expectRejectsWithCode(() => openTicketStore({ board, gitDirs: [real] }), ErrorCodes.USAGE);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 // ---- ADR 0002 step (b) write-time re-check, and step (c) git-directory exclusion (1B, Ruling R9) ----
@@ -782,6 +812,54 @@ describe("ticketStore — ADR 0002 step (b) write-time re-check and step (c) git
 
         await assertDoesNotExist(targetPath);
         expect(await readdir(hostileTicketsDir)).toEqual([]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("gitDirs: [join(root, '.git')] against a --separate-git-dir repo is refused at open, before any write is attempted (fix round 4, Important, rung (a)) -- .git there is a FILE, and would otherwise silently exclude nothing", async () => {
+    await withEnv(undefined, async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "cankan-store-sepgit-gitfile-")));
+      try {
+        // Same fixture as the R2 repro above: `.git` here is a file
+        // containing `gitdir: <root>/innergit`, not the repository's real
+        // git directory. On an ordinary (non-separate-git-dir) repo,
+        // `join(root, ".git")` IS a correct gitDirs value -- verified just
+        // below against a plain `makeTempRepo()` -- which is exactly what
+        // makes this silent: it is right everywhere a developer would
+        // casually test it, wrong only in the one adversarial layout step
+        // (c) exists to defend against.
+        const ordinary = await makeTempRepo();
+        try {
+          const ordinaryAdapter = await createGitAdapter(ordinary.dir);
+          expect(await ordinaryAdapter.gitCommonDir()).toBe(join(ordinary.dir, ".git"));
+        } finally {
+          await ordinary.cleanup();
+        }
+        runGit(root, ["init", "--separate-git-dir=./innergit", "."]);
+        runGit(root, ["config", "user.name", "CanKan Test"]);
+        runGit(root, ["config", "user.email", "test@cankan.invalid"]);
+        runGit(root, ["commit", "--allow-empty", "-m", "initial commit"]);
+
+        const hostileTicketsDir = join(root, "innergit", "refs", "cankan-evil");
+        await mkdir(hostileTicketsDir, { recursive: true });
+
+        const board: BoardRef = {
+          kind: "repo",
+          name: "hostile",
+          root,
+          ticketsDir: hostileTicketsDir,
+          coordinationRef: "refs/cankan/coordination",
+        };
+        const targetPath = join(hostileTicketsDir, "ck-evil0001 - Pwn.md");
+
+        await expectRejectsWithCode(
+          () => openTicketStore({ board, gitDirs: [join(root, ".git")] }),
+          ErrorCodes.USAGE,
+        );
+
+        await assertDoesNotExist(targetPath);
       } finally {
         await rm(root, { recursive: true, force: true });
       }

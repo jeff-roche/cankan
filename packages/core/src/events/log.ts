@@ -716,7 +716,7 @@ const SHA_SHAPE_PATTERN = /^[0-9a-f]{40}$/;
  *
  * A wrong-typed value (a number, an object, a non-SHA string) throws
  * `EVENT_APPEND_INVALID_OPTION` here rather than reaching the retry loop's
- * own `parentSha !== options.expectedParent` comparison — a plain `!==`
+ * own `parentSha !== expectedParent` comparison — a plain `!==`
  * would not throw for a mistyped value (it would just always compare
  * unequal, misreporting every attempt as "stale" instead of "the caller's
  * input was never valid"), the same past-`isCanKanError` shape this file's
@@ -840,21 +840,47 @@ export interface AppendOptions {
    */
   readonly maxExistingBlobBytes?: number;
   /**
-   * The tip this call's decision was made against (M2.10 slice 0 — the CAS
-   * seam ADR 0001:696-699's mandated cycle needs and this file's own header
-   * comment names as out of scope for M2.7: "does not check whether the
-   * event is otherwise valid to append"). `append`'s own CAS
-   * (`updateRefCAS`, inside `withCasRetry`) serializes concurrent writers
-   * against *each other* — it says nothing about whether either writer's
-   * decision is still correct by the time its write lands. Two callers that
-   * each read "this ticket is unclaimed" and both call `append` with no
-   * `expectedParent` both succeed: the internal re-read-and-retry loop below
-   * just serializes the two writes onto the ref one after another, it never
-   * asks whether the second writer's decision is still valid once the
-   * first's event has landed — a double claim, the exact hazard ADR 0001
-   * exists to prevent. That check needs `state/` (the fold this dispatch may
-   * not import — PLAN.md rule 2), so it belongs to the caller; this option
-   * is the seam that lets the caller supply the tip its decision assumed.
+   * The tip the caller's decision must have been made against (M2.10 slice
+   * 0 — the CAS seam ADR 0001:696-699's mandated cycle needs and this
+   * file's own header comment names as out of scope for M2.7: "does not
+   * check whether the event is otherwise valid to append"). `append`'s own
+   * CAS (`updateRefCAS`, inside `withCasRetry`) serializes concurrent
+   * writers against *each other* — it says nothing about whether either
+   * writer's decision is still correct by the time its write lands. Two
+   * callers that each read "this ticket is unclaimed" and both call
+   * `append` with no `expectedParent` both succeed: the internal
+   * re-read-and-retry loop below just serializes the two writes onto the
+   * ref one after another, it never asks whether the second writer's
+   * decision is still valid once the first's event has landed — a double
+   * claim, the exact hazard ADR 0001 exists to prevent. That check needs
+   * `state/` (the fold this dispatch may not import — PLAN.md rule 2), so
+   * it belongs to the caller; this option is the seam that lets the caller
+   * supply the tip its decision assumed.
+   *
+   * **Binding requirement on every caller, not a description of a value
+   * `append` can verify for you: capture the tip with `adapter.readRef()`
+   * strictly *before* calling `read()`, then fold from that same tip, and
+   * only then decide and call `append` with that tip as `expectedParent`.**
+   * A tip captured *after* `read()` — the natural-looking order, "fold the
+   * log, then grab the tip" — is captured too late: it can already be newer
+   * than the events actually folded, because `read()` resolves the ref's
+   * tip internally and never hands it back (`EventRecord` carries only
+   * `month`/`line`/`position`, no commit; `ReadOptions` has no commit pin
+   * a caller could supply to pin the read to a chosen tip). A caller that
+   * gets the ordering backwards captures a tip that already reflects writes
+   * the fold never saw, so this guard validates state the caller never
+   * actually validated — and can pass. A real double claim reproduces this
+   * way: fold sees `ck-x` unclaimed, a competing peer claims it, the caller
+   * *then* captures "the tip", and the guarded append succeeds anyway. The
+   * safe ordering — `readRef()` before `read()` — fails closed on the same
+   * race instead: `EVENT_APPEND_STALE_PARENT`, zero claims landed.
+   *
+   * The real fix is for `read()` itself to return the head it resolved,
+   * removing this ordering trap by construction — `recovery.ts`'s
+   * `diagnose` already returns `{ ref, commit: head, ... }` for exactly
+   * this reason. Not done here: changing `read()`'s return type ripples
+   * through `state/`, `recovery.ts`, and every existing caller, and is
+   * routed to M2.7 instead of this dispatch.
    *
    * - Omitted (`undefined`, the default): **today's behavior, exactly** —
    *   no check, whatever the ref currently points to on a given attempt is
@@ -1108,7 +1134,27 @@ export async function appendCore(
   // M2.10 slice 0: `expectedParent`'s own shape, checked here alongside
   // every other option-shape check — see `validateExpectedParent`'s doc
   // comment.
-  validateExpectedParent(options.expectedParent);
+  //
+  // Fix round 4, finding 1: read from `options.expectedParent` exactly
+  // once, into a local, and validate *that local* — never the option
+  // object's property again. `options` is the caller's own object; a
+  // second, later, independent property access trusts the caller not to
+  // have handed over an accessor whose return value can change between
+  // reads. A getter that returns a valid SHA on its first invocation and
+  // something else (e.g. `undefined`, "no check requested") on every
+  // subsequent one defeats a validate-then-re-read split even when the
+  // re-read sits on the very next line: the value validated and the value
+  // later compared against are two different accesses of the same
+  // accessor, so validating the first does nothing to constrain the
+  // second. Reading once and validating (and using) only that snapshot
+  // closes this regardless of how many times a hostile getter is later
+  // invoked, because it is invoked at most once — the same discipline this
+  // file already applies to every other option (`mint`,
+  // `maxExistingBlobBytes`, `casMaxAttempts`, `casBackoffMs`, `casSleep`),
+  // and the same shape this file has already closed twice before, for
+  // `casRetry.backoffMs` and `maxExistingBlobBytes`.
+  const expectedParent = options.expectedParent;
+  validateExpectedParent(expectedParent);
 
   // The id is minted once, before the retry loop — not per attempt. A retry
   // re-reads and re-checks git-level state, but it is still the same
@@ -1182,11 +1228,11 @@ export async function appendCore(
     // a mismatch here means the caller's decision, not merely this
     // attempt's build, is stale, and only the caller (which owns the
     // re-check) can decide what to do next.
-    if (options.expectedParent !== undefined && parentSha !== options.expectedParent) {
+    if (expectedParent !== undefined && parentSha !== expectedParent) {
       throw new CanKanError(
         EventErrorCodes.EVENT_APPEND_STALE_PARENT,
         "expectedParent no longer matches the ref's current tip; re-read and re-check before appending again",
-        { details: { ref: validatedRef, expectedParent: options.expectedParent, actualParent: parentSha } },
+        { details: { ref: validatedRef, expectedParent, actualParent: parentSha } },
       );
     }
 
@@ -1259,7 +1305,7 @@ export async function appendCore(
     if (outcome.outcome === "applied") {
       return { done: true, value: { event, month, line: priorLineCount } };
     }
-    if (options.expectedParent !== undefined) {
+    if (expectedParent !== undefined) {
       // M2.10 slice 0: a CAS rejection while the caller is holding a
       // specific `expectedParent` means someone else's write landed between
       // this attempt's read (above) and this commit attempt — the caller's
@@ -1275,18 +1321,32 @@ export async function appendCore(
       // go re-check" regardless of what this second read finds. A `GIT_*`
       // failure here must not replace `EVENT_APPEND_STALE_PARENT` with an
       // unrelated error code the caller has no reason to expect from an
-      // `append` call — caught and downgraded to `null` (a legitimate
-      // `RefSha | null` value already) rather than left to propagate.
+      // `append` call — caught and downgraded to `null` rather than left to
+      // propagate.
+      //
+      // Fix round 4, finding 2: `null` already has a meaning here — "the
+      // ref does not exist" — so a caught read failure cannot also be
+      // reported as `null` without conflating "ref absent" with "ref
+      // unreadable" (the same hazard this project has been bitten by
+      // before, in reverse: `readRef`'s own `null` normally *is* a genuine
+      // absent-ref signal, see its doc comment). `actualParentUnread: true`
+      // is the distinct marker: a caller or an operator reading `--json`
+      // output can tell "the board is empty" apart from "the ref could not
+      // be read" without either field losing its own clean meaning.
+      // `details` stays flat and printable — a boolean sibling, not a
+      // nested object.
       let actualParent: RefSha | null;
+      let actualParentUnread = false;
       try {
         actualParent = await adapter.readRef(validatedRef);
       } catch {
         actualParent = null;
+        actualParentUnread = true;
       }
       throw new CanKanError(
         EventErrorCodes.EVENT_APPEND_STALE_PARENT,
         "expectedParent's compare-and-swap was rejected by a concurrent writer; re-read and re-check before appending again",
-        { details: { ref: validatedRef, expectedParent: options.expectedParent, actualParent } },
+        { details: { ref: validatedRef, expectedParent, actualParent, actualParentUnread } },
       );
     }
     return { done: false };

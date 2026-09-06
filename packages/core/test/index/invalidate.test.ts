@@ -6,6 +6,7 @@ import { openIndex } from "../../src/index/db";
 import { createIndexInvalidator, ensureIndexFresh, computeIndexValidity, isIndexStale, queryTicketsFresh, readIndexValidity } from "../../src/index/invalidate";
 import { queryTickets } from "../../src/index/query";
 import { reindex } from "../../src/index/reindex";
+import { IndexErrorCodes } from "../../src/index/errors";
 import { makeTicket, sentinelState } from "./testHelpers";
 
 describe("index invalidation", () => {
@@ -48,6 +49,99 @@ describe("index invalidation", () => {
     reindex({ index, state, validity: JSON.stringify(validity) });
     const result = await queryTicketsFresh({ index, ticketsDir, readRef: async () => null, fold: () => { throw new Error("fold should not run"); } });
     expect(result).toEqual(queryTickets(index));
+    index.close();
+  });
+
+  test("refolds when inputs change while the first fold is running", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cankan-index-fold-race-"));
+    const ticketsDir = join(root, "tickets");
+    await mkdir(ticketsDir);
+    const ticket = join(ticketsDir, "CK-RACE.md");
+    await writeFile(ticket, "---\nid: CK-RACE\nstatus: To Do\n---\ninitial\n");
+    const index = openIndex({ boardKey: `fold-race-${root}`, env: { HOME: root } });
+    const initial = { ...sentinelState("CK-RACE"), tickets: [makeTicket("CK-RACE")] };
+    const validity = await computeIndexValidity({ ticketsDir, readRef: async () => "abc" });
+    reindex({ index, state: initial, validity: JSON.stringify(validity) });
+    createIndexInvalidator(index)();
+
+    let folds = 0;
+    const result = await queryTicketsFresh({
+      index,
+      ticketsDir,
+      readRef: async () => "abc",
+      fold: async () => {
+        folds += 1;
+        if (folds === 1) await writeFile(ticket, "---\nid: CK-RACE\nstatus: Done\n---\nchanged\n");
+        const source = await Bun.file(ticket).text();
+        return { ...initial, tickets: [makeTicket("CK-RACE", { status: source.includes("status: Done") ? "Done" : "To Do" })] };
+      },
+    });
+
+    expect(folds).toBe(2);
+    expect(result[0]?.status).toBe("Done");
+    index.close();
+  });
+
+  test("throws instead of retrying forever when inputs never stabilize", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cankan-index-refresh-limit-"));
+    const ticketsDir = join(root, "tickets");
+    await mkdir(ticketsDir);
+    const ticket = join(ticketsDir, "CK-LIMIT.md");
+    await writeFile(ticket, "---\nid: CK-LIMIT\nstatus: To Do\n---\ninitial\n");
+    const index = openIndex({ boardKey: `refresh-limit-${root}`, env: { HOME: root } });
+    const initial = { ...sentinelState("CK-LIMIT"), tickets: [makeTicket("CK-LIMIT")] };
+    const validity = await computeIndexValidity({ ticketsDir, readRef: async () => "abc" });
+    reindex({ index, state: initial, validity: JSON.stringify(validity) });
+    createIndexInvalidator(index)();
+
+    let folds = 0;
+    await expect(
+      ensureIndexFresh({
+        index,
+        ticketsDir,
+        readRef: async () => "abc",
+        fold: async () => {
+          folds += 1;
+          await writeFile(ticket, `---\nid: CK-LIMIT\nstatus: Done\n---\nchange-${folds}\n`);
+          return initial;
+        },
+      }),
+    ).rejects.toMatchObject({ code: IndexErrorCodes.STALE });
+    expect(folds).toBe(3);
+    expect(() => queryTickets(index)).toThrow(/stale/);
+    index.close();
+  });
+
+  test("refolds when the inputs change after publishing the first rebuild", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cankan-index-publish-race-"));
+    const ticketsDir = join(root, "tickets");
+    await mkdir(ticketsDir);
+    const ticket = join(ticketsDir, "CK-PUBLISH.md");
+    await writeFile(ticket, "---\nid: CK-PUBLISH\nstatus: To Do\n---\ninitial\n");
+    const index = openIndex({ boardKey: `publish-race-${root}`, env: { HOME: root } });
+    const initial = { ...sentinelState("CK-PUBLISH"), tickets: [makeTicket("CK-PUBLISH")] };
+    const initialValidity = await computeIndexValidity({ ticketsDir, readRef: async () => "abc" });
+    reindex({ index, state: initial, validity: JSON.stringify(initialValidity) });
+    createIndexInvalidator(index)();
+
+    let refReads = 0;
+    let folds = 0;
+    const result = await queryTicketsFresh({
+      index,
+      ticketsDir,
+      readRef: async () => {
+        refReads += 1;
+        return refReads >= 3 ? "def" : "abc";
+      },
+      fold: async () => {
+        folds += 1;
+        return initial;
+      },
+    });
+
+    expect(folds).toBe(2);
+    expect(refReads).toBe(5);
+    expect(String(result[0]?.id)).toBe("CK-PUBLISH");
     index.close();
   });
 });

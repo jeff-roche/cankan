@@ -203,6 +203,7 @@ describe("append — CAS retry re-reads rather than replaying a stale tree", () 
     await append(adapter, COORD_REF, claim("ck-seed"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
 
     const attemptNumbersSeen: number[] = [];
+    let notifications = 0;
     const hooks: AppendHooks = {
       beforeCas: async (attemptNumber) => {
         attemptNumbersSeen.push(attemptNumber);
@@ -224,7 +225,7 @@ describe("append — CAS retry re-reads rather than replaying a stale tree", () 
       adapter,
       COORD_REF,
       claim("ck-mine"),
-      { now: SEPT_15_MS, casRetry: { ...FAST_RETRY, maxAttempts: 5 } },
+      { now: SEPT_15_MS, casRetry: { ...FAST_RETRY, maxAttempts: 5 }, onAppend: () => { notifications += 1; } },
       hooks,
     );
 
@@ -232,6 +233,7 @@ describe("append — CAS retry re-reads rather than replaying a stale tree", () 
     // Proves a *second* attempt genuinely happened — attempt 1 was rejected,
     // not silently accepted.
     expect(attemptNumbersSeen).toEqual([1, 2]);
+    expect(notifications).toBe(1);
 
     const records = await read(adapter, COORD_REF, { now: SEPT_15_MS });
     const tickets = records.map((r) => r.event.ticket as string).sort();

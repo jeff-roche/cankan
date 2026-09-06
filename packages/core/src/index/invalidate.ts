@@ -9,12 +9,15 @@
  */
 import { createHash } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
+import { CanKanError } from "../errors";
 import type { BoardIndex } from "./db";
+import { IndexErrorCodes } from "./errors";
 import type { ReindexResult } from "./reindex";
 import { reindex } from "./reindex";
 import { queryBoardState, queryTickets, type QueryBoardStateOptions, type TicketQuery } from "./query";
 type BoardState = ReturnType<typeof queryBoardState>;
 type TicketState = ReturnType<typeof queryTickets>[number];
+const MAX_FRESHNESS_ATTEMPTS = 3;
 
 export interface IndexValidityInputs {
   /** Directory containing the board's ticket files. */
@@ -77,6 +80,10 @@ export function isIndexStale(index: BoardIndex, current: IndexValidity): boolean
   return dirty?.value === "1" || indexed === undefined || indexed.ticketsMtimeMs !== current.ticketsMtimeMs || indexed.ticketsSignature !== current.ticketsSignature || indexed.refSha !== current.refSha;
 }
 
+function sameIndexValidity(left: IndexValidity, right: IndexValidity): boolean {
+  return left.ticketsMtimeMs === right.ticketsMtimeMs && left.ticketsSignature === right.ticketsSignature && left.refSha === right.refSha;
+}
+
 /** Explicitly dirties an index. Useful for callers that know a write occurred. */
 export function invalidateIndex(index: BoardIndex): void {
   index.db.query("INSERT INTO cankan_meta (key, value) VALUES ('dirty', '1') ON CONFLICT(key) DO UPDATE SET value = '1'").run();
@@ -102,9 +109,35 @@ export interface EnsureIndexFreshOptions extends IndexValidityInputs {
 
 /** Reindexes once when the current inputs differ from the cached marker. */
 export async function ensureIndexFresh(options: EnsureIndexFreshOptions): Promise<ReindexResult | undefined> {
-  const validity = await computeIndexValidity(options);
+  let validity = await computeIndexValidity(options);
   if (!isIndexStale(options.index, validity)) return undefined;
-  return reindex({ index: options.index, state: await options.fold(), now: options.now, validity: serializeIndexValidity(validity) });
+
+  // Folding is asynchronous and can overlap an editor write or another
+  // append. Do not mark the result fresh unless the inputs stayed unchanged
+  // for the complete fold; otherwise fold again from the newer inputs.
+  for (let attempt = 0; attempt < MAX_FRESHNESS_ATTEMPTS; attempt += 1) {
+    const state = await options.fold();
+    const foldedValidity = await computeIndexValidity(options);
+    if (!sameIndexValidity(validity, foldedValidity)) {
+      validity = foldedValidity;
+      continue;
+    }
+    const result = reindex({ index: options.index, state, now: options.now, validity: serializeIndexValidity(foldedValidity) });
+    const publishedValidity = await computeIndexValidity(options);
+    if (sameIndexValidity(foldedValidity, publishedValidity)) return result;
+    validity = publishedValidity;
+  }
+
+  // Never publish an index whose input changed throughout every refresh
+  // attempt. Mark it dirty so a later caller cannot use the stale contents
+  // through the synchronous query API, then let the caller retry.
+  try {
+    invalidateIndex(options.index);
+  } catch {
+    // Preserve the typed freshness failure even if the cache itself is no
+    // longer writable.
+  }
+  throw new CanKanError(IndexErrorCodes.STALE, "index inputs changed during refresh; retry the query");
 }
 
 export interface FreshTicketQueryOptions extends EnsureIndexFreshOptions {

@@ -79,6 +79,42 @@
  * this graph can see: `resolveTier1` always resolves it to `undefined` (a
  * leaf), and the walk below only ever follows a same-type edge whose `to` is
  * resolved.
+ *
+ * ## Two different "unresolved," two different fail directions (Ruling R10, fix round 1)
+ *
+ * `indexById` below fails closed on a same-normalized-id collision between
+ * two *distinct* input nodes (`ck-1` and `CK-1`, say) exactly the way
+ * `state/queries.ts::buildIdentifierIndex` fails closed on a same-tier
+ * collision: the colliding key is never set in `nodesByKey`, so
+ * `resolveTier1` returns `undefined` for it, indistinguishable at that layer
+ * from an id that names no ticket at all. `buildGraph` additionally reports
+ * every such key on `DependencyGraph.ambiguousIds`, because the two facts
+ * below need **opposite** handling, and a caller cannot tell them apart from
+ * `resolveTier1`'s `undefined` alone:
+ *
+ * - **Unresolved-because-unknown** (no ticket declares this id): failing
+ *   closed means treating it as **still outstanding** — `blockers()` reports
+ *   it, `ready.ts` reports the ticket naming it as blocked. This is the
+ *   right direction because "blocked" is safe to over-report to a human
+ *   (Ruling R1's whole point).
+ * - **Unresolved-because-ambiguous** (two tickets declare this id): treating
+ *   it as "still outstanding" is *also* correct for `blockers()` — same
+ *   fail-closed direction, nothing to change there. But `wouldCreateCycle`
+ *   is not a read-only report; it gates whether `dep add` proceeds. If it
+ *   treated an ambiguous endpoint as an ordinary unresolved leaf (the way
+ *   `blockers()` does), it would return `false` — "no cycle, proceed" — for
+ *   a proposed edge that might close a real loop through whichever of the
+ *   colliding tickets is the intended one. That is the *fail-open*
+ *   direction this whole ruling exists to close, so `wouldCreateCycle`
+ *   instead **refuses** (returns `true`) whenever either endpoint of the
+ *   proposed edge is one of `ambiguousIds` — it never falls through to
+ *   treating an ambiguous id as a leaf.
+ *
+ * `buildGraph` itself never throws on a collision — it records
+ * `ambiguousIds` and still produces a usable graph for every other ticket,
+ * mirroring `state/fold.ts`'s own partition-and-report pattern
+ * (`BoardState.duplicateTicketIds`) rather than refusing the whole board
+ * over one ambiguous id.
  */
 
 import type { TicketId } from "../types";
@@ -146,6 +182,18 @@ export interface DependencyEdge {
 export interface DependencyGraph {
   readonly edges: readonly DependencyEdge[];
   readonly nodesByKey: ReadonlyMap<string, DependencyGraphNode>;
+  /**
+   * Normalized ids claimed by more than one distinct input node (Ruling
+   * R10, fix round 1) — sorted for deterministic output, analogous to
+   * `state/fold.ts`'s `BoardState.duplicateTicketIds`. `resolveTier1`
+   * already resolves any of these to `undefined` (indistinguishable from an
+   * unknown id at that layer, and `blockers()` reports both the same way —
+   * still outstanding), but `wouldCreateCycle` reads this field directly to
+   * refuse rather than treat an ambiguous endpoint as a leaf — see this
+   * file's header for why the two "unresolved" facts need opposite
+   * handling there.
+   */
+  readonly ambiguousIds: readonly string[];
 }
 
 /**
@@ -164,13 +212,57 @@ export function normalizeDependencyId(id: string): string {
   return id.toLowerCase();
 }
 
-/** Indexes `items` by `normalizeDependencyId(item.id)` — the one lookup structure both `buildGraph` and `ready.ts` build over a ticket list. */
-export function indexById<T extends { readonly id: TicketId }>(items: readonly T[]): ReadonlyMap<string, T> {
-  const map = new Map<string, T>();
+/** The result of `indexById` — see that function's own doc. */
+export interface IndexedById<T> {
+  readonly byKey: ReadonlyMap<string, T>;
+  /** Normalized ids claimed by more than one distinct input item — never set on `byKey`. */
+  readonly ambiguousKeys: ReadonlySet<string>;
+}
+
+/**
+ * Indexes `items` by `normalizeDependencyId(item.id)` — the one lookup
+ * structure both `buildGraph` and `ready.ts` build over a ticket list.
+ *
+ * **Fails closed on a same-key collision (Ruling R10, fix round 1).** Two
+ * distinct items whose ids normalize to the same key (`ck-1` and `CK-1`,
+ * say) are a conflict, not a coin flip: a plain last-write-wins `map.set`
+ * in loop order would let array order silently decide which of the two
+ * "wins" the key — reversing the input array would then reverse every
+ * downstream verdict that depended on it, exactly the failure `attack4.ts`
+ * (security review) demonstrated directly against the pre-fix version of
+ * this function. Mirroring `state/queries.ts::buildIdentifierIndex`'s own
+ * discipline: a collided key is **removed from `byKey`** (so `.get()`
+ * returns `undefined` for it, same as an id naming no item at all) and is
+ * instead recorded in `ambiguousKeys`, so a caller that needs to tell "no
+ * item has this id" apart from "two items claim this id" — `buildGraph`'s
+ * `wouldCreateCycle` does, see this file's header — can do so without
+ * re-deriving the collision itself.
+ *
+ * `state/`'s own fold already excludes same-normalized-id tickets from
+ * `BoardState.tickets` (`partitionByDuplicateId`) before `ready.ts` calls
+ * this over `state.tickets`, so a collision there should be unreachable in
+ * practice; this defends `buildGraph`'s own node list, which a caller may
+ * build directly from parsed ticket files without going through the fold's
+ * own dedup first (Ruling R6 — flat `dependencies`/labels are
+ * caller-supplied, and so, transitively, can be the node list itself).
+ */
+export function indexById<T extends { readonly id: TicketId }>(items: readonly T[]): IndexedById<T> {
+  const byKey = new Map<string, T>();
+  const ambiguousKeys = new Set<string>();
   for (const item of items) {
-    map.set(normalizeDependencyId(item.id), item);
+    const key = normalizeDependencyId(item.id);
+    if (ambiguousKeys.has(key)) {
+      continue; // already known to collide -- stays unset, regardless of how many more share it
+    }
+    const existing = byKey.get(key);
+    if (existing === undefined) {
+      byKey.set(key, item);
+    } else if (existing !== item) {
+      byKey.delete(key);
+      ambiguousKeys.add(key);
+    }
   }
-  return map;
+  return { byKey, ambiguousKeys };
 }
 
 /**
@@ -199,9 +291,26 @@ export function resolveTier1<T extends { readonly id: TicketId }>(
   return ticketsByKey.get(normalizeDependencyId(rawId));
 }
 
-/** The de-duplication key for one node's outgoing edge of a given `type`: the resolved target's normalized id when resolvable, else the raw id's normalized form (Ruling R1's worked example — same target via either form is one edge). */
+/**
+ * The de-duplication key for one node's outgoing edge of a given `type`: the
+ * resolved target's normalized id when resolvable, else the raw id's
+ * normalized form (Ruling R1's worked example — same target via either form
+ * is one edge).
+ *
+ * **`JSON.stringify` of a two-element tuple, not a `${type}:${target}`
+ * template (Ruling R13, fix round 1).** `cankanDepSchema.type` is
+ * `z.string()`, not an enum (`ticket/schema.ts:39-44`), so a delimiter-joined
+ * template string is reachable through the real fold: `{type:"blocks:x",
+ * id:"y"}` and `{type:"blocks", id:"x:y"}` both templated to `"blocks:x:y"`
+ * and collided, silently dropping the second edge (`attack2.ts` §H,
+ * verified). `JSON.stringify(["blocks:x", "y"])` and
+ * `JSON.stringify(["blocks", "x:y"])` are two different strings — a JSON
+ * array's own structural delimiters (quoting and escaping the two elements
+ * separately) make two distinct pairs of strings produce distinct output,
+ * which no single joining character can guarantee.
+ */
 function edgeDedupeKey(type: string, rawId: string, to: TicketId | undefined): string {
-  return `${type}:${to !== undefined ? normalizeDependencyId(to) : normalizeDependencyId(rawId)}`;
+  return JSON.stringify([type, to !== undefined ? normalizeDependencyId(to) : normalizeDependencyId(rawId)]);
 }
 
 /**
@@ -215,7 +324,7 @@ function edgeDedupeKey(type: string, rawId: string, to: TicketId | undefined): s
  * `ready.ts`'s concern, not this graph's.
  */
 export function buildGraph(nodes: readonly DependencyGraphNode[]): DependencyGraph {
-  const nodesByKey = indexById(nodes);
+  const { byKey: nodesByKey, ambiguousKeys } = indexById(nodes);
   const edges: DependencyEdge[] = [];
 
   for (const node of nodes) {
@@ -239,7 +348,7 @@ export function buildGraph(nodes: readonly DependencyGraphNode[]): DependencyGra
     }
   }
 
-  return { edges, nodesByKey };
+  return { edges, nodesByKey, ambiguousIds: [...ambiguousKeys].sort() };
 }
 
 /**
@@ -256,6 +365,15 @@ export function buildGraph(nodes: readonly DependencyGraphNode[]): DependencyGra
  * `blockedBy` directly for the typed half rather than relying on this
  * function for it; `blockers` here is a general graph query (useful for a
  * future `dep list`-style command), not the readiness gate itself.
+ *
+ * **An edge whose target id is ambiguous (in `DependencyGraph.ambiguousIds`,
+ * Ruling R10) is treated exactly like an edge whose target names no ticket
+ * at all** — `edge.to` is `undefined` either way, and both fail closed here
+ * as "still outstanding." That is deliberately the *same* handling for both
+ * facts in this read-only query, even though `wouldCreateCycle` below must
+ * treat them differently — see this file's header for why a report-only
+ * query and a gate that decides whether an add proceeds need opposite care
+ * for the same ambiguity.
  */
 export function blockers(graph: DependencyGraph, id: TicketId): readonly DependencyEdge[] {
   const key = normalizeDependencyId(id);
@@ -279,6 +397,17 @@ export function blockers(graph: DependencyGraph, id: TicketId): readonly Depende
  * Otherwise: walk the existing same-type, resolved edges starting at `to`;
  * if that walk can already reach `from`, the proposed edge would close the
  * loop.
+ *
+ * **Refuses (returns `true`) when either `from` or `to` is one of
+ * `graph.ambiguousIds` (Ruling R10, fix round 1) — checked before the
+ * self-loop/walk logic below, for `"blocks"`/`"parent-child"` only.** An
+ * ambiguous id is not an ordinary leaf: `blockers()` may safely treat
+ * "unresolved because ambiguous" the same as "unresolved because unknown"
+ * (both fail closed to "still outstanding" there), but this function decides
+ * whether an add *proceeds* — treating an ambiguous endpoint as a leaf here
+ * would let a cycle-creating add through simply because this graph could not
+ * tell which of the colliding tickets `from`/`to` actually names. See this
+ * file's header for the fuller reasoning.
  */
 export function wouldCreateCycle(
   graph: DependencyGraph,
@@ -292,6 +421,11 @@ export function wouldCreateCycle(
 
   const fromKey = normalizeDependencyId(from);
   const toKey = normalizeDependencyId(to);
+
+  if (graph.ambiguousIds.includes(fromKey) || graph.ambiguousIds.includes(toKey)) {
+    return true;
+  }
+
   if (fromKey === toKey) {
     return true;
   }

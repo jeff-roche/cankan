@@ -96,16 +96,20 @@
  * `state/queries.ts::blockedBy` throws `STATE_TICKET_ID_AMBIGUOUS` (the id
  * is duplicated on the board) and `STATE_TICKET_NOT_IN_BOARD_STATE` (the id
  * is genuinely absent) — opposite facts with opposite remedies. `isReady`
- * calls `blockedBy` first and lets both propagate: no
- * `try { blockedBy(...) } catch { return false }`, and no third `deps/`
- * error code wrapping either one. Collapsing "duplicated" into an ordinary
- * negative readiness answer would hide the fact that the caller's board data
- * is ambiguous behind a plain "not ready." Calling `blockedBy` unconditionally
- * first has a second benefit: by the time it returns without throwing,
- * `ticketId` is guaranteed to match **exactly one** entry in
- * `state.tickets` (contract 3 — an id absent from `state.tickets` may be
- * duplicated, never assume "missing"), so this function's own lookup right
- * after it should always find that same entry.
+ * calls `blockedBy` before consulting `state.tickets` at all and lets both
+ * propagate: no `try { blockedBy(...) } catch { return false }`, and no
+ * third `deps/` error code wrapping either one. Collapsing "duplicated" into
+ * an ordinary negative readiness answer would hide the fact that the
+ * caller's board data is ambiguous behind a plain "not ready." (The
+ * `excludedLabels`/`labelsFor` misconfiguration guard below runs *before*
+ * `blockedBy`, since it is a caller-programming-error check independent of
+ * `ticketId`/board state — see Ruling R11's companion guard — but every
+ * board-state-dependent check still goes through `blockedBy` first.) Calling
+ * `blockedBy` before that lookup has a second benefit: by the time it
+ * returns without throwing, `ticketId` is guaranteed to match **exactly
+ * one** entry in `state.tickets` (contract 3 — an id absent from
+ * `state.tickets` may be duplicated, never assume "missing"), so this
+ * function's own lookup right after it should always find that same entry.
  *
  * **That "should always find it" is now an enforced check, not an unchecked
  * cast (fix round 1, Ruling R15).** `blockedBy` resolves its own subject by
@@ -183,9 +187,11 @@ function blockerDedupeKey(rawId: string, resolvedTicket: { readonly id: TicketId
  * — see `ReadinessVerdict`. Read this file's header before wiring this into
  * anything that acts automatically: the result is advisory.
  *
- * `state.blockedBy(state, ticketId)` is called first, unconditionally, and
- * never wrapped in `try`/`catch` (Ruling R2) — both its error codes escape
- * to this function's own caller with their `code` intact.
+ * `state.blockedBy(state, ticketId)` is called before any lookup into
+ * `state.tickets` (after only the caller-programming-error options guard,
+ * fix round 1, Ruling R11) and never wrapped in `try`/`catch` (Ruling R2) —
+ * both its error codes escape to this function's own caller with their
+ * `code` intact.
  */
 export function isReady(state: BoardState, ticketId: TicketId, options: IsReadyOptions): ReadinessVerdict {
   const excludedLabels = options.excludedLabels ?? NO_LABELS;

@@ -14,7 +14,7 @@ import {
   type ParsedTicket,
   type TicketIdLookupKey,
 } from "../ticket/index";
-import type { BoardKind, BoardRef, TicketId } from "../types";
+import type { BoardRef, TicketId } from "../types";
 import { StoreErrorCodes } from "./errors";
 
 /**
@@ -190,25 +190,24 @@ export interface OpenTicketStoreOptions {
   readonly board: BoardRef;
   /**
    * Absolute, canonical paths of the repository's git directories, for ADR
-   * 0002 step (c). Required, with an explicit empty array as the escape
-   * hatch for the personal board's "no git directory" (see the paragraph
-   * below — `[]` is not legal for a repo-kind board) — the same shape
-   * `loadBoardConfig`/`loadConfig` established for "a field a caller can
-   * simply forget becomes a silently-skipped security check" (Ruling R3).
-   * Each entry must already be canonical (`fs.realpath`'d), not merely
-   * absolute — see `assertValidGitDirs`.
+   * 0002 step (c). **At least one entry is required, for every board,
+   * with no exemption** (fix round 3, Important — see `assertValidGitDirs`
+   * for the full history of why an exemption is not safe here).
    *
-   * **The empty array is only a legal escape hatch for `board.kind ===
-   * "personal"`** (fix round 2, Important — a security reviewer executed
-   * the gap: `gitDirs: []` against a `kind: "repo"` board disables step (c)
-   * entirely, including the by-name `.git` check, which lives only in
-   * `board/ref.ts` and a hand-built `BoardRef` skips). A repo board that
-   * genuinely has no git directory cannot exist — `resolveBoard()` only
-   * ever produces a `kind: "repo"` `BoardRef` for something `walkForBoard`
-   * found by walking up from inside a real repository — so an empty array
-   * for a repo board is never "correctly asserting there is no git
-   * directory," always a caller that forgot to wire one in. See
-   * `assertValidGitDirs`.
+   * 1A's Ruling R3 and fix round 2 each tried a narrower escape hatch
+   * instead of this flat requirement — an empty array meaning "no git
+   * directory" (Ruling R3), then an empty array exempted only for
+   * `kind: "personal"` (fix round 2) — and each was found to reopen ADR
+   * 0002 step (c) entirely: a hostile `tickets_dir` resolving inside the
+   * repository's real git directory (the `git init --separate-git-dir`
+   * reproduction, R2) passes cleanly whenever `gitDirs` is empty, since
+   * the by-name `.git` check lives only in `board/ref.ts` and neither a
+   * hand-built `BoardRef` nor the `kind` label it carries changes that.
+   * Every caller of this function must supply the git directory it is
+   * asking this store to defend against, including a caller opening the
+   * personal board — see `assertValidGitDirs`'s doc comment for why "a
+   * personal-board caller never holds a `GitAdapter`" turned out to be
+   * false.
    */
   readonly gitDirs: readonly string[];
 }
@@ -242,7 +241,7 @@ export interface OpenTicketStoreOptions {
  */
 export async function openTicketStore(options: OpenTicketStoreOptions): Promise<TicketStore> {
   const { board, gitDirs } = options;
-  await assertValidGitDirs(board.kind, gitDirs);
+  await assertValidGitDirs(gitDirs);
   const ticketsDir = board.ticketsDir;
   const guardWrite = (): Promise<string> => assertTicketsDirContained(ticketsDir, board.root, gitDirs);
   return {
@@ -271,24 +270,45 @@ export async function openTicketStore(options: OpenTicketStoreOptions): Promise<
  * making the field required rather than defaulting it. Checked eagerly so
  * the failure is loud and immediate, not a mystery inside 1B's later logic.
  *
- * **The empty array is refused for `kind: "repo"` boards** (fix round 2,
- * Important). A security reviewer executed the gap this closes: `gitDirs:
- * []` disables step (c) *entirely* for a repo board — not merely "no extra
- * git-directory to exclude," but zero git-directory defence at all, since
- * the by-name `.git` check lives only in `board/ref.ts` and a hand-built
- * `BoardRef` (or, worse, the *legitimate* `resolveBoard()` path with a
- * hostile checked-in `tickets_dir` — see R2/the ADR 0002 amendment) skips
- * it. `[]` is only ever correct for `kind: "personal"`: the personal board
- * is itself a git repo (CONCEPT.md §6c), but a caller opening it is never
- * expected to also be holding a `GitAdapter` for it, so `[]` there really
- * does mean "no exclusion, by design," not "forgot to wire one in." A repo
- * board with no git directory cannot legitimately exist — `resolveBoard()`
- * only ever produces `kind: "repo"` for something found by walking up from
- * inside a real repository — so this is a forgotten wire-up, not a
- * legitimate empty state, every time it happens for a repo board. This is
- * Ruling R3's own rationale ("a field a caller can simply forget becomes a
- * silently-skipped security check") applied to the forgettable *value* R3
- * failed to anticipate.
+ * **At least one entry is required, for every board, with no exemption**
+ * (fix round 3, Important — the third and, this time, structural attempt
+ * at this same guarantee):
+ *
+ * - **Ruling R3** (1A) first made `gitDirs` a required field with `[]` as
+ *   an explicit "no git directory" escape hatch.
+ * - **Fix round 2** found `[]` disables step (c) *entirely* for a repo
+ *   board — not merely "no extra git directory to exclude," but zero
+ *   git-directory defence at all, since the by-name `.git` check lives
+ *   only in `board/ref.ts` and a hand-built `BoardRef` skips it. That
+ *   round's fix exempted only `kind === "personal"` from the non-empty
+ *   requirement, reasoning that a caller opening the personal board is
+ *   never expected to also hold a `GitAdapter` for it.
+ * - **Fix round 3** found that reasoning false, and the exemption itself
+ *   exploitable two different ways. First, false: `personal.ts`'s own
+ *   file header documents that any caller who has reached a *usable*
+ *   personal board (`needsGitInit: false`, or a caller that has already
+ *   run `git init` in response to `needsGitInit: true`) has, by
+ *   construction, already had to hold `git/index.ts` to get there — so it
+ *   always has a `GitAdapter` available for exactly the case where a real
+ *   `gitDirs` matters. Second, exploitable: the security reviewer
+ *   reproduced the original step (c) gap *verbatim* by simply labelling
+ *   the same hostile board `kind: "personal"` instead of `"repo"` — and,
+ *   separately, showed the `kind`-keyed check itself could be bypassed by
+ *   any value that is not the exact literal string `"repo"`
+ *   (`undefined`, `null`, `""`, `"Repo"`, ...), since `BoardKind` is a
+ *   compile-time-only type with no runtime validation anywhere upstream
+ *   of this function — precisely the class of bad value this function's
+ *   very first paragraph above already exists to catch for `gitDirs`
+ *   itself, just not yet applied to the parameter the exemption was keyed
+ *   on.
+ *
+ * The fix removes the exemption, and the `kind` parameter that carried
+ * it, entirely — rather than validating `kind` at runtime — because a
+ * check that cannot be keyed on a bad value cannot be bypassed by one:
+ * this closes the whole class (every current and future `BoardKind`, and
+ * anything a JS caller could pass instead of one) at once, rather than
+ * chasing each bad value individually the way a runtime `kind` guard
+ * would have needed to.
  *
  * Each entry is further required to be **canonical** — `fs.realpath`'d,
  * not merely absolute (1B, work item 2b.1, tightened from "absolute" alone
@@ -310,17 +330,14 @@ export async function openTicketStore(options: OpenTicketStoreOptions): Promise<
  * exist," fix round 2 Minor 4). This makes the function asynchronous
  * (fix round 1's version was synchronous).
  */
-async function assertValidGitDirs(kind: BoardKind, gitDirs: readonly string[]): Promise<void> {
+async function assertValidGitDirs(gitDirs: readonly string[]): Promise<void> {
   if (!Array.isArray(gitDirs)) {
-    throw new CanKanError(
-      ErrorCodes.USAGE,
-      "gitDirs must be an array — pass [] to assert there is no git directory (personal boards only)",
-    );
+    throw new CanKanError(ErrorCodes.USAGE, "gitDirs must be an array with at least one entry");
   }
-  if (kind === "repo" && gitDirs.length === 0) {
+  if (gitDirs.length === 0) {
     throw new CanKanError(
       ErrorCodes.USAGE,
-      "A repo-kind board must supply at least one git directory in gitDirs -- [] is only valid for the personal board, which has none to exclude by design",
+      "gitDirs must include at least one git directory -- every board this store can be opened for has one",
     );
   }
   for (const dir of gitDirs) {
@@ -891,6 +908,30 @@ async function removeTicket(ticketsDir: string, lookup: string): Promise<void> {
  * earlier, in the kernel, rather than relying solely on the `realpath`
  * check below to catch it after the fact — the residual window is the same
  * either way; this is defence in depth, not a distinct bug fix.
+ *
+ * **The `realpath(archiveDir)` equality check's coverage status, stated
+ * precisely (fix round 3, Minor — do not delete this check as dead code,
+ * and do not assume a passing suite still exercises it deterministically):**
+ * fix round 2's Minor 1 made every caller of this function receive an
+ * already-`realpath`'d `ticketsDir` (`openTicketStore`'s `guardWrite()`
+ * closure resolves it once, up front, and passes the resolved value down
+ * to `writeTicket`/`removeTicket`/`archiveTicket`), which made the
+ * *hand-built-non-canonical-`ticketsDir`* route to this branch structurally
+ * unreachable — there is, as of that fix, no test in this suite that
+ * deterministically drives a mismatch here anymore. That does **not** mean
+ * this check is decorative. It is the *only* defence against a second,
+ * narrower race than the `lstat`/`isDirectory` branch above can see: a
+ * symlink swapped into `archive` in the instant *between* this function's
+ * own `lstat` call and its `realpath` call — after the existence check has
+ * already passed, before this equality check runs. The `lstat`/
+ * `isDirectory` branch cannot catch that window at all, by construction
+ * (it runs once, earlier); this branch is what catches it. Separately,
+ * this branch would also catch a plain non-canonical `ticketsDir` passed
+ * in directly, the way fix round 1's original test drove it — Minor 1 is
+ * why no *current* caller does that (every caller of this internal
+ * function already resolves `ticketsDir` first), not a guarantee that
+ * will always hold for every future caller this function might gain. Keep
+ * it.
  */
 async function ensureArchiveDir(ticketsDir: string): Promise<string> {
   const archiveDir = join(ticketsDir, ARCHIVE_DIR_NAME);

@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { makeTempRepo, type TempRepo } from "../../../test-utils/src/tempRepo";
 import { withEnv } from "../../../test-utils/src/withEnv";
-import { BoardErrorCodes, resolveBoard } from "../../src/board/index";
+import { BoardErrorCodes, ensurePersonalBoard, resolveBoard } from "../../src/board/index";
 import { buildBoardRef } from "../../src/board/ref";
 import { ErrorCodes, isCanKanError } from "../../src/errors";
 import { createGitAdapter } from "../../src/git/index";
@@ -17,7 +17,7 @@ import {
   type TicketStore,
 } from "../../src/store/ticketStore";
 import { TicketErrorCodes, parseTicketFile, parseTicketFilename, setCankanBlock, type ParsedTicket } from "../../src/ticket/index";
-import type { BoardRef } from "../../src/types";
+import type { BoardKind, BoardRef } from "../../src/types";
 import { hermeticEnv, writeRepoConfigFile } from "../config/testHelpers";
 
 /**
@@ -94,10 +94,11 @@ async function expectRejectsWithCode(fn: () => Promise<unknown>, code: string): 
 
 /**
  * `gitDirs` is a required, explicit parameter here -- never defaulted to
- * `[]` (fix round 2, Important). `[]` is refused for a `kind: "repo"`
- * board (it disables step (c) entirely), so a default here would just be
- * the exact forgettable, copyable shape the security reviewer found. Every
- * call site names a real value, via `realGitDirsFor` below.
+ * `[]` (fix rounds 2-3, Important). `[]` is refused for every board,
+ * regardless of `kind` (it disables step (c) entirely), so a default here
+ * would just be the exact forgettable, copyable shape the security
+ * reviewer found. Every call site names a real value, via `realGitDirsFor`
+ * below.
  */
 async function openStore(board: BoardRef, gitDirs: readonly string[]): Promise<TicketStore> {
   return openTicketStore({ board, gitDirs });
@@ -497,32 +498,27 @@ describe("ticketStore — missing tickets directory (Ruling R4)", () => {
 
 describe("ticketStore — an unusable tickets directory", () => {
   test("a tickets directory that fails to stat for a reason other than ENOENT raises STORE_TICKETS_DIR_UNAVAILABLE", async () => {
-    const scratch = await mkdtemp(join(tmpdir(), "cankan-store-unavailable-"));
+    // A real git repo (fix round 3: gitDirs is required for every board,
+    // with no per-kind exemption, so this needs a real value to supply --
+    // a bare scratch directory no longer suffices).
+    const repo = await makeTempRepo();
     try {
       // A self-referential symlink: `stat` on it always fails with ELOOP,
       // never ENOENT -- confirmed by direct execution before relying on it
       // here (see the task report).
-      const loopPath = join(scratch, "self-loop");
+      const loopPath = join(repo.dir, "self-loop");
       await symlink(loopPath, loopPath);
       const board: BoardRef = {
-        // `kind: "personal"`, deliberately, though this is a synthetic
-        // scratch directory rather than the real personal board: `scratch`
-        // is not a git repository, so there is no real gitDirs value to
-        // supply, and `kind: "repo"` would now be refused an empty
-        // `gitDirs` at open time (fix round 2) before this test ever
-        // reaches the `list()` call it actually exercises. `kind` plays no
-        // other role in what this test targets (`TICKETS_DIR_UNAVAILABLE`
-        // via `stat`'s `ELOOP`).
-        kind: "personal",
+        kind: "repo",
         name: "loop-board",
-        root: scratch,
+        root: repo.dir,
         ticketsDir: loopPath,
         coordinationRef: "refs/cankan/coordination",
       };
-      const store = await openStore(board, []);
+      const store = await openStore(board, await realGitDirsFor(board));
       await expectRejectsWithCode(() => store.list(), StoreErrorCodes.TICKETS_DIR_UNAVAILABLE);
     } finally {
-      await rm(scratch, { recursive: true, force: true });
+      await repo.cleanup();
     }
   });
 });
@@ -546,30 +542,55 @@ describe("ticketStore — write() refuses to guess between duplicate on-disk ids
 
 // ---- openTicketStore's required gitDirs (Ruling R3) ------------------------
 
-describe("openTicketStore — gitDirs is required, with an empty-array escape for the personal board only", () => {
-  test("a repo-kind board with an empty gitDirs array is refused at open (fix round 2, Important) -- [] would otherwise disable step (c) entirely, including the by-name .git check board/ref.ts alone can no longer be relied on for", async () => {
+describe("openTicketStore — gitDirs is required for every board, with no per-kind exemption (fix round 3, Important)", () => {
+  // Fix round 2 exempted `kind: "personal"` from the non-empty-gitDirs
+  // requirement, on the theory that a caller opening the personal board is
+  // never expected to also hold a `GitAdapter` for it. The security
+  // reviewer reproduced the original exploit through that exemption
+  // *verbatim*, through `buildBoardRef` and a real `.cankan/config.yml`,
+  // by simply labelling the same hostile board `kind: "personal"` -- and
+  // separately showed the check that keyed on `kind` could be bypassed by
+  // any value other than the literal string `"repo"` (`undefined`, `null`,
+  // `""`, `"Repo"`, ...), since `BoardKind` is a compile-time-only type
+  // with no runtime validation anywhere upstream. The theory was also
+  // simply false at this layer: `personal.ts`'s own file header documents
+  // that any caller who has reached a *usable* personal board (one where
+  // `needsGitInit` is `false`, or where a prior caller has already run
+  // `git init` in response to `needsGitInit: true`) is, by construction,
+  // a caller who holds `git/index.ts` -- so it always has a `GitAdapter`
+  // available for exactly the case where a real `gitDirs` value matters.
+  // Ruling: remove the exemption entirely rather than validate `kind` at
+  // runtime -- a check that cannot be keyed on a bad value cannot be
+  // bypassed by one, closing the entire class (any current or future
+  // `BoardKind`, and anything a JS caller could pass instead of one) at
+  // once rather than chasing each bad value individually.
+  test("gitDirs: [] is refused regardless of kind -- including kind values a hostile or buggy caller could pass that a kind-keyed check would have missed entirely", async () => {
     await withTestBoard(async ({ board }) => {
-      await expectRejectsWithCode(() => openTicketStore({ board, gitDirs: [] }), ErrorCodes.USAGE);
+      const hostileKinds: unknown[] = ["repo", "personal", undefined, null, "", "Repo", "REPO"];
+      for (const kind of hostileKinds) {
+        const hostileBoard = { ...board, kind: kind as BoardKind };
+        await expectRejectsWithCode(() => openTicketStore({ board: hostileBoard, gitDirs: [] }), ErrorCodes.USAGE);
+      }
     });
   });
 
-  test("a personal-kind board with an empty gitDirs array is accepted, and the store still works end to end", async () => {
+  test("the personal board works end to end once its own repository is initialized (git init, the M3.2 boundary personal.ts documents) and a real gitDirs is supplied", async () => {
     await withEnv(undefined, async () => {
-      const repo = await makeTempRepo();
-      try {
-        // `kind: "personal"` is the only legal home for `gitDirs: []` (fix
-        // round 2) -- the personal board is itself a git repo (CONCEPT.md
-        // §6c), but a caller opening it is never expected to also be
-        // holding a `GitAdapter` for it, so `[]` here really does mean "no
-        // exclusion, by design," not "forgot to wire one in."
-        const board = await buildBoardRef({ kind: "personal", name: "personal", root: repo.dir });
-        await mkdir(board.ticketsDir, { recursive: true });
-        const store = await openTicketStore({ board, gitDirs: [] });
-        await store.write(newTicket("ck-personal1", "Personal board ticket"));
-        expect((await store.get("ck-personal1"))?.id as string).toBe("ck-personal1");
-      } finally {
-        await repo.cleanup();
-      }
+      const { board, needsGitInit } = await ensurePersonalBoard({ env: hermeticEnv() });
+      // A fresh $XDG_DATA_HOME (from `withEnv`) has never had `git init`
+      // run in it -- confirming this test actually exercises the
+      // "caller must git init before this is safe to touch" boundary
+      // `personal.ts`'s file header describes, not a board that already
+      // happened to be a repo.
+      expect(needsGitInit).toBe(true);
+      runGit(board.root, ["init", "-b", "main"]);
+      runGit(board.root, ["config", "user.name", "CanKan Test"]);
+      runGit(board.root, ["config", "user.email", "test@cankan.invalid"]);
+      runGit(board.root, ["commit", "--allow-empty", "-m", "initial commit"]);
+
+      const store = await openTicketStore({ board, gitDirs: await realGitDirsFor(board) });
+      await store.write(newTicket("ck-personal1", "Personal board ticket"));
+      expect((await store.get("ck-personal1"))?.id as string).toBe("ck-personal1");
     });
   });
 
@@ -662,8 +683,8 @@ describe("ticketStore — ADR 0002 step (b) write-time re-check and step (c) git
           coordinationRef: "refs/cankan/coordination",
         };
         // A real, non-empty gitDirs -- unrelated to what this test targets
-        // (root-escape, not git-dir exclusion), but required now that a
-        // repo-kind board refuses `[]` (fix round 2, Important).
+        // (root-escape, not git-dir exclusion), but required now that every
+        // board refuses `[]` (fix rounds 2-3, Important).
         const store = await openTicketStore({ board, gitDirs: await realGitDirsFor(board) });
         const targetPath = join(outside, "ck-escape1 - Escape.md");
 
@@ -836,7 +857,7 @@ describe("ticketStore — ADR 0002 step (b) write-time re-check and step (c) git
 
         // A real, non-empty gitDirs -- unrelated to what this test targets
         // (the TOCTOU symlink swap, not git-dir exclusion), but required
-        // now that a repo-kind board refuses `[]` (fix round 2, Important).
+        // now that every board refuses `[]` (fix rounds 2-3, Important).
         const store = await openTicketStore({ board, gitDirs: await realGitDirsFor(board) });
         const targetPath = join(outside, "ck-escape4 - Escape.md");
 
@@ -900,27 +921,25 @@ describe("ticketStore — guardWrite() passes the realpath'd ticketsDir through 
       // directory it refused to use was genuinely, correctly inside the
       // real tickets directory the whole time. This test now demonstrates
       // the fix directly instead.
-      const base = await realpath(await mkdtemp(join(tmpdir(), "cankan-store-realpath-through-")));
+      // A real git repo (fix round 3: gitDirs is required for every board,
+      // with no per-kind exemption -- a bare scratch directory no longer
+      // suffices).
+      const repo = await makeTempRepo();
       try {
-        const actualTickets = join(base, "actual-tickets");
+        const actualTickets = join(repo.dir, "actual-tickets");
         await mkdir(actualTickets);
-        const ticketsLink = join(base, "tickets-link");
+        const ticketsLink = join(repo.dir, "tickets-link");
         await symlink(actualTickets, ticketsLink);
 
         const board: BoardRef = {
-          // `kind: "personal"` only to route around the repo-kind gitDirs
-          // requirement (fix round 2, Important) -- `base` is not a git
-          // repository, and this test targets ticketsDir canonicalization
-          // carrying through to every write path, not git-directory
-          // exclusion.
-          kind: "personal",
+          kind: "repo",
           name: "mismatch",
-          root: base,
+          root: repo.dir,
           // Non-canonical on purpose: a symlink, not its resolved target.
           ticketsDir: ticketsLink,
           coordinationRef: "refs/cankan/coordination",
         };
-        const store = await openTicketStore({ board, gitDirs: [] });
+        const store = await openTicketStore({ board, gitDirs: await realGitDirsFor(board) });
 
         const written = await store.write(newTicket("ck-mismatch1", "Archive mismatch"));
         // Landed directly under the resolved, canonical directory -- never
@@ -934,7 +953,7 @@ describe("ticketStore — guardWrite() passes the realpath'd ticketsDir through 
         expect(onDisk.length).toBeGreaterThan(0);
         expect(await store.get("ck-mismatch1")).toBeUndefined();
       } finally {
-        await rm(base, { recursive: true, force: true });
+        await repo.cleanup();
       }
     });
   });

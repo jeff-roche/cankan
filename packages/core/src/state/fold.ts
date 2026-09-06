@@ -50,12 +50,17 @@
  * - Expiry is computed from the **reader's own first-observation time**:
  *   `firstSeen(eventId) + leaseTtlMs` vs `now` (CONCEPT.md §4:163, ADR 0001
  *   fm7).
- * - The live lease is anchored on the **most recent** `claim`/`takeover`,
- *   or a `renew` **from the same actor as the current anchor** (by chain
- *   position — see below and `resolveLeaseAnchor`'s own doc for the full
- *   state machine, including why a `renew` with no unended incumbent, or
- *   from a different actor than the incumbent's, is not folded in at all —
- *   Rulings M1/M2, security review). A qualifying `renew` genuinely extends
+ * - The live lease is anchored on the **most recent** `claim`/`takeover`;
+ *   a `renew` extends it when it is either the very **first** lease-affecting
+ *   event visible in this call's `events` (its own `claim`/`takeover` may
+ *   simply have aged out of the caller's read window — see
+ *   `resolveLeaseAnchor`'s own doc, Ruling L8, security review, for why
+ *   over-honoring here is the safe direction) or when it names the **same
+ *   actor as the current anchor** (Ruling M2). A `renew` following a
+ *   *visible* `release`/`close`/`expire` mints nothing (Ruling M1's real
+ *   content), and a cross-actor `renew` against a *visible* anchor neither
+ *   extends nor reassigns it (Ruling M2) — see `resolveLeaseAnchor`'s own
+ *   doc for the full state machine. A qualifying `renew` genuinely extends
  *   the lease: its own `firstSeen`, not the original claim's, is what `now`
  *   is compared against.
  * - A missing `firstSeen` entry (an anchoring event this reader never
@@ -519,26 +524,72 @@ type LeaseAnchorEvent = Extract<Event, { event: LeaseAnchorKind }>;
  *   reclaim should even reach this fold as a plain `claim` at all is
  *   M2.10's write-protocol question, not this fold's to answer by
  *   inventing a read-side rule).
- * - `renew` extends the current anchor **only when there is one and its
- *   actor matches** (M1/M2, security review): a `renew` with no unended
- *   incumbent in chain order mints a lease from nothing, and a `renew`
- *   from a different actor than the incumbent's would silently reassign
- *   the lease to whoever last pushed a `renew` — `actor` is not an
- *   authenticated identity, so this is not a security boundary, but it
- *   costs nothing to refuse both: an unqualified `renew` is simply not
- *   folded in, leaving the prior anchor (if any) exactly as it was.
+ * - `renew` extends the current anchor when its actor matches the current
+ *   one (Ruling M2, security review: a `renew` from a *different* actor
+ *   than the incumbent's would silently reassign the lease to whoever last
+ *   pushed a `renew` — `actor` is not an authenticated identity, so this is
+ *   not a security boundary, but it costs nothing to refuse it; the renew
+ *   is simply not folded in, leaving the prior anchor exactly as it was),
+ *   **or when it is the very first lease-affecting event in `leaseAffecting`
+ *   at all** (Ruling L8, security review — see below for why this is a
+ *   correction of an earlier, over-tightened M1, not new content). A
+ *   `renew` that is neither (no anchor yet, and not the first event this
+ *   walk has seen at all) mints nothing — that is M1's real, retained
+ *   content: a lease a *visible* `release`/`close`/`expire` has already
+ *   ended does not come back from a bare `renew`.
+ *
+ * **Ruling L8 — the original M1 ("a renew with no unended incumbent mints
+ * nothing," unconditionally) broke honest actors.** `leaseAffecting` is
+ * whatever slice of the log `events` happens to cover — in practice
+ * `read()`'s window, `trailingMonths` (default 2). A ticket claimed, then
+ * renewed on a schedule for long enough, eventually has its *original*
+ * `claim` age out of that window while the `renew`s remain visible. Under
+ * the original M1, every reader — including the actor who actually holds
+ * the ticket — would then see `leaseAffecting` start with a `renew` and no
+ * preceding anchor, fold `lease: undefined`, and let a second actor claim
+ * the same ticket: two workers on one ticket, no attacker required,
+ * reproduced directly against this fix. The fold cannot tell "no claim ever
+ * happened" apart from "the claim aged out of my caller's window" — it only
+ * ever sees `leaseAffecting`, never the full history — so treating a
+ * `renew` at the very start of that slice as anchoring is the only
+ * available fail-safe direction for a *mutual-exclusion* primitive: it
+ * over-honors a lease that might already be long gone (a stall — the
+ * ticket looks held a little longer than strictly necessary) rather than
+ * under-honoring one that is very much still held (a double-claim). This
+ * mirrors the fold's other window-truncation gaps (documented above: the
+ * alias graph loses aliases older than the read window) with one difference
+ * worth naming explicitly: those are display/readiness concerns, and this
+ * is the mutual-exclusion primitive itself, which is exactly why the safe
+ * default here is "assume held," not "assume free."
+ *
+ * A concrete trace worth keeping in mind: `events` = `[claim(alice),
+ * release]` (both now outside the window) followed by `renew(alice)`
+ * (inside the window). This function sees only the `renew`, folds it as a
+ * fresh anchor, and reports the ticket as held by alice — even though the
+ * `release` genuinely ended that lease. This is a **stall** (alice's own
+ * client will keep renewing a lease nobody contests, and the ticket simply
+ * never frees up until she stops), not a race: no second actor can be
+ * admitted to hold the same ticket at the same time by this path, because
+ * `release` was real and in the past — there is nothing left to double
+ * with. Accepted as the cost of not under-honoring the case that matters.
+ *
+ * The near-zero security content the original M1 was trying to add is
+ * covered elsewhere already: a bare `renew(mallory)` with no incumbent at
+ * all gives Mallory nothing a bare `claim(mallory)` doesn't already give
+ * her, since M3 (above) makes `claim`/`takeover` anchor unconditionally
+ * regardless of any existing incumbent.
  */
 function resolveLeaseAnchor(leaseAffecting: readonly EventRecord[]): LeaseAnchorEvent | undefined {
   let anchor: LeaseAnchorEvent | undefined;
 
-  for (const record of leaseAffecting) {
-    const event = record.event;
+  for (let i = 0; i < leaseAffecting.length; i++) {
+    const event = (leaseAffecting[i] as EventRecord).event;
     if (event.event === "release" || event.event === "close" || event.event === "expire") {
       anchor = undefined;
     } else if (event.event === "claim" || event.event === "takeover") {
       anchor = event;
     } else if (event.event === "renew") {
-      if (anchor !== undefined && anchor.actor === event.actor) {
+      if (i === 0 || (anchor !== undefined && anchor.actor === event.actor)) {
         anchor = event;
       }
     }
@@ -615,64 +666,177 @@ function foldStatusAndClose(bucket: readonly EventRecord[]): StatusFold {
 // ============================================================================
 
 /**
- * Resolves every node in `edges` (the `from -> to` redirect graph) to its
- * final target, memoizing as it goes so the whole graph is resolved in
- * amortized-linear time — **not** one from-scratch walk per node (I2,
- * security review: the original per-call walk was O(N) per node and this
- * function is called once per node, making the whole build O(N²); measured
- * directly at N=16,000 that was ~4.7s for `foldState` alone, extrapolating
- * to tens of seconds at a realistic board size, from a blob any contributor
- * can push to).
+ * Resolves every node in `edges` (the `from -> to` redirect graph, out-degree
+ * at most 1 per node) to its final target, in one amortized-linear pass —
+ * **not** one from-scratch walk per node (I2, security review: the original
+ * per-call walk was O(N) per node and called once per node, making the whole
+ * build O(N²); measured directly at N=16,000, ~4.7s for `foldState` alone,
+ * from a blob any contributor can push to).
  *
- * Each call to the inner `resolve` walks forward from `start`, recording
- * every node it passes through in `path`, until it hits a node whose target
- * is already cached (an earlier `resolve` call settled it) or a node it has
- * already visited **on this walk** (a cycle or self-loop — the same
- * "stop the moment a node would be revisited" guard the original
- * `resolveAliasTarget` used, so a genuine cycle or a self-loop that reached
- * this module despite `aliasEventSchema` rejecting one at the boundary
- * still terminates, unchanged from before). Once the final target is known,
- * every node recorded in `path` is cached to it too (path compression), so
- * a later `resolve` call starting from any of them is O(1).
+ * **The semantics being reproduced, node by node, are the ones a fresh,
+ * from-scratch walk per node would give** (the pre-I2-fix `resolveAliasTarget`,
+ * preserved unmodified below as a private reference implementation the
+ * memoized version is tested against): walk forward from `start`, stop the
+ * moment the next step would revisit a node already seen **on this walk**,
+ * and return the last node reached before that. On an acyclic chain that
+ * ends at a true sink (a node with no outgoing edge), every node on the
+ * chain resolves to that sink — the ordinary, unsurprising case. On a
+ * *cycle*, this per-node walk has a real consequence: starting from a
+ * different node on the same cycle can give a different answer (each node
+ * resolves to *its own predecessor* on the cycle, since that is the last
+ * new node its own walk reaches before it would revisit itself) — see
+ * `resolveCycleAndTail`'s own doc for the worked derivation.
+ *
+ * **The bug this replaced (Critical, fix round 3, security review):** an
+ * earlier version of this function cached whatever node a walk happened to
+ * stop at — including a stop caused by *hitting a cycle*, not a validated
+ * sink — and let a *later* walk short-circuit onto that cached value as if
+ * it were stable. For a 2-node cycle `a <-> b`, that made the result depend
+ * on which node's `resolve()` call happened to run first, which in turn
+ * depended on event order: `[a→b, b→a]` gave `eventAliases: []` for a real
+ * ticket `a` (silently dropping a genuine alias); `[b→a, a→b]` gave
+ * `eventAliases: ["b", "a"]` for the same ticket (fabricating `a` as its own
+ * alias). Order must never decide an outcome in this module (Ruling R12) —
+ * confirmed fixed below: both orderings now produce the identical map (see
+ * `fold.test.ts`'s "order-independence" test, which asserts exactly that).
+ *
+ * **How the fix achieves O(N) without that shortcut:** a functional graph
+ * (out-degree ≤ 1) decomposes into disjoint "rho" components — zero or more
+ * tail nodes feeding into exactly one cycle. This function walks each
+ * component once: forward-walking with an explicit position-in-this-walk
+ * map (`positionInPath`) to detect a cycle *within the current walk*
+ * (`current` revisiting a node still on the current path — necessarily a
+ * closed cycle, never a false positive, since every node here has ≤ 1
+ * outgoing edge); once found, `resolveCycleAndTail` computes the exact
+ * per-node answer for the whole cycle plus every tail node feeding into it,
+ * in one pass over just that component. A walk that instead lands on an
+ * *already-resolved* node (from an earlier, unrelated component, or a
+ * shared sink) adopts that cached value immediately — safe, because
+ * `resolved` only ever holds values this function has already fully
+ * validated (a true sink, or a settled cycle/tail answer), never a
+ * mid-walk stopping point. Every node is added to `resolved` exactly once,
+ * so total work across every top-level call is O(N).
+ *
+ * Self-loops (which `aliasEventSchema` rejects at the boundary, but this
+ * function does not assume never reaches it) are the degenerate one-node
+ * cycle case and fall out of the same logic unchanged: a node resolves to
+ * itself.
  */
 function resolveAllAliasTargets(edges: ReadonlyMap<string, string>): Map<string, string> {
   const resolved = new Map<string, string>();
 
-  function resolve(start: string): string {
-    const cached = resolved.get(start);
-    if (cached !== undefined) {
-      return cached;
+  function resolveFrom(start: string): void {
+    if (resolved.has(start)) {
+      return;
     }
 
     const path: string[] = [];
-    const visitedThisWalk = new Set<string>([start]);
+    const positionInPath = new Map<string, number>();
     let current = start;
+
     for (;;) {
       const already = resolved.get(current);
       if (already !== undefined) {
-        current = already;
-        break;
+        for (const node of path) {
+          resolved.set(node, already);
+        }
+        return;
       }
+
+      const positionIfOnThisWalk = positionInPath.get(current);
+      if (positionIfOnThisWalk !== undefined) {
+        resolveCycleAndTail(resolved, path, positionIfOnThisWalk);
+        return;
+      }
+
       const next = edges.get(current);
-      if (next === undefined || visitedThisWalk.has(next)) {
-        break;
+      if (next === undefined) {
+        // `current` has no outgoing edge — a genuine sink. Every node on
+        // the path (and `current` itself, for any future walk that lands
+        // on it directly) resolves to it.
+        for (const node of path) {
+          resolved.set(node, current);
+        }
+        resolved.set(current, current);
+        return;
       }
+
+      positionInPath.set(current, path.length);
       path.push(current);
-      visitedThisWalk.add(next);
       current = next;
     }
-
-    resolved.set(start, current);
-    for (const node of path) {
-      resolved.set(node, current);
-    }
-    return current;
   }
 
   for (const from of edges.keys()) {
-    resolve(from);
+    resolveFrom(from);
   }
   return resolved;
+}
+
+/**
+ * Settles the exact per-node answer for one rho component's cycle, and for
+ * every tail node that walked into it, given `path` (the current walk, in
+ * order) and `cycleStart` (the index in `path` where the cycle begins —
+ * `path[cycleStart]` is the cycle's entry node, already revisited by
+ * `path[path.length - 1]`'s own outgoing edge).
+ *
+ * **Cycle members** (`path[cycleStart..]`): per the from-scratch-walk
+ * semantics this function reproduces, a node `x` on a pure cycle resolves
+ * to its own predecessor *within that cycle* — the walk starting at `x`
+ * traverses the whole cycle and stops the instant it would revisit `x`
+ * itself, returning the last new node reached, which is exactly the cycle
+ * member whose own edge points to `x`. Verified by hand for the 2-node case
+ * (`a→b→a`: `a` resolves to `b`, `b` resolves to `a` — each node's own
+ * "one step before closing the loop back to itself") and the 3-node case
+ * (`a→b→c→a`: `a`→`c`, `b`→`a`, `c`→`b`), both matching the reference
+ * `resolveAliasTarget` implementation exactly (see `fold.test.ts`).
+ *
+ * **Tail members** (`path[0..cycleStart-1]`, if any): a node that walks
+ * into the cycle at entry `path[cycleStart]` traverses the tail (all new
+ * nodes, since a functional graph's tail is a simple path with no repeats)
+ * and then goes all the way around the cycle back to the entry node — which
+ * *was* already visited (the moment it stepped onto the tail's end) — so
+ * every tail node resolves to the same fixed value: the cycle's own
+ * predecessor of the entry node. This holds regardless of which tail node a
+ * walk started from, which is what makes memoizing it across every tail
+ * node in one shot correct.
+ */
+function resolveCycleAndTail(resolved: Map<string, string>, path: readonly string[], cycleStart: number): void {
+  const cycle = path.slice(cycleStart);
+  const tail = path.slice(0, cycleStart);
+
+  for (let i = 0; i < cycle.length; i++) {
+    const member = cycle[i] as string;
+    const predecessor = cycle[(i - 1 + cycle.length) % cycle.length] as string;
+    resolved.set(member, predecessor);
+  }
+
+  const entryPredecessor = cycle[cycle.length - 1] as string;
+  for (const node of tail) {
+    resolved.set(node, entryPredecessor);
+  }
+}
+
+/**
+ * The pre-I2-fix reference implementation, preserved for tests only: one
+ * from-scratch walk per call, defining the exact semantics
+ * `resolveAllAliasTargets` above must reproduce for every individual node.
+ * Never called from production code — `buildAliasEventIndex` uses the
+ * memoized version exclusively; this exists so `fold.test.ts` can assert
+ * the two agree, node by node, rather than trusting the memoized version's
+ * self-description.
+ */
+export function resolveAliasTargetForTesting(edges: ReadonlyMap<string, string>, start: string): string {
+  let current = start;
+  const visited = new Set<string>([current]);
+  for (;;) {
+    const next = edges.get(current);
+    if (next === undefined || visited.has(next)) {
+      return current;
+    }
+    visited.add(next);
+    current = next;
+  }
 }
 
 /**
@@ -698,8 +862,18 @@ function buildAliasEventIndex(
 
   const resolvedTargets = resolveAllAliasTargets(edges);
 
+  // Iterate `edges.keys()` — the actual alias identities — rather than
+  // `resolvedTargets`'s own key set: `resolveAllAliasTargets` also caches a
+  // sink node's resolution to itself internally (a real optimization, not a
+  // bug), and a sink is never itself a `from` alias unless it independently
+  // appears as one in `edges`. Trusting `resolvedTargets`'s full key set
+  // here would risk treating that internal bookkeeping as a real alias.
   const result = new Map<TicketIdLookupKey, string[]>();
-  for (const [from, target] of resolvedTargets) {
+  for (const from of edges.keys()) {
+    const target = resolvedTargets.get(from);
+    if (target === undefined) {
+      continue; // unreachable in practice — every `edges` key is resolved by resolveAllAliasTargets — but never trust an internal invariant silently.
+    }
     const targetKey = normalizeTicketIdForComparison(target);
     if (knownIds.has(targetKey)) {
       const list = result.get(targetKey);
@@ -813,17 +987,24 @@ export async function observeAndFold(
   // I3 (security review): only observe an anchor id when its event's
   // `ticket` actually joins to a known `StoredTicket`. `foldState` routes
   // every orphaned event (Ruling R15) straight into `orphanedEvents` and
-  // never reads its `firstSeen` at all, so observing one writes a record
-  // under `$XDG_STATE_HOME` that nothing will ever read back — and nothing
-  // can ever reclaim it either: `discard()` is keyed per ticket lease
-  // (M2.10's), and an id belonging to no ticket has no lease to key it by.
-  // A peer can push an unbounded number of `claim`s naming nonexistent
-  // tickets; skipping the observe call here is what keeps that from
-  // growing the observation store without bound. Fail-safe in the other
-  // direction too: if the ticket file later appears, the clock for that id
-  // simply starts on that later `observeAndFold` call instead — the same
-  // "over-honor the lease, never under-honor it" direction every other
-  // missing-observation case in this module already takes.
+  // never reads its `firstSeen` at all — there is no `TicketState` for an
+  // orphaned event to attach a `lease` to in the first place, so skipping
+  // the observe call here is not an expiry decision at all (contrast the
+  // header's "a missing `firstSeen` resolves to `expired: true`" rule,
+  // which is about an event that DOES have a matching ticket). Observing
+  // one anyway would write a record under `$XDG_STATE_HOME` that nothing
+  // will ever read back — and nothing can ever reclaim it either:
+  // `discard()` is keyed per ticket lease (M2.10's), and an id belonging
+  // to no ticket has no lease to key it by. A peer can push an unbounded
+  // number of `claim`s naming nonexistent tickets; skipping the observe
+  // call here is what keeps that from growing the observation store
+  // without bound. If the ticket file later appears while this same event
+  // id is still inside the caller's read window, that later call's
+  // `observe()` records the CURRENT time as `firstSeen` for an event that
+  // may in truth be much older — a liveness cost (the claim can look
+  // fresher, and so valid for longer, than a fully historical clock would
+  // say), not a mutual-exclusion one, and orthogonal to the header's
+  // missing-`firstSeen`-resolves-to-expired rule above.
   const knownIds = new Set<TicketIdLookupKey>(tickets.map((t) => normalizeTicketIdForComparison(t.id)));
   const idsToObserve = new Set<EventId>();
   for (const record of events) {

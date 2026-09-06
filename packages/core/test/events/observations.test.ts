@@ -1044,16 +1044,68 @@ describe("Fix round 3, Minor 3 -- tightening permissions never follows a symlink
   });
 });
 
-describe("Fix round 3, Ruling R40 -- a failed permission-tightening attempt is fatal on the write path, not the read path", () => {
-  test("firstSeen() still returns the record when the store is on a read-only mount and its directory mode can't be tightened (real bind-mount remount, not simulated)", async () => {
-    // Requires unprivileged user namespaces with mount capability
-    // (`unshare --user --mount --map-root-user`) -- confirmed available in
-    // this sandbox; skip cleanly where it isn't (CI runners may lack it).
-    const probe = Bun.spawnSync(["unshare", "--user", "--mount", "--map-root-user", "true"]);
-    if (probe.exitCode !== 0) {
-      return;
+/**
+ * R53 (orchestrator, macOS CI failure) -- gate the *mechanism*, not the
+ * assertion. `unshare` is a Linux-only utility (it enters new namespaces via
+ * `CLONE_NEWUSER`/`CLONE_NEWNS`, which do not exist on macOS), so
+ * `Bun.spawnSync(["unshare", ...])` throws `ENOENT` there rather than
+ * returning a non-zero exit code -- the fix-round-3 exit-code probe this
+ * test originally shipped with (commit c20e1b5) only distinguished "present
+ * but unusable" (a container without the right namespace privilege, exit
+ * code non-zero) from "present and usable"; it never handled "not present
+ * at all," so the uncaught `ENOENT` failed the test outright on macOS CI
+ * instead of skipping it. (The general shape -- discriminate "expected,
+ * legitimate absence of a capability" from "an unexpected failure" by a
+ * real, specific signal rather than guessing -- mirrors fix round 2's L3
+ * hard-link diagnosis (`HARD_LINK_UNSUPPORTED_CODES`, below): reused here
+ * as a pattern, not as shared code, since the concrete signal -- an errno
+ * on a thrown spawn error, versus an errno on a syscall result -- differs.)
+ *
+ * Both failure shapes are probed for up front, synchronously, at module
+ * load -- *before* `test()` is called -- so the capability (and, when
+ * absent, *why*) can be baked into the test's own title via
+ * `test.skipIf`. That's deliberate: it's what makes a `bun test` run PRINT
+ * a skip line naming `unshare` and Linux, rather than the test either
+ * silently no-op'ing (the previous behaviour, an early `return` with no
+ * assertions and no visible trace) or crashing outright. Neither of those
+ * is acceptable per R53 -- a macOS user can genuinely have a read-only
+ * mount, so R40's behaviour matters there; choosing not to test it must be
+ * legible, not silent.
+ */
+function probeUnshareCapability(): { readonly available: boolean; readonly reason: string } {
+  let probe: ReturnType<typeof Bun.spawnSync>;
+  try {
+    probe = Bun.spawnSync(["unshare", "--user", "--mount", "--map-root-user", "true"]);
+  } catch (error) {
+    // `Bun.spawnSync` throws (rather than returning a non-zero exit code)
+    // when the executable itself isn't found -- confirmed directly, `code:
+    // "ENOENT"` on the thrown error, distinct from every other spawn
+    // failure this function needs to tell apart from a working `unshare`.
+    if (error && typeof error === "object" && "code" in error && (error as { code: unknown }).code === "ENOENT") {
+      return {
+        available: false,
+        reason: "the `unshare` executable was not found on $PATH -- it is Linux-only (unprivileged user/mount namespaces via CLONE_NEWUSER/CLONE_NEWNS have no macOS equivalent), so this is expected on any non-Linux platform",
+      };
     }
+    throw error;
+  }
+  if (probe.exitCode !== 0) {
+    return {
+      available: false,
+      reason: "`unshare --user --mount --map-root-user` is present but exited non-zero -- present-but-unusable (e.g. a container without the needed namespace privilege), same as an absent binary for this test's purposes",
+    };
+  }
+  return { available: true, reason: "" };
+}
 
+const unshareCapability = probeUnshareCapability();
+
+describe("Fix round 3, Ruling R40 -- a failed permission-tightening attempt is fatal on the write path, not the read path", () => {
+  const baseTitle =
+    "firstSeen() still returns the record when the store is on a read-only mount and its directory mode can't be tightened (real bind-mount remount, not simulated)";
+  const title = unshareCapability.available ? baseTitle : `${baseTitle} -- SKIPPED: ${unshareCapability.reason}`;
+
+  test.skipIf(!unshareCapability.available)(title, async () => {
     await withEnv(undefined, async () => {
       const home = process.env.HOME as string;
       const eventId = ulid() as EventId;

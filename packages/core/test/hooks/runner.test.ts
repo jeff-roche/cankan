@@ -44,6 +44,30 @@ function fakeLayer(layer: LoadedLayer["layer"], file: string, hooks: Record<stri
 /** Any pid a test wants killed in `afterEach` even if the test itself fails. */
 const leakedPids: number[] = [];
 
+/**
+ * Timeout for the tests whose hook must WRITE A FILE (a pid, a pgid) and only
+ * then hang, where the assertions read that file back afterwards (#93).
+ *
+ * Those tests have two independent time requirements pulling in opposite
+ * directions, and conflating them is what made one of them flaky:
+ *
+ *  - the timeout must be LONGER than the hook's setup -- forking `ps`,
+ *    writing files, backgrounding a job -- or the kill lands before the file
+ *    exists and the test fails with `ENOENT` from its own `readFile`, which
+ *    looks like a process-group defect and is not one;
+ *  - the timeout must be SHORTER than the hook's hang, so `timedOut` is true
+ *    and the group-kill path under test actually runs.
+ *
+ * Every hook using this sleeps 30s or more, so the second bound has enormous
+ * slack and the first is the only one worth tuning. One second is ~6x the
+ * observed setup cost on a contended CI runner while remaining ~30x inside
+ * the hang, so both hold comfortably.
+ *
+ * This is a SETUP window, not an assertion threshold. Nothing about what
+ * these tests prove depends on its value.
+ */
+const HANG_SETUP_TIMEOUT_MS = 1_000;
+
 afterEach(() => {
   for (const pid of leakedPids.splice(0)) {
     // Both forms: `-pid` in case it is (or was) a process-group leader,
@@ -303,7 +327,22 @@ describe("obligation 3: the timeout kills the whole process group, including gra
         command,
         cwd: dir,
         env: { PATH: process.env.PATH ?? "" },
-        timeoutMs: 150,
+        // #93: this was 150ms and flaked on CI. The failure was never in the
+        // process-group kill this test exists to prove -- it was
+        // `ENOENT: ... open '/tmp/cankan-hooks-grandchild-XXXXXX/gcpid'`
+        // from the test's OWN readFile below. The hook has until the timeout
+        // to fork/exec `ps`, write three files and background a `sleep`; on a
+        // loaded runner it had not reached `echo $! > gcFile` before the kill
+        // landed, so the file the assertions read did not exist yet.
+        //
+        // This widens the SETUP window, and weakens no assertion: the hook
+        // hangs on `sleep 30`, which outlasts any timeout we would pick, so
+        // `timedOut` is still true, the group is still killed the same way,
+        // and pgid/pid/grandchild are still asserted exactly as before. The
+        // 150 was an arbitrary tight value with no semantic content -- the
+        // only thing it needs to be is comfortably longer than the setup and
+        // far shorter than 30s.
+        timeoutMs: HANG_SETUP_TIMEOUT_MS,
       });
 
       expect(result.timedOut).toBe(true);
@@ -380,7 +419,14 @@ describe("obligation 3: the timeout kills the whole process group, including gra
         command,
         cwd: dir,
         env: { PATH: process.env.PATH ?? "" },
-        timeoutMs: 100,
+        // Same setup race as case 5 above (#93), pre-emptively: this hook
+        // also backgrounds a job, writes `$!` to a file, and hangs on
+        // `wait`, and the test below reads that file. It has not been
+        // observed failing, but it is the identical shape on a tighter
+        // window, so it gets the same treatment rather than waiting for it
+        // to flake. The grandchild sleeps 300s, so `timedOut` and every
+        // assertion are unaffected.
+        timeoutMs: HANG_SETUP_TIMEOUT_MS,
       });
 
       expect(result.timedOut).toBe(true);

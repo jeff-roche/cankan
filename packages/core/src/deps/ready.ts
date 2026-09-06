@@ -10,11 +10,12 @@
  * on inherits it in full:
  *
  * **Two pushed events — one `close`, one `alias` — neutralize any `blocks`
- * dependency on the board, permanently until #105 lands.** Push a `close`
- * event naming any real, closable ticket, then push an `alias {from: <the
- * dep id>, to: <that now-closed ticket>}`. The dependency's id now resolves
- * (through `blockedBy`'s alias-aware tiered index) to a closed ticket, so it
- * reads satisfied — for every ticket that names it. The attacker needs
+ * dependency on the board, and do so permanently until #105 lands.** Push a
+ * `close` event naming any real, closable ticket, then push an `alias
+ * {from: <the dep id>, to: <that now-closed ticket>}`. The dependency's id
+ * now resolves (through `blockedBy`'s alias-aware tiered index) to a closed
+ * ticket, so it reads satisfied — for every ticket that names it. The
+ * attacker needs
  * **push access to the coordination ref alone and zero access to the
  * repository itself**.
  *
@@ -38,8 +39,8 @@
  *   `claims.require_ready` (CONCEPT.md:300) is a policy knob built on top of
  *   it. There is no prohibition on M2.10 auto-claiming.
  * - **The rule that replaces it: readiness must never be the sole gate on an
- *   action that is NOT reversible.** Frame this as a test a future consumer
- *   applies to itself, not as a list of blessed callers — before wiring an
+ *   action that is NOT reversible.** This is a test a future consumer
+ *   applies to itself, not a list of blessed callers: before wiring an
  *   `isReady` verdict into anything that acts automatically, ask "is the
  *   action I am gating reversible?" Claiming qualifies precisely *because*
  *   release and expiry undo it. An action this module has no way to
@@ -55,11 +56,14 @@
  *   dependency on the board."
  * - **Convergence:** #105 records that M2.8 had already flagged this same
  *   `close`/`reopen` gap as a known limitation in its own Ruling R14 —
- *   reached from the *correctness* side (folding safely around a missing
- *   reopen) — while M2.8's security review reached the identical gap
- *   independently from the *security* side (a forgeable, permanent `close`).
- *   Two independent reviews converging on the same gap from opposite
- *   directions means it is **structural**, not an oversight in either lane.
+ *   reached from the *correctness* side (`state/fold.ts`'s own comment: with
+ *   no `reopen` event kind, a legitimately reopened ticket still folds to
+ *   `closed: true` forever, which `blockedBy` then treats as satisfied when
+ *   it may not be — flagged there as a gap, not fixed) — while M2.8's
+ *   security review reached the identical gap independently from the
+ *   *security* side (a forgeable, permanent `close`). Two independent
+ *   reviews converging on the same gap from opposite directions means it is
+ *   **structural**, not an oversight in either lane.
  *
  * **R1's flat-`dependencies` resolution is narrower than `blockedBy`'s, and
  * that narrowness is a partial mitigation, not a fix.** `deps/graph.ts`'s
@@ -398,7 +402,7 @@ export interface ReadySetResult {
    * `state.tickets` (Ruling D1, `state/fold.ts`), so it has no entry in
    * `verdicts` either — `isReady` still throws `STATE_TICKET_ID_AMBIGUOUS`
    * for it individually (Ruling R2), but a whole-board sweep silently
-   * omitting it would fail this module's own "surface to a human" purpose:
+   * omitting it would fail this module's own don't-silently-drop discipline:
    * "your board has an ambiguous id" is exactly the kind of thing a `cankan
    * ready` listing must not drop without a trace (`attack3.ts` §I, verified
    * — the id vanished from the sweep with no signal at all before this

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { openIndex } from "../../src/index/db";
+import { closeSync, openSync, statSync, writeSync } from "node:fs";
+import { openIndex, rebuildIndex } from "../../src/index/db";
 import { IndexErrorCodes } from "../../src/index/errors";
 import { queryBoardState, queryTickets } from "../../src/index/query";
 import { reindex } from "../../src/index/reindex";
@@ -274,6 +275,95 @@ describe("queryTickets -- actor mirrors claimedBy precisely", () => {
 
         expect(queryTickets(index, { actor: liveActor }).map((t) => String(t.id))).toEqual(["ck-live"]);
         expect(queryTickets(index, { actor: expiredActor })).toEqual([]);
+      } finally {
+        index.close();
+      }
+    });
+  });
+});
+
+/**
+ * Corrupts pages holding `tickets`/`ticket_aliases`/`ticket_deps` rows
+ * while leaving page 1 (the schema pragma, `cankan_meta`) intact -- the
+ * exact shape the security reviewer demonstrated (fix round 1, `e4.ts`/
+ * `e6.ts`): `openIndex`'s own open-time probe only ever reads page 1, so
+ * it reports `rebuilt: false` for a file damaged this way.
+ */
+function corruptTicketPages(path: string): void {
+  const size = statSync(path).size;
+  const fd = openSync(path, "r+");
+  const junk = Buffer.alloc(4096, 0x41);
+  for (let offset = 4096 * 6; offset < Math.min(size, 4096 * 14); offset += 4096) {
+    writeSync(fd, junk, 0, 4096, offset);
+  }
+  closeSync(fd);
+}
+
+describe("queryTickets/queryBoardState -- INDEX_CORRUPT (fix round 1, S2): corruption the open-time probe cannot see", () => {
+  test("a torn page holding ticket rows throws a typed INDEX_CORRUPT, never a raw SQLiteError, and the documented recovery (rebuildIndex + reindex) restores a correct, working index", async () => {
+    await withEnv(undefined, () => {
+      const index = openIndex({ boardKey: BOARD_KEY });
+      const path = index.path;
+      reindex({
+        index,
+        state: { tickets: Array.from({ length: 800 }, (_, i) => makeTicket(`ck-wedge-${i}`)), orphanedEvents: [], duplicateTicketIds: [] },
+      });
+      index.close();
+
+      corruptTicketPages(path);
+
+      let reopened = openIndex({ boardKey: BOARD_KEY });
+      // The whole point of S2: the open-time probe cannot see this
+      // damage -- it only reads page 1.
+      expect(reopened.rebuilt).toBe(false);
+
+      try {
+        queryTickets(reopened);
+        throw new Error("expected queryTickets to throw");
+      } catch (error) {
+        expect(isCanKanError(error)).toBe(true);
+        expect(isCanKanError(error) && error.code).toBe(IndexErrorCodes.CORRUPT);
+      }
+      try {
+        queryBoardState(reopened);
+        throw new Error("expected queryBoardState to throw");
+      } catch (error) {
+        expect(isCanKanError(error)).toBe(true);
+        expect(isCanKanError(error) && error.code).toBe(IndexErrorCodes.CORRUPT);
+      }
+
+      // The documented recovery, exercised end to end -- not just that
+      // the error shape changed, but that the board is usable again.
+      reopened = rebuildIndex(reopened);
+      expect(reopened.rebuilt).toBe(true);
+      expect(reopened.discardReason).toBe("corrupt");
+      reindex({ index: reopened, state: sentinelState("ck-recovered") });
+      const rows = queryTickets(reopened);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.id).toBe("ck-recovered" as TicketId);
+      reopened.close();
+    });
+  });
+
+  test("a malformed dep_json value (a JSON.parse SyntaxError) throws INDEX_CORRUPT rather than escaping raw", async () => {
+    await withEnv(undefined, () => {
+      const index = openIndex({ boardKey: BOARD_KEY });
+      try {
+        reindex({
+          index,
+          state: { tickets: [makeTicket("ck-1", { deps: [{ type: "blocks", id: "ck-x" }] })], orphanedEvents: [], duplicateTicketIds: [] },
+        });
+        // Simulates bit rot confined to this one column -- the probe has
+        // no way to see this either, since it never reads `ticket_deps`.
+        index.db.exec("UPDATE ticket_deps SET dep_json = 'not json at all' WHERE ticket_ordinal = 0");
+
+        try {
+          queryTickets(index);
+          throw new Error("expected a throw");
+        } catch (error) {
+          expect(isCanKanError(error)).toBe(true);
+          expect(isCanKanError(error) && error.code).toBe(IndexErrorCodes.CORRUPT);
+        }
       } finally {
         index.close();
       }

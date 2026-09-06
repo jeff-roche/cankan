@@ -39,10 +39,49 @@
  * `user_version` but has no `cankan_meta` table at all (a rebuild that
  * crashed between `PRAGMA user_version = N` and seeding `cankan_meta`,
  * say).
+ *
+ * ## Fix round 1, S1 -- the cache DIRECTORY itself is now checked, not just the file inside it
+ *
+ * The open sequence below used to `mkdirSync(cacheDir, { recursive: true,
+ * mode: 0o700 })` and nothing else. Two gaps in that, both verified
+ * directly (security review, fix round 1): `mkdir` never chmods an
+ * **existing** directory, so a `cankan` directory a vulnerable build left
+ * at `0777` stayed `0777` forever; and `mkdirSync(recursive)` does not
+ * `lstat` first, so a `cankan` **symlinked** to an attacker's directory
+ * made the index land inside that directory, silently. `ensurePrivateCacheDir`
+ * below closes both -- see its own doc comment, which mirrors
+ * `events/observations.ts`'s `ensurePrivateDir`/`tightenDirPermissions`
+ * (that module solved this exact problem under its own security review,
+ * fix round 2's Ruling R37). Reimplemented locally, not imported --
+ * R1 forbids importing `events/`, the same way `resolveCacheHome` below
+ * reimplements `board/xdg.ts`'s XDG rule rather than importing `board/`.
+ *
+ * ## Fix round 1, S2 -- a page-level corruption the open-time probe cannot see
+ *
+ * The probe above only ever reads page 1 (`cankan_meta`, the schema
+ * pragma). Corruption in a page holding `tickets`/`ticket_aliases`/
+ * `ticket_deps` rows passes it cleanly, and used to be a **permanent,
+ * unrecoverable wedge**: `openIndex` kept reporting `rebuilt: false`
+ * forever, `queryTickets`/`queryBoardState` threw a raw, untyped
+ * `SQLiteError`, and `reindex` -- the only remedy this module offered --
+ * failed on the same corruption trying to fix it (verified directly,
+ * security review, fix round 1: `e4.ts`/`e6.ts`). See `rebuildIndex`
+ * below and `IndexErrorCodes.CORRUPT`'s own doc comment for the fix and
+ * the documented recovery sequence.
  */
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
+import {
+  type Stats,
+  closeSync,
+  constants as fsConstants,
+  fchmodSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  rmSync,
+  unlinkSync,
+} from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 // F1/F2/F3: `bun run typecheck`/`bun test`/`bun run lint` all pass with
 // this import only because of `./sql.d.ts`'s ambient `*.sql` declaration
@@ -187,11 +226,179 @@ function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
 }
 
-/** Removes the index file and any rollback-journal-mode sidecars it may have left (R5: this module never sets WAL itself, but an older or differently-configured build might have). */
+/**
+ * Removes the index file and every sidecar a build of this module could
+ * have left behind: `-wal`/`-shm` are **WAL-mode** sidecars (fix round 1,
+ * code-review Minor M1 -- the previous comment here called them
+ * "rollback-journal-mode sidecars," which is backwards: rollback journal
+ * mode, the mode this module actually uses per R5, produces `-journal`,
+ * not `-wal`/`-shm`; this module never sets `PRAGMA journal_mode = WAL`
+ * itself, but an older or differently-configured build might have).
+ * `-journal` is added here too (fix round 1, S4/code-review M2) purely to
+ * match R5's stated intent that no build, old or new, can leave a stale
+ * sidecar behind -- **not** because a planted `-journal` is exploitable.
+ * The security reviewer tried four ways to make a symlinked `-journal`
+ * write through to a victim file (a real `reindex` write transaction,
+ * against both an empty and a 690-byte victim, with a healthy index and a
+ * live handle) and every one was refused with `SQLITE_CANTOPEN`: SQLite
+ * opens the rollback journal exclusive-create, so it neither follows nor
+ * reuses an existing path at `<db>-journal`. That is a SQLite property,
+ * not something this module enforces -- recorded here so the negative
+ * result is not re-litigated.
+ */
 function removeIndexFileAndSidecars(path: string): void {
   rmSync(path, { force: true });
   rmSync(`${path}-wal`, { force: true });
   rmSync(`${path}-shm`, { force: true });
+  rmSync(`${path}-journal`, { force: true });
+}
+
+/**
+ * `chmod(dir, 0o700)` by path would resolve `dir`'s own path and, if a
+ * symlink now sits there, follow it -- moving the *target's* mode, not a
+ * directory this module actually owns. Mirrors
+ * `events/observations.ts`'s `tightenDirPermissions` (fix round 3 there,
+ * Minor 3), reimplemented as the synchronous `node:fs` equivalent since
+ * R1 forbids importing `events/`: `open(dir, O_DIRECTORY | O_NOFOLLOW)`
+ * refuses a symlink outright (`ENOTDIR` -- `O_DIRECTORY` requires the
+ * target to already be a directory, and `O_NOFOLLOW` refuses to resolve
+ * one to find out), and once open, the descriptor names a specific inode
+ * with no further path left to re-resolve -- so `ensurePrivateCacheDir`'s
+ * own `lstat` and this `fchmod` provably name the same thing.
+ */
+function tightenCacheDirPermissions(dir: string): void {
+  const fd = openSync(dir, fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+  try {
+    fchmodSync(fd, 0o700);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Confirms `dir` (the `<cacheHome>/cankan` directory) is a genuine
+ * directory -- never a symlink, even a symlink-to-directory, since
+ * `lstat` reports the entry itself and never follows it -- owned by the
+ * current user, with no group/other access bits, creating it (mode
+ * `0o700`) if nothing is there yet. Fix round 1, S1 (Important),
+ * mirroring `events/observations.ts`'s `ensurePrivateDir` (fix round 2
+ * there, Ruling R37, findings H1/M1) -- reimplemented locally rather than
+ * imported (R1) with this file's header comment carrying the duplication
+ * rationale.
+ *
+ * **Two gaps this closes, both verified directly against the previous
+ * `mkdirSync(cacheDir, { recursive: true, mode: 0o700 })`-only sequence:**
+ * `mkdir` never chmods an *existing* directory, so a `cankan` directory a
+ * vulnerable build (or a local attacker) left at `0o777` stayed `0o777`
+ * forever -- closed below by the post-`mkdir` ownership+mode check,
+ * which runs whether this call just created the directory or found it
+ * already there. `mkdirSync(recursive)` does not `lstat` first and
+ * resolves through a symlink when checking what already exists, so a
+ * `cankan` **symlinked** to an attacker's directory made the index land
+ * inside that directory with no error -- closed below by `lstat`ing
+ * *before* ever calling `mkdir`, and refusing outright (never following,
+ * never silently redirecting) when something that is not a plain
+ * directory is already there.
+ *
+ * Scoped to the `cankan` directory only, **never `$XDG_CACHE_HOME`
+ * itself** -- matching `ensurePrivateDir`'s own stated remit; this module
+ * does not create `$XDG_CACHE_HOME` and has no business tightening
+ * permissions on whatever else lives under it.
+ *
+ * **One TOCTOU window is disclosed, not claimed closed, mirroring
+ * `ensurePrivateDir`'s own honesty about its analogous window**: between
+ * the pre-`mkdir` `lstat` finding nothing and `mkdirSync` actually
+ * running, a same-user attacker could in principle plant a symlink there
+ * first. Re-checked with a second `lstat` immediately after `mkdirSync`
+ * (below) rather than assumed safe, so this window is caught, not merely
+ * narrowed -- but the check-then-act gap between the two calls is real
+ * and untested (isolating a single-syscall race from outside this
+ * function is not practical), the same disclosure `ensurePrivateDir`
+ * makes about its own `mkdir`.
+ *
+ * **Ruling R41 disclosure, carried forward verbatim from
+ * `observations.ts`: on a runtime with no `process.getuid` (Windows),
+ * this whole check does not run, and the property it enforces is
+ * UNMITIGATED, not merely relaxed.** There is no POSIX uid/mode model to
+ * check against there, so both halves of this function -- the ownership
+ * check and the mode-tightening `chmod` that exists only to enforce the
+ * same ownership property -- fall away together. A world-writable cache
+ * directory with a planted file is not caught on such a runtime. Windows
+ * is not in this project's supported-platform list today (no
+ * `engines`/`os` field, no CI job for it) -- this is not a defect to fix
+ * now, but whoever adds Windows support inherits this obligation, not the
+ * false assumption that "no uid to check" merely means "less strict".
+ */
+function ensurePrivateCacheDir(dir: string): void {
+  let existing: Stats | undefined;
+  try {
+    existing = lstatSync(dir);
+  } catch (cause) {
+    if (!(isErrnoException(cause) && cause.code === "ENOENT")) {
+      throw new CanKanError(IndexErrorCodes.CACHE_PATH_UNAVAILABLE, "could not inspect the index cache directory", {
+        cause,
+      });
+    }
+  }
+  if (existing !== undefined && !existing.isDirectory()) {
+    // A symlink (to a directory or to anything else), a plain file, a
+    // FIFO -- `lstat` never resolves it, so this is what actually catches
+    // the symlinked-`cankan`-directory attack (`mkdirSync(recursive)`
+    // alone does not: it stats through the symlink and no-ops).
+    throw new CanKanError(
+      IndexErrorCodes.CACHE_PATH_UNAVAILABLE,
+      "the index cache directory's path is occupied by something other than a plain directory",
+    );
+  }
+  try {
+    // Safe to call unconditionally now: either nothing is there
+    // (`existing === undefined`) or `existing` is already a genuine
+    // directory, so `recursive: true` is a no-op rather than a path this
+    // function has not already validated.
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch (cause) {
+    throw new CanKanError(IndexErrorCodes.CACHE_PATH_UNAVAILABLE, "could not create the index cache directory", {
+      cause,
+    });
+  }
+  const stat = lstatSync(dir);
+  if (!stat.isDirectory()) {
+    // A genuine TOCTOU window (disclosed, not claimed closed elsewhere in
+    // this function's doc comment): between the pre-`mkdir` `lstat`
+    // above finding nothing and this line, a same-user attacker could in
+    // principle have replaced the path with a symlink that `mkdirSync`'s
+    // own EEXIST handling (which `stat`s, not `lstat`s, an already-
+    // existing entry to decide whether "already a directory" applies)
+    // could silently accept. Re-checked with `lstat` here, never assumed
+    // from the pre-`mkdir` check alone.
+    throw new CanKanError(
+      IndexErrorCodes.CACHE_PATH_UNAVAILABLE,
+      "the index cache directory's path is occupied by something other than a plain directory",
+    );
+  }
+  const uid = process.getuid?.();
+  if (uid === undefined) {
+    // Ruling R41 (see this function's doc comment): unmitigated here, not
+    // merely skipped.
+    return;
+  }
+  if (stat.uid !== uid) {
+    throw new CanKanError(
+      IndexErrorCodes.CACHE_PATH_UNAVAILABLE,
+      "the index cache directory is not owned by the current user",
+    );
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    try {
+      tightenCacheDirPermissions(dir);
+    } catch (cause) {
+      throw new CanKanError(
+        IndexErrorCodes.CACHE_PATH_UNAVAILABLE,
+        "could not restrict the index cache directory's permissions",
+        { cause },
+      );
+    }
+  }
 }
 
 /**
@@ -268,7 +475,11 @@ function initializeSchema(db: Database, boardKey: string): void {
  * (`INDEX_INVALID_BOARD_KEY`).
  *
  * The open sequence (F4/F5-aware):
- * 1. `mkdir` the cache directory recursively, mode `0o700`.
+ * 1. `ensurePrivateCacheDir` the cache directory (fix round 1, S1): create
+ *    it (mode `0o700`) if absent, refuse outright if something that is
+ *    not a plain directory is already there (never following a symlink),
+ *    and otherwise confirm/tighten its ownership and mode -- see that
+ *    function's own doc comment.
  * 2. `lstat` (never `stat` -- never follow) the index file's path.
  *    - Nothing there (`ENOENT`): proceed to create fresh, discard reason
  *      `"missing"`.
@@ -296,13 +507,7 @@ export function openIndex(options: OpenIndexOptions): BoardIndex {
   const path = indexPathFor(options.boardKey, env);
   const cacheDir = dirname(path);
 
-  try {
-    mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
-  } catch (cause) {
-    throw new CanKanError(IndexErrorCodes.CACHE_PATH_UNAVAILABLE, "could not create the index cache directory", {
-      cause,
-    });
-  }
+  ensurePrivateCacheDir(cacheDir);
 
   let preflightReason: IndexDiscardReason | undefined;
   try {
@@ -332,13 +537,26 @@ export function openIndex(options: OpenIndexOptions): BoardIndex {
     }
   }
 
-  // `create: true` is safe even when `preflightReason === "missing"` was
-  // just determined by `lstatSync` throwing `ENOENT`: nothing raced to
-  // create a *directory* there between the two calls except another
-  // cooperating `openIndex()` writing the same file, which this module
-  // does not defend against (single-process, single-board cache; the
-  // same non-goal every other module's cache-style store in this
-  // codebase carries).
+  // **Necessary-but-insufficient, not "safe" (fix round 1, code-review
+  // Minor: this comment previously undersold the risk by only
+  // considering a cooperating second `openIndex()`).** This function has
+  // three unlink-then-recreate windows -- this one (`lstatSync`
+  // throwing `ENOENT`, or the `unlinkSync` calls a few lines above and
+  // below this one), each followed eventually by a fresh
+  // `new Database(path, { create: true })`. Between an `unlink` and the
+  // next open, a local attacker who can write this directory can
+  // re-plant a symlink, and `bun:sqlite` exposes no `O_NOFOLLOW`/
+  // `O_EXCL` open flag to refuse it -- `create: true`'s `O_CREAT`
+  // without `O_EXCL` follows whatever is there. Demonstrated directly
+  // (security review, `e2.ts` case E3b): an empty victim file became a
+  // 60 KB cankan database, and a foreign SQLite file kept its own table
+  // but had all five `cankan_*` tables grafted onto it and its
+  // `user_version` forced from 42 to 1. **This window is closed at the
+  // root by `ensurePrivateCacheDir` above, not by narrowing the race
+  // here**: only a process that already owns the exclusive-mode
+  // (`0o700`, this-user-only) `cankan` directory can write into it at
+  // all, so there is no other local user left who could win a race
+  // against these few lines in the first place.
   let db: Database;
   try {
     db = new Database(path, { create: true });
@@ -391,5 +609,102 @@ export function openIndex(options: OpenIndexOptions): BoardIndex {
     rebuilt: true,
     discardReason,
     close: () => rebuiltDb.close(),
+  };
+}
+
+/**
+ * True for an error shaped like SQLite reporting on-disk corruption that
+ * `openIndex`'s open-time probe could not have caught -- the probe only
+ * ever reads page 1 (this file's header comment), so damage confined to
+ * a page holding `tickets`/`ticket_aliases`/`ticket_deps` rows surfaces
+ * later, on whatever query or write first touches it. Checked by
+ * `bun:sqlite`'s own `.code` first (confirmed directly:
+ * `SQLITE_CORRUPT` for a torn page, `SQLITE_NOTADB` for a file that is
+ * not a database at all), and the "malformed"/"not a database" message
+ * text as a fallback for a `bun:sqlite` version that does not attach a
+ * `.code`.
+ *
+ * **Exported (not re-exported from `index.ts`) so `query.ts` and
+ * `reindex.ts` -- the two call sites that can hit this after the probe
+ * has already passed -- map it to the same `IndexErrorCodes.CORRUPT`
+ * rather than two independently-drifting checks.** `query.ts` additionally
+ * treats a `SyntaxError` (a malformed `dep_json` value failing
+ * `JSON.parse`) the same way -- that is this module's own write having
+ * been corrupted, not a programming error, even though it is not a
+ * `bun:sqlite` error at all.
+ */
+export function isIndexCorruptionError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const code = (error as { code?: unknown }).code;
+  if (code === "SQLITE_CORRUPT" || code === "SQLITE_NOTADB") {
+    return true;
+  }
+  return /database disk image is malformed|file is not a database/i.test(error.message);
+}
+
+/**
+ * The recovery primitive for `IndexErrorCodes.CORRUPT` (fix round 1, S2)
+ * -- closes `index`'s handle, removes the index file and its sidecars
+ * (R5), reopens a brand-new file at the same path, and runs the DDL
+ * against it. Returns a fresh, empty, **`rebuilt: true` /
+ * `discardReason: "corrupt"`** `BoardIndex` the caller must `reindex()`
+ * before querying (`INDEX_NOT_BUILT` otherwise, same as any other freshly
+ * rebuilt index).
+ *
+ * **Lives in `db.ts`, not `query.ts` or `reindex.ts`, because recovery
+ * has to route back through the file-level owner.** `reindex.ts` holds
+ * only a `Database` handle inside `BoardIndex` -- it cannot discard and
+ * recreate the file underneath itself, and self-healing by silently
+ * rebuilding *inside* a query would return an empty result for a board
+ * that may hold thousands of tickets, a wrong answer, not merely a stale
+ * one (the exact failure mode `openIndex`'s own "index is a cache" rule
+ * exists to rule out). Recovery is therefore explicit, not automatic:
+ *
+ * ```
+ * try {
+ *   return queryTickets(index, query);
+ * } catch (error) {
+ *   if (isCanKanError(error) && error.code === IndexErrorCodes.CORRUPT) {
+ *     index = rebuildIndex(index);
+ *     reindex({ index, state });   // caller's own already-folded state
+ *     return queryTickets(index, query);
+ *   }
+ *   throw error;
+ * }
+ * ```
+ *
+ * Keeping the rebuild explicit (rather than hiding it inside a query or a
+ * probe-time `PRAGMA quick_check`, both considered and rejected during
+ * fix round 1) also matters for M2.15 (#38): that lane needs to know the
+ * index was discarded because whatever invalidation state it had stored
+ * went with it, which an implicit, invisible rebuild would hide.
+ */
+export function rebuildIndex(index: BoardIndex): BoardIndex {
+  try {
+    index.db.close();
+  } catch {
+    // Already closed, or close itself failed -- either way there is
+    // nothing more this function can do with the old handle, and
+    // `removeIndexFileAndSidecars` below does not need it open.
+  }
+  removeIndexFileAndSidecars(index.path);
+  let db: Database;
+  try {
+    db = new Database(index.path, { create: true });
+    initializeSchema(db, index.boardKey);
+  } catch (cause) {
+    throw new CanKanError(IndexErrorCodes.CACHE_PATH_UNAVAILABLE, "could not rebuild the index cache file", {
+      cause,
+    });
+  }
+  return {
+    db,
+    path: index.path,
+    boardKey: index.boardKey,
+    rebuilt: true,
+    discardReason: "corrupt",
+    close: () => db.close(),
   };
 }

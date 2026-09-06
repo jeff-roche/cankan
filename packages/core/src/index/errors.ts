@@ -15,11 +15,15 @@
  *
  * **What is deliberately absent from this list**: `db.ts`'s whole
  * "index is a cache" design (`openIndex`'s doc comment) means a corrupt,
- * truncated, stale or version-mismatched *file* never raises any of these
- * -- it degrades to a rebuild (`IndexDiscardReason`), which is data, not
- * an error. Every code below fires only for a genuinely unusable
- * *environment*, an invalid caller argument, or a cache that was opened
- * but never reindexed.
+ * truncated, stale or version-mismatched file **detectable at open time**
+ * never raises any of these -- it degrades to a rebuild
+ * (`IndexDiscardReason`), which is data, not an error. `CORRUPT` below is
+ * the one exception, and it is not actually an exception to the rule: it
+ * fires only for damage the open-time probe structurally cannot see
+ * (page 1 was fine; a later page was not), discovered by a subsequent
+ * read or write rather than by `openIndex` itself. Every other code below
+ * fires only for a genuinely unusable *environment*, an invalid caller
+ * argument, or a cache that was opened but never reindexed.
  */
 export const IndexErrorCodes = {
   /**
@@ -84,13 +88,38 @@ export const IndexErrorCodes = {
   /** Same as `INVALID_QUERY_LIMIT`, for `TicketQuery.offset`. */
   INVALID_QUERY_OFFSET: "INDEX_INVALID_QUERY_OFFSET",
   /**
-   * `reindex()`'s write transaction threw. Reindexing is derived-data
-   * maintenance over a caller-supplied `BoardState`, not a read of
-   * untrusted file contents -- a failure here (a `STRICT` type mismatch
-   * the fold's own contract should have prevented, a disk-full write,
-   * and the like) is a programming error or a genuine I/O failure, never
-   * one of `IndexDiscardReason`'s "the file's contents are bad" cases, so
-   * it is surfaced as a typed error rather than absorbed into a rebuild.
+   * `reindex()`'s write transaction threw for a reason other than
+   * `CORRUPT` below (a `STRICT` type mismatch the fold's own contract
+   * should have prevented, a disk-full write, and the like) -- a
+   * programming error or a genuine I/O failure, never one of
+   * `IndexDiscardReason`'s "the file's contents are bad" cases, so it is
+   * surfaced as a typed error rather than absorbed into a rebuild. As of
+   * fix round 1, `SQLITE_CORRUPT`/`SQLITE_NOTADB` specifically is `CORRUPT`
+   * instead (below) -- distinct because that one has a documented
+   * recovery this code does not.
    */
   REINDEX_FAILED: "INDEX_REINDEX_FAILED",
+  /**
+   * Fix round 1, S2 (Important): a read (`queryTickets`/`queryBoardState`)
+   * or a `reindex()` write hit `SQLITE_CORRUPT`/`SQLITE_NOTADB` (or a
+   * `dep_json` value that fails `JSON.parse`) against an index file that
+   * had already passed `db.ts`'s open-time probe -- corruption confined
+   * to a page the probe never reads (it only reads page 1). Before this
+   * code existed, such a file was a **permanent, unrecoverable wedge**:
+   * `openIndex` kept reporting `rebuilt: false` forever (the probe never
+   * saw the damage), a raw `SQLiteError` escaped this module's declared
+   * surface, and `reindex`'s own `DELETE FROM tickets` -- the only remedy
+   * this module offered -- failed on the same corruption it was trying to
+   * fix (verified directly, security review: `e4.ts`/`e6.ts`).
+   *
+   * **The documented recovery**, and the reason `db.ts` exports
+   * `rebuildIndex` rather than either of `query.ts`/`reindex.ts`
+   * self-healing: `catch INDEX_CORRUPT -> rebuildIndex(index) ->
+   * reindex({ index, state }) -> query again`. See `rebuildIndex`'s own
+   * doc comment for the full argument and a worked example. Not raised by
+   * `openIndex` itself -- a corrupt-at-open-time file degrades to a
+   * rebuild there instead (`IndexDiscardReason`'s `"corrupt"`); this code
+   * fires only for the corruption the open-time probe cannot see.
+   */
+  CORRUPT: "INDEX_CORRUPT",
 } as const;

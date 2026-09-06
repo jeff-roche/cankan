@@ -294,6 +294,104 @@ describe("initRef — fix round 1, S3: refuses to report success on a ref that i
   });
 });
 
+/** Replaces the coordination ref's entire tree with one containing a single entry at `cacheinfo` (`"<mode>,<sha>,<path>"`) — real plumbing, real commit, on top of whatever the ref currently points to. Mirrors `log.test.ts`'s identical helper. */
+async function plantAtEventsPrefix(adapter: Awaited<ReturnType<typeof createGitAdapter>>, repoDir: string, cacheinfo: string): Promise<void> {
+  rawGit(repoDir, ["read-tree", "--empty"]);
+  rawGit(repoDir, ["update-index", "--add", "--cacheinfo", cacheinfo]);
+  const treeSha = rawGit(repoDir, ["write-tree"]).trim();
+  const parent = await adapter.readRef(COORD_REF);
+  if (parent === null) throw new Error("expected an existing ref to plant onto");
+  const commitSha = rawGit(repoDir, ["commit-tree", "-p", parent, "-m", "plant", treeSha]).trim();
+  rawGit(repoDir, ["update-ref", COORD_REF, commitSha]);
+}
+
+describe("initRef — fix round 3 follow-up, Ruling R48: checkRefUsability closes the same blocked-`events`-prefix gap read()/diagnose()/recover() already closed", () => {
+  test("a blob planted at the bare `events` path makes initRef() throw EVENT_REF_UNUSABLE (cause: EVENT_LOG_EVENTS_PREFIX_BLOCKED), not silently report usable", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await initRef(adapter, COORD_REF, { now: NOW });
+
+    const blobSha = rawGit(repo.dir, ["hash-object", "-w", "--stdin"], "not a directory").trim();
+    await plantAtEventsPrefix(adapter, repo.dir, `100644,${blobSha},events`);
+
+    // Before this fix: initRef() against this exact board resolved
+    // successfully (confirmed by direct probe) even though read() against
+    // the identical ref already threw EVENT_LOG_EVENTS_PREFIX_BLOCKED —
+    // checkRefUsability's own probe path is nested *under* `events`, so it
+    // silently read as "not found" under the blocked prefix, the same as
+    // a genuinely empty, healthy board.
+    try {
+      await initRef(adapter, COORD_REF, { now: NOW });
+      throw new Error("expected initRef() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_REF_UNUSABLE);
+      expect(isCanKanError(error.cause)).toBe(true);
+      if (!isCanKanError(error.cause)) throw new Error("unreachable");
+      expect(error.cause.code).toBe(EventErrorCodes.EVENT_LOG_EVENTS_PREFIX_BLOCKED);
+    }
+  });
+
+  test("a symlink planted at the bare `events` path also fails closed (mode 120000 shares GIT_BLOB_AMBIGUOUS with a healthy directory)", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await initRef(adapter, COORD_REF, { now: NOW });
+
+    const blobSha = rawGit(repo.dir, ["hash-object", "-w", "--stdin"], "/etc/passwd").trim();
+    await plantAtEventsPrefix(adapter, repo.dir, `120000,${blobSha},events`);
+
+    // Asserts `cause.code`, not just the outer `EVENT_REF_UNUSABLE`: under a
+    // hypothetical regression in `isEventsPrefixBlocked`'s mode check, this
+    // shape would still throw `EVENT_REF_UNUSABLE` via the *second*,
+    // pre-existing probe's own generic-failure path — with a different
+    // `cause` — and a bare `expectCode` on the outer code alone would not
+    // notice. This is the property that distinguishes "closed by this
+    // round's R48 probe" from "caught by accident."
+    try {
+      await initRef(adapter, COORD_REF, { now: NOW });
+      throw new Error("expected initRef() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_REF_UNUSABLE);
+      expect(isCanKanError(error.cause)).toBe(true);
+      if (!isCanKanError(error.cause)) throw new Error("unreachable");
+      expect(error.cause.code).toBe(EventErrorCodes.EVENT_LOG_EVENTS_PREFIX_BLOCKED);
+    }
+  });
+
+  test("a gitlink planted at the bare `events` path also fails closed (mode 160000 shares GIT_BLOB_AMBIGUOUS with a healthy directory)", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await initRef(adapter, COORD_REF, { now: NOW });
+
+    const fakeSubmoduleSha = "a".repeat(40);
+    await plantAtEventsPrefix(adapter, repo.dir, `160000,${fakeSubmoduleSha},events`);
+
+    // Same reasoning as the symlink test above: assert the specific `cause`,
+    // not just the outer code.
+    try {
+      await initRef(adapter, COORD_REF, { now: NOW });
+      throw new Error("expected initRef() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_REF_UNUSABLE);
+      expect(isCanKanError(error.cause)).toBe(true);
+      if (!isCanKanError(error.cause)) throw new Error("unreachable");
+      expect(error.cause.code).toBe(EventErrorCodes.EVENT_LOG_EVENTS_PREFIX_BLOCKED);
+    }
+  });
+
+  test("control: a healthy events directory is unaffected — initRef() still reports usable (no false positive)", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await initRef(adapter, COORD_REF, { now: NOW });
+
+    await expect(initRef(adapter, COORD_REF, { now: NOW })).resolves.toBeUndefined();
+    const records = await read(adapter, COORD_REF, { now: NOW });
+    expect(records).toEqual([]);
+  });
+});
+
 // ============================================================================
 // Fix round 1, S4/Ruling R20 — end-to-end fm10 coverage, exercised on initRef
 // too. Fix round 2, Ruling R24: this is an end-to-end assertion, not a guard

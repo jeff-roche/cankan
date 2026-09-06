@@ -623,9 +623,30 @@ export function openIndex(options: OpenIndexOptions): BoardIndex {
   }
 
   db.close();
-  removeIndexFileAndSidecars(path);
-  const rebuiltDb = new Database(path, { create: true });
-  initializeSchema(rebuiltDb, options.boardKey);
+  let rebuiltDb: Database;
+  try {
+    // Fix round 2 (unbriefed -- found while testing item 2, same defect
+    // class): this discard-and-rebuild step's own `removeIndexFileAndSidecars`
+    // call was unwrapped since the very first commit (`f910f6b`), not only
+    // since fix round 1 -- verified against `git show f910f6b`. Reachable
+    // without any attacker at all: a plain directory landing at `<path>-wal`
+    // (a confused prior run, say) makes SQLite refuse to open the otherwise
+    // healthy main file at all (`SQLITE_CANTOPEN`), `probe()`'s catch-all
+    // maps that to `"corrupt"`, and this step then tried to sweep a sidecar
+    // that is a directory -- throwing a raw `ERR_FS_EISDIR` straight out of
+    // `openIndex`, in direct violation of this function's own doc comment
+    // ("a mkdir/lstat/unlink failure ... INDEX_CACHE_PATH_UNAVAILABLE").
+    // Wrapped with the same shape `rebuildIndex` uses (rm + reopen + schema
+    // in one try) for parity between this module's two discard-and-rebuild
+    // call sites, not just the rm call alone.
+    removeIndexFileAndSidecars(path);
+    rebuiltDb = new Database(path, { create: true });
+    initializeSchema(rebuiltDb, options.boardKey);
+  } catch (cause) {
+    throw new CanKanError(IndexErrorCodes.CACHE_PATH_UNAVAILABLE, "could not discard and rebuild the index cache file", {
+      cause,
+    });
+  }
 
   return {
     db: rebuiltDb,

@@ -171,9 +171,10 @@
  *
  * ## Fix round 3 (orchestrator security + code review) — what changed
  *
- * One Critical and one High, both closed here — see `task-4-report.md`'s
- * fix-round-3 addendum for the full defect-by-defect account and RED/GREEN
- * evidence.
+ * One Critical and one High, plus a follow-up fix for new breakage the
+ * Critical's own remedy introduced — see `task-4-report.md`'s fix-round-3
+ * addendum (and its two follow-up addenda) for the full defect-by-defect
+ * account and RED/GREEN evidence.
  *
  * 1. **A duplicate-id conflict could be "fixed" by evicting the victim
  *    (Critical; Ruling R47).** `FIXABLE_REASONS` used to include
@@ -222,6 +223,24 @@
  *    blob-only and shared the identical symlink/gitlink blind spot this
  *    round closes for `events`; both are fixed together, not just the one
  *    the reviewer named.
+ * 3. **Fix round 3 follow-up #2 (New, Critical-in-effect): the Critical
+ *    above's own remedy introduced a count-cap starvation defect.**
+ *    Removing `"duplicate-id-conflict"` from `FIXABLE_REASONS` (item 1)
+ *    made it the first reason that is both permanently unfixable and,
+ *    when an attacker varies any field, immune to coalescing — so the
+ *    single shared `MAX_DIAGNOSTIC_FAILURES` cap let an unbounded pile of
+ *    distinct-content duplicate-id lines exhaust the entire budget before
+ *    a genuinely repairable line anywhere later in the scan window was
+ *    ever even reported, permanently starving `recover()`'s own ability to
+ *    make progress (reproduced: 5,001 lines sharing one event id placed
+ *    before one repairable line made that line invisible across three
+ *    consecutive `recover()` runs, with zero progress each time). Closed
+ *    with two independent counters, `fixableSpanCount`/
+ *    `unfixableSpanCount` — see `MAX_DIAGNOSTIC_FAILURES`'s own doc
+ *    comment for the full mechanism and reproduction. The truncation
+ *    message's "re-run recovery... to make further progress" advice was
+ *    also made conditional on this run having actually found a fixable
+ *    span — see `pushTruncatedMarker`.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -846,7 +865,7 @@ export interface DiagnosticFailure {
   readonly count?: number;
   readonly reason: DiagnosticFailureReason;
   readonly message: string;
-  /** Structured remediation guidance for a reason this tool cannot repair by itself (currently only `"non-blob-month-path"`) — see `recover`'s doc comment, Ruling R43. */
+  /** Structured remediation guidance for a reason this tool cannot repair by itself — `"non-blob-month-path"` (Ruling R43), `"duplicate-id-conflict"` (Ruling R47), and `"events-prefix-blocked"` (Ruling R48) all set this; see `recover`'s doc comment. */
   readonly remediation?: string;
   /** Only for `"invalid-json"`/`"schema-invalid"` — `parseEvent`'s own already-safe-to-publish issue list (see `schema.ts`'s `projectIssues`). */
   readonly issues?: readonly EventValidationIssue[];

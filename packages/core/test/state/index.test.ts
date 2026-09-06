@@ -7,9 +7,10 @@ import * as core from "../../src/index";
  * would — the same pattern `test/ticket/index.test.ts` uses for
  * `core.ticket`. Type-only exports (`BoardState`, `FoldStateOptions`,
  * `LeaseState`, `ObserveAndFoldOptions`, `OrphanedTicketEvents`,
- * `TicketState`, `BlockingDependency`) carry no runtime value and so are
- * not — and cannot be — asserted here; they are exercised by every other
- * test file in `test/state/` that imports them.
+ * `OrphanedTicketEventsCause`, `DuplicateTicketId`, `TicketState`,
+ * `BlockingDependency`) carry no runtime value and so are not — and cannot
+ * be — asserted here; they are exercised by every other test file in
+ * `test/state/` that imports them.
  */
 describe("core.state — the M2.8 public surface", () => {
   test("exposes exactly the documented value exports", () => {
@@ -27,10 +28,11 @@ describe("core.state — the M2.8 public surface", () => {
     }
   });
 
-  test("StateErrorCodes carries exactly the two documented codes, each STATE_-prefixed", () => {
+  test("StateErrorCodes carries exactly the three documented codes, each STATE_-prefixed", () => {
     expect(core.state.StateErrorCodes).toEqual({
       INVALID_LEASE_TTL: "STATE_INVALID_LEASE_TTL",
       TICKET_NOT_IN_BOARD_STATE: "STATE_TICKET_NOT_IN_BOARD_STATE",
+      TICKET_ID_AMBIGUOUS: "STATE_TICKET_ID_AMBIGUOUS",
     });
   });
 });

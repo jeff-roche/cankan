@@ -171,8 +171,19 @@
  * make `claimedBy` under-report and a held claim look free — the wrong
  * direction to fail. Following the house `SkippedBoard`/`SkippedTicket`
  * pattern, every event whose (normalized) `ticket` field matches no
- * `StoredTicket` is counted into `BoardState.orphanedEvents` instead of
- * being folded onto anything.
+ * **unambiguous** `StoredTicket` is counted into `BoardState.orphanedEvents`
+ * instead of being folded onto anything.
+ *
+ * **`orphanedEvents` now carries two distinct causes, not one (Ruling D1,
+ * fix round 6, security/code review) — say which, don't just say
+ * "missing."** An event can land there because no file matches its ticket
+ * id at all, **or** because more than one file does (see Ruling D1 below):
+ * those are opposite failures with opposite remedies ("create the ticket"
+ * vs. "delete/rename one of the colliding files"), and collapsing them into
+ * one "no ticket file... matches this event's ticket id" message pointed an
+ * operator investigating a duplicate-id incident at the wrong cause.
+ * `OrphanedTicketEvents.cause` distinguishes them; `reason` is a
+ * human-readable string for whichever one applies.
  *
  * **Event→ticket join is direct id only (Ruling R11).** `Event.ticket` is
  * joined against a `StoredTicket.id` via `normalizeTicketIdForComparison`
@@ -397,21 +408,47 @@ export interface TicketState {
   readonly deps: ReadonlyArray<NonNullable<CankanBlock["deps"]>[number]>;
 }
 
-/** One ticket id that had events pointing at it but no matching `StoredTicket` (Ruling R15). */
+/**
+ * Which of the two opposite reasons an id's events could not be folded
+ * (Ruling D1, fix round 6): `"no-matching-ticket"` — no `StoredTicket` at
+ * all declares this id (Ruling R15's original case); or
+ * `"duplicate-ticket-id"` — more than one `StoredTicket` declares it, so
+ * there is no safe file to pick (see `DuplicateTicketId`). The remedy is
+ * opposite for each: create the missing ticket, vs. delete or rename one of
+ * the colliding files.
+ */
+export type OrphanedTicketEventsCause = "no-matching-ticket" | "duplicate-ticket-id";
+
+/** One ticket id that had events pointing at it but no single `StoredTicket` they could be folded onto (Ruling R15, extended by Ruling D1). */
 export interface OrphanedTicketEvents {
-  /** The comparison-key form of the missing ticket's id — never on-disk casing, since no file exists to have any. */
+  /**
+   * The comparison-key form of the id. On-disk casing is never available:
+   * for `"no-matching-ticket"` there is no file to have any; for
+   * `"duplicate-ticket-id"` more than one file exists but they may disagree
+   * on casing, so there is no single answer to prefer (see
+   * `DuplicateTicketId.paths` for the actual files).
+   */
   readonly ticketId: TicketIdLookupKey;
   /** How many events (of any kind) referenced this id. */
   readonly eventCount: number;
-  /** Fixed reason string — no ticket file in `tickets` matches this id. */
+  /** Which of the two causes applies — check this, not `reason`, for anything other than display. */
+  readonly cause: OrphanedTicketEventsCause;
+  /** Human-readable string describing whichever `cause` applies — for display, not for a caller to branch on. */
   readonly reason: string;
 }
 
 /**
  * Two or more `StoredTicket`s whose ids collide under
- * `normalizeTicketIdForComparison` — e.g. `ck-1 - a.md` declaring `id: ck-1`
- * and `CK-1 - b.md` declaring `id: CK-1` both landing in the same `tickets`
- * array (Ruling D1, fix round 5, security review). `store/ticketStore.ts`'s
+ * `normalizeTicketIdForComparison` (Ruling D1, fix round 5, security
+ * review). **No casing trick, and no relationship to the filename, is
+ * required to cause this (fix round 6 correction — an earlier version of
+ * this comment implied one was)**: `store/ticketStore.ts`'s `list()` reads
+ * a ticket's id from `ticket.frontmatter.id` alone and never compares it to
+ * the filename it came from, so any two ticket-shaped files whose
+ * frontmatter `id` fields normalize to the same value collide — including
+ * two files with `id: ck-1` verbatim, identical casing, arbitrary
+ * filenames. The `ck-1 - a.md` / `CK-1 - b.md` casing example is one way to
+ * cause this, not the requirement. `store/ticketStore.ts`'s
  * `get()`/`write()`/`remove()`/`archive()` all guard this (`STORE_
  * AMBIGUOUS_TICKET_LOOKUP`), but `list()` — this fold's natural input —
  * deliberately does not: nothing at the store/state seam previously stopped
@@ -435,7 +472,13 @@ export interface BoardState {
    * `duplicateTicketIds`.
    */
   readonly tickets: readonly TicketState[];
-  /** Every ticket id that had events but no matching file — sorted the same way. */
+  /**
+   * Every ticket id whose events could not be folded onto a single
+   * `StoredTicket` — sorted the same way as `tickets`. Two distinct causes,
+   * distinguished by each entry's own `cause` field (Ruling D1, fix round 6):
+   * no file declares the id at all, or more than one file does (cross-check
+   * against `duplicateTicketIds` for the second case).
+   */
   readonly orphanedEvents: readonly OrphanedTicketEvents[];
   /**
    * Every normalized ticket id claimed by more than one `StoredTicket`
@@ -444,7 +487,18 @@ export interface BoardState {
    * reported in `orphanedEvents` instead of being folded (there is no safe
    * way to pick which of the colliding files it belongs to), the same
    * "report what cannot be resolved, never guess" discipline Ruling R15
-   * already applies to an event naming no file at all.
+   * already applies to an event naming no file at all — those
+   * `orphanedEvents` entries carry `cause: "duplicate-ticket-id"` and their
+   * `ticketId` is a key into this array.
+   *
+   * **Binding forward constraint, alongside `blockedBy`'s own (see
+   * `queries.ts`): no downstream consumer may read a ticket's absence from
+   * `tickets` above as "this id does not exist" or "this id is unclaimed"
+   * without first checking whether that id appears here.** An id excluded
+   * from `tickets` because it is ambiguous is not the same fact as an id
+   * that was never created, and a consumer that conflates the two (e.g. by
+   * treating "not in `tickets`" as "safe to claim") reopens exactly the
+   * fail-open-on-readiness hazard this field exists to close.
    */
   readonly duplicateTicketIds: readonly DuplicateTicketId[];
 }
@@ -520,6 +574,16 @@ interface JoinResult {
  * separately by `buildAliasEventIndex` below (see this file's own comment on
  * that event kind's envelope `ticket` field having no specified
  * convention).
+ *
+ * **`tickets` here is always the caller's already-deduplicated set (Ruling
+ * D1) — `foldState` passes `partitionByDuplicateId(...).unique`, never the
+ * raw input.** So `orphaned` conflates two causes this function itself
+ * cannot tell apart: an id no `StoredTicket` declares at all, and an id
+ * more than one `StoredTicket` declared (excluded from "known" upstream,
+ * for exactly the reason it is ambiguous). `foldState` is what
+ * distinguishes the two, by cross-referencing `orphaned`'s keys against
+ * `duplicateTicketIds` when it builds the final `OrphanedTicketEvents` list
+ * — see that function and `OrphanedTicketEventsCause`'s own doc.
  */
 function joinEventsToTickets(
   tickets: readonly StoredTicket[],
@@ -1064,12 +1128,31 @@ export function foldState(
     return ak < bk ? -1 : ak > bk ? 1 : 0;
   });
 
+  // Ruling D1 (fix round 6): distinguish "no file at all" from "more than
+  // one file" for every orphaned id — collapsing both into one "missing"
+  // message pointed an operator investigating a duplicate-id incident at
+  // the wrong cause (see `OrphanedTicketEventsCause`'s own doc).
+  const duplicateIdCounts = new Map<TicketIdLookupKey, number>(
+    duplicateTicketIds.map((d) => [d.ticketId, d.paths.length]),
+  );
   const orphanedEvents: OrphanedTicketEvents[] = [...orphaned.entries()]
-    .map(([ticketId, eventCount]) => ({
-      ticketId,
-      eventCount,
-      reason: "no ticket file in this checkout matches this event's ticket id",
-    }))
+    .map(([ticketId, eventCount]) => {
+      const duplicateFileCount = duplicateIdCounts.get(ticketId);
+      if (duplicateFileCount !== undefined) {
+        return {
+          ticketId,
+          eventCount,
+          cause: "duplicate-ticket-id" as const,
+          reason: `this ticket id is claimed by ${duplicateFileCount} ticket files in this checkout — ambiguous, not missing (see BoardState.duplicateTicketIds)`,
+        };
+      }
+      return {
+        ticketId,
+        eventCount,
+        cause: "no-matching-ticket" as const,
+        reason: "no ticket file in this checkout matches this event's ticket id",
+      };
+    })
     .sort((a, b) => (a.ticketId < b.ticketId ? -1 : a.ticketId > b.ticketId ? 1 : 0));
 
   return { tickets: ticketStates, orphanedEvents, duplicateTicketIds };

@@ -20,10 +20,12 @@
  *
  * ---- this module's own error codes ---------------------------------------
  *
- * `StateErrorCodes` — currently just `INVALID_LEASE_TTL` (a caller-supplied
- * `leaseTtlMs` that is not a positive finite number) and
- * `TICKET_NOT_IN_BOARD_STATE` (`blockedBy` asked about an id its
- * `BoardState` does not contain).
+ * `StateErrorCodes` — `INVALID_LEASE_TTL` (a caller-supplied `leaseTtlMs`
+ * that is not a positive finite number), `TICKET_NOT_IN_BOARD_STATE`
+ * (`blockedBy` asked about an id its `BoardState` genuinely does not
+ * contain), and `TICKET_ID_AMBIGUOUS` (`blockedBy` asked about an id that
+ * is *ambiguous*, not absent — deliberately a separate code from the one
+ * above, since the two are opposite facts with opposite remedies).
  *
  * ---- deliberately withheld -------------------------------------------------
  *

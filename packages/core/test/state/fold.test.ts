@@ -656,7 +656,12 @@ describe("foldState — orphaned events (Ruling R15): reported, never dropped", 
 
     expect(state.tickets).toHaveLength(0);
     expect(state.orphanedEvents.map((o) => ({ ...o, ticketId: o.ticketId as string }))).toEqual([
-      { ticketId: "ck-ghost", eventCount: 1, reason: "no ticket file in this checkout matches this event's ticket id" },
+      {
+        ticketId: "ck-ghost",
+        eventCount: 1,
+        cause: "no-matching-ticket",
+        reason: "no ticket file in this checkout matches this event's ticket id",
+      },
     ]);
   });
 
@@ -668,6 +673,7 @@ describe("foldState — orphaned events (Ruling R15): reported, never dropped", 
     expect(state.orphanedEvents).toHaveLength(1);
     expect(state.orphanedEvents[0]?.ticketId as string | undefined).toBe("ck-ghost");
     expect(state.orphanedEvents[0]?.eventCount).toBe(2);
+    expect(state.orphanedEvents[0]?.cause).toBe("no-matching-ticket");
   });
 
   test("events for a known ticket are not counted as orphaned", () => {
@@ -712,6 +718,11 @@ describe("foldState — duplicate normalized ticket ids (Ruling D1, fix round 5,
     expect(state.tickets).toHaveLength(0);
     expect(state.orphanedEvents).toHaveLength(1);
     expect(state.orphanedEvents[0]?.ticketId as string | undefined).toBe("ck-1");
+    // Fix round 6: this must say "duplicated," not "missing" — two real
+    // files declare this id, which is the opposite fact from no file at
+    // all declaring it, with the opposite remedy.
+    expect(state.orphanedEvents[0]?.cause).toBe("duplicate-ticket-id");
+    expect(state.orphanedEvents[0]?.reason).not.toContain("no ticket file");
   });
 
   test("a third, unambiguous ticket is unaffected by an unrelated duplicate", () => {

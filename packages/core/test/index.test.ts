@@ -117,9 +117,15 @@ describe("the public entry", () => {
   test("resolves the `index/` folder to the folder, not to itself", () => {
     // `export * as index from "./index/index"` — had this been written
     // `"./index"`, `core.index` would be the entry namespace itself and so
-    // would carry the other twelve folders.
+    // would carry the other twelve folders (`ticket` among them, which
+    // `index/` itself is forbidden from ever importing — R1, M2.14).
+    // M2.14 populated `index/index.ts` with its real public surface, so
+    // this no longer asserts emptiness (only ever true before M2.14
+    // landed) — it asserts the real surface is there instead.
     expect(core.index).toBeTypeOf("object");
-    expect(Object.keys(core.index)).toEqual([]);
+    expect(core.index).toHaveProperty("openIndex");
+    expect(core.index).toHaveProperty("reindex");
+    expect(core.index).toHaveProperty("queryTickets");
     expect(core.index).not.toHaveProperty("ticket");
   });
 

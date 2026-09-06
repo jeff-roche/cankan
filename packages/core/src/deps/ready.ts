@@ -3,33 +3,63 @@
  * verdict for one ticket ("open, unclaimed, no open blockers, not excluded
  * by label" — CONCEPT.md §4), and `readySet` sweeps a whole board.
  *
- * ## Binding constraint: this is advisory, never authoritative — surface it
- * to a human, do not auto-act on it
+ * ## Readiness is advisory and attacker-influenceable
  *
  * `state/queries.ts::blockedBy` already documents the attack this section
  * restates in this module's own words, because everything `isReady` builds
  * on inherits it in full:
  *
- * **Two pushed events — one `close`, one `alias` — permanently neutralize
- * any `blocks` dependency on the board.** Push a `close` event naming any
- * real, closable ticket, then push an `alias {from: <the dep id>, to: <that
- * now-closed ticket>}`. The dependency's id now resolves (through
- * `blockedBy`'s alias-aware tiered index) to a closed ticket, so it reads
- * satisfied — for every ticket that names it. The attacker needs **push
- * access to the coordination ref alone and zero access to the repository
- * itself**. Because **no `reopen` event kind exists** (`state/fold.ts`'s own
- * Ruling R14 gap), `closed` can never be cleared back to `false` — the
- * effect is **permanent**.
+ * **Two pushed events — one `close`, one `alias` — neutralize any `blocks`
+ * dependency on the board, permanently until #105 lands.** Push a `close`
+ * event naming any real, closable ticket, then push an `alias {from: <the
+ * dep id>, to: <that now-closed ticket>}`. The dependency's id now resolves
+ * (through `blockedBy`'s alias-aware tiered index) to a closed ticket, so it
+ * reads satisfied — for every ticket that names it. The attacker needs
+ * **push access to the coordination ref alone and zero access to the
+ * repository itself**.
  *
- * `state.blockedBy` — and therefore every `"blocked"` reason this function
- * ever reports — is **advisory, not authoritative**. A human reading "this
- * looks ready" and using their own judgment is exactly what this function is
- * for. **A machine that auto-claims, auto-merges, or auto-advances work on
- * the strength of an `isReady`/`readySet` verdict turns a coordination-ref
- * push into board-wide control** — an escalation path from "can push one
- * ref" to "can silently unblock anything." Nothing downstream of this module
- * (M2.10's `ready`/`claim --next` and anything built on top of them) may
- * auto-act on this result. Read the verdict; don't act on it unattended.
+ * **The controller has ruled on this (fix round 3): CONCEPT.md wins.
+ * `claim --next` ships as specified, and the constraint that used to live
+ * here — surface this to a human, never auto-act on it — drops from binding
+ * to advisory.** The reasoning: this attacker already holds coordination-ref
+ * push, and with it can already forge `claim`, `release`, `close` and
+ * `alias` events outright — steal a ticket, release someone else's claim,
+ * close things directly. Steering *which* ticket an agent auto-picks via a
+ * forged readiness verdict is a **subset** of the disruption that attacker
+ * already commands, and a claim made this way is **reversible** — release
+ * and expiry undo it. Requiring a human in the loop on `--next` does not
+ * meaningfully raise the bar against this attacker, while it breaks the
+ * headline agent workflow CONCEPT.md:542 specifies. So:
+ *
+ * - `state.blockedBy` — and therefore every `"blocked"` reason this function
+ *   ever reports — is **advisory and attacker-influenceable, not a security
+ *   boundary.** Consumers **MAY** auto-act on an `isReady`/`readySet`
+ *   verdict: `claim --next` does, by spec (CONCEPT.md:542), and
+ *   `claims.require_ready` (CONCEPT.md:300) is a policy knob built on top of
+ *   it. There is no prohibition on M2.10 auto-claiming.
+ * - **The rule that replaces it: readiness must never be the sole gate on an
+ *   action that is NOT reversible.** Frame this as a test a future consumer
+ *   applies to itself, not as a list of blessed callers — before wiring an
+ *   `isReady` verdict into anything that acts automatically, ask "is the
+ *   action I am gating reversible?" Claiming qualifies precisely *because*
+ *   release and expiry undo it. An action this module has no way to
+ *   enumerate up front, with no undo, needs a stronger gate than readiness
+ *   alone — whatever that turns out to be is a decision for that consumer,
+ *   not for `deps/`.
+ * - **The sharp edge is the permanence, not the auto-action — that is the
+ *   part of M2.8's security review that actually matters.** There is no
+ *   `reopen` event kind, so a forged `close` cannot be undone through the log
+ *   — the effect is permanent **until #105 lands**. That is the root cause,
+ *   and it lives in `events/` (M2.7), not in this module. #105: "No reopen
+ *   event kind: a forged close permanently neutralizes every blocks
+ *   dependency on the board."
+ * - **Convergence:** #105 records that M2.8 had already flagged this same
+ *   `close`/`reopen` gap as a known limitation in its own Ruling R14 —
+ *   reached from the *correctness* side (folding safely around a missing
+ *   reopen) — while M2.8's security review reached the identical gap
+ *   independently from the *security* side (a forgeable, permanent `close`).
+ *   Two independent reviews converging on the same gap from opposite
+ *   directions means it is **structural**, not an oversight in either lane.
  *
  * **R1's flat-`dependencies` resolution is narrower than `blockedBy`'s, and
  * that narrowness is a partial mitigation, not a fix.** `deps/graph.ts`'s
@@ -262,8 +292,11 @@ function blockerDedupeKey(rawId: string, resolvedTicket: { readonly id: TicketId
 /**
  * Is `ticketId` ready right now? "Open, unclaimed, no open blockers, not
  * excluded by label" (CONCEPT.md §4), with every applicable reason reported
- * — see `ReadinessVerdict`. Read this file's header before wiring this into
- * anything that acts automatically: the result is advisory.
+ * — see `ReadinessVerdict`. Read this file's header for the reversibility
+ * rule before wiring this into anything that acts automatically: the result
+ * is advisory and attacker-influenceable, and the gate that matters is
+ * whether the action being taken is reversible, not whether a human looked
+ * at the verdict first.
  *
  * `state.blockedBy(state, ticketId)` is called before any lookup into
  * `state.tickets` (after only the caller-programming-error options guard,

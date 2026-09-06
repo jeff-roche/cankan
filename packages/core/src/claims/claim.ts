@@ -325,10 +325,38 @@ function resolveTicket(state: BoardState, ticketQuery: string): TicketState {
   // Ruling (this module): resolve by `id` and `displayId` ONLY — never by
   // alias. See this file's own header for why an alias-resolved write is
   // out of scope.
-  const match = state.tickets.find((t) => {
+  //
+  // Collect EVERY match, never take the first. `state.tickets` is already
+  // guaranteed distinct-by-`id` (Ruling D1, checked above), but `displayId`
+  // is a second, independent axis of collision that guarantee says nothing
+  // about, and there are two distinct shapes it can take:
+  //
+  //   1. two tickets share the same `displayId` (both `id`s are fine on
+  //      their own; the query matches both via `displayId`);
+  //   2. one ticket's `displayId` collides with a DIFFERENT ticket's
+  //      canonical `id` (the query matches ticket A by `id` and ticket B by
+  //      `displayId`).
+  //
+  // A first-match `.find()` would silently return whichever of these came
+  // first in `state.tickets` — a caller-invisible write-redirect onto a
+  // ticket the query never uniquely named. `store.get()` (`store/`)
+  // already refuses to guess in the equivalent case
+  // (`STORE_AMBIGUOUS_TICKET_LOOKUP`); this is a mutual-exclusion primitive
+  // deciding *which* ticket a claim/renew/release acts on, so it holds
+  // itself to at least that standard, not less. Exactly one match proceeds;
+  // more than one rejects as ambiguous; zero remains `TICKET_NOT_FOUND`.
+  const matches = state.tickets.filter((t) => {
     if (normalizeTicketIdForComparison(t.id) === key) return true;
     return t.displayId !== undefined && normalizeTicketIdForComparison(t.displayId) === key;
   });
+  if (matches.length > 1) {
+    throw new CanKanError(
+      ClaimErrorCodes.TICKET_AMBIGUOUS,
+      `ticket "${safeTicketQuery}" is ambiguous: more than one ticket matches this id or display id`,
+      { details: { ticket: safeTicketQuery, matches: matches.length } },
+    );
+  }
+  const match = matches[0];
   if (match === undefined) {
     throw new CanKanError(ClaimErrorCodes.TICKET_NOT_FOUND, `no ticket found matching "${safeTicketQuery}"`, {
       details: { ticket: safeTicketQuery },

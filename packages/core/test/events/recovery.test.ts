@@ -447,6 +447,52 @@ describe("read() does not reach the quarantine file", () => {
 });
 
 // ============================================================================
+// Fix round 3, Ruling R48 (High, orchestrator security review): diagnose()/
+// recover() must not silently agree with read()'s own fail-open when the
+// events prefix is blocked
+// ============================================================================
+
+describe("diagnose/recover — fix round 3, Ruling R48: a blocked events prefix is reported, never silently 'clean'", () => {
+  test("a blob at the bare events path is reported as events-prefix-blocked, and recover() never reports clean", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    // A tree with ONLY a blob at "events" — no month file can exist
+    // underneath a path that is itself a blob, so this alone establishes
+    // the hostile shape.
+    const outcome = await adapter.commitTreeToRef(COORD_REF, {
+      parent: null,
+      message: "plant",
+      files: [{ path: "events", content: "not a directory" }],
+    });
+    if (outcome.outcome !== "applied") throw new Error("setup failed");
+
+    const report = await diagnose(adapter, COORD_REF, { now: NOW });
+    expect(report.failures).toHaveLength(1);
+    expect(report.failures[0]?.reason).toBe("events-prefix-blocked");
+    expect(report.failures[0]?.remediation).toContain("events");
+    expect(report.monthsScanned).toEqual([]);
+
+    const result = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    expect(result.outcome).toBe("unrepairable");
+    expect(result.quarantined).toEqual([]);
+    expect(result.unresolved).toHaveLength(1);
+    expect(result.unresolved[0]?.reason).toBe("events-prefix-blocked");
+    expect(result.newTip).toBe(result.previousTip);
+
+    await expectCode(read(adapter, COORD_REF, { now: NOW }), EventErrorCodes.EVENT_LOG_EVENTS_PREFIX_BLOCKED);
+  });
+
+  test("control: a healthy events directory reports no events-prefix-blocked failure", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await seedRef(adapter, [{ path: "events/2026-09.jsonl", content: `${validLine("ck-1")}\n` }]);
+
+    const report = await diagnose(adapter, COORD_REF, { now: NOW });
+    expect(report.failures.some((f) => f.reason === "events-prefix-blocked")).toBe(false);
+  });
+});
+
+// ============================================================================
 // The append-path blob cap does not close recovery's exit: recovery writes
 // via `commitTreeToRef` directly, never through `append()`, so
 // `AppendOptions.maxExistingBlobBytes` never governs it
@@ -525,12 +571,14 @@ describe("recover — a truncated tail (fm8(a)'s partially-written-line case)", 
 });
 
 // ============================================================================
-// The adversarial question: a duplicate-id conflict never lets an attacker
-// evict a rival's already-appended, valid claim
+// Fix round 3, Ruling R47 (Critical, orchestrator security review): a
+// duplicate-id conflict is never automatically resolved — recovery must not
+// be usable to evict a rival's already-appended, valid claim by placing a
+// forgery in an earlier month
 // ============================================================================
 
-describe("recover — a duplicate-id conflict never removes the first (surviving) occurrence", () => {
-  test("the earlier, valid occurrence survives; only the later, differing one is quarantined", async () => {
+describe("recover — fix round 3, Ruling R47: a duplicate-id conflict is always unresolved, never automatically resolved", () => {
+  test("a same-content-month conflict: neither occurrence is quarantined; both remain, with a remediation naming both coordinates", async () => {
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);
     const sharedId = ulid();
@@ -545,16 +593,70 @@ describe("recover — a duplicate-id conflict never removes the first (surviving
     expect(diagBefore.failures[0]?.reason).toBe("duplicate-id-conflict");
     expect(diagBefore.failures[0]?.line).toBe(1);
     expect(diagBefore.failures[0]?.firstLine).toBe(0);
+    expect(diagBefore.failures[0]?.remediation).toContain("2026-09");
+    expect(diagBefore.failures[0]?.remediation).toContain(String(sharedId));
+
+    // Fix round 3: this used to be "recovered" with the later line
+    // quarantined. It is now never automatically resolved.
+    const result = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    expect(result.outcome).toBe("unrepairable");
+    expect(result.quarantined).toEqual([]);
+    expect(result.unresolved).toHaveLength(1);
+    expect(result.unresolved[0]?.reason).toBe("duplicate-id-conflict");
+    expect(result.unresolved[0]?.remediation).toBeDefined();
+
+    // Both lines are still there — read() still refuses.
+    await expectCode(read(adapter, COORD_REF, { now: NOW }), EventErrorCodes.EVENT_LOG_DUPLICATE_ID_CONFLICT);
+    const raw = await adapter.readBlobFromRef(COORD_REF, "events/2026-09.jsonl");
+    expect(raw).toBe(`${first}\n${second}\n`);
+  });
+
+  // The exact attack the security review demonstrated end to end against
+  // fix round 2's code, reproduced here as a permanent regression test —
+  // see task-4-report.md's fix-round-3 addendum for the RED evidence
+  // against the pre-fix commit.
+  test("R47's adversarial case: a forgery placed in an EARLIER month than the victim's real claim is never quarantined in its place", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    const sharedId = ulid();
+    // Alice's real claim, in the current (newer) month.
+    const aliceClaim = JSON.stringify({
+      ts: "2026-09-04T10:12:00Z",
+      id: sharedId,
+      actor: "alice",
+      ticket: "ck-1",
+      event: "claim",
+      lease_until: "2026-09-04T12:12:00Z",
+    });
+    // Mallory forges a differing event under the SAME id, but pushes it
+    // into the PREVIOUS month — still inside the default `trailingMonths: 2`
+    // window, so this walk (oldest-month-first) finds mallory's forgery
+    // *before* alice's real claim, regardless of any timestamp.
+    const malloryForgery = JSON.stringify({ ts: "2026-08-04T10:12:00Z", id: sharedId, actor: "mallory", ticket: "ck-1", event: "release" });
+    await seedRef(adapter, [
+      { path: "events/2026-09.jsonl", content: `${aliceClaim}\n` },
+      { path: "events/2026-08.jsonl", content: `${malloryForgery}\n` },
+    ]);
+
+    await expectCode(read(adapter, COORD_REF, { now: NOW }), EventErrorCodes.EVENT_LOG_DUPLICATE_ID_CONFLICT);
 
     const result = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
-    expect(result.outcome).toBe("recovered");
-    expect(result.quarantined).toHaveLength(1);
-    expect(result.quarantined[0]?.line).toBe(1);
-    expect(result.unresolved).toEqual([]);
+    // Fix round 3: against the pre-fix code, this reported "recovered" and
+    // quarantined alice's claim (2026-09:0), keeping mallory's forgery —
+    // exactly the double-claim this module exists to prevent. Now: no
+    // commit is made at all.
+    expect(result.outcome).toBe("unrepairable");
+    expect(result.quarantined).toEqual([]);
+    expect(result.newTip).toBe(result.previousTip);
 
-    const records = await read(adapter, COORD_REF, { now: NOW });
-    expect(records).toHaveLength(1);
-    expect(records[0]?.event.actor as string | undefined).toBe("alice");
+    // Both lines survive, unchanged, in their original months.
+    const septRaw = await adapter.readBlobFromRef(COORD_REF, "events/2026-09.jsonl");
+    const augRaw = await adapter.readBlobFromRef(COORD_REF, "events/2026-08.jsonl");
+    expect(septRaw).toBe(`${aliceClaim}\n`);
+    expect(augRaw).toBe(`${malloryForgery}\n`);
+
+    // read() still refuses — the board is not silently declared readable.
+    await expectCode(read(adapter, COORD_REF, { now: NOW }), EventErrorCodes.EVENT_LOG_DUPLICATE_ID_CONFLICT);
   });
 });
 
@@ -846,6 +948,35 @@ describe("recover — fix round 1/2, Critical 2 & NEW-1 case 3: a blocked quaran
     expect(result.outcome).toBe("recovered");
     expect(result.unresolved).toEqual([]);
     await read(adapter, COORD_REF, { now: NOW });
+  });
+
+  // Fix round 3 (Ruling R48's mode-check, applied to this function too):
+  // `GIT_BLOB_AMBIGUOUS` alone is not proof of a healthy directory — a
+  // symlink at the exact top-level `quarantine` path shares that error
+  // code with a genuine directory, and the pre-fix version of this probe
+  // treated both as "fine."
+  test("a symlink planted at the literal top-level quarantine path also throws EVENT_RECOVERY_QUARANTINE_BLOCKED", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await seedRef(adapter, [{ path: "events/2026-09.jsonl", content: "bad line\n" }]);
+
+    // Real plumbing: a tree with both the events/ month file AND a symlink
+    // (mode 120000) at the exact top-level "quarantine" path.
+    const eventsBlobSha = rawGitBytes(repo.dir, ["hash-object", "-w", "--stdin"], Buffer.from("bad line\n")).stdout.trim();
+    const symlinkBlobSha = rawGitBytes(repo.dir, ["hash-object", "-w", "--stdin"], Buffer.from("/etc/passwd")).stdout.trim();
+    rawGit(repo.dir, ["read-tree", "--empty"]);
+    rawGit(repo.dir, ["update-index", "--add", "--cacheinfo", `100644,${eventsBlobSha},events/2026-09.jsonl`]);
+    rawGit(repo.dir, ["update-index", "--add", "--cacheinfo", `120000,${symlinkBlobSha},quarantine`]);
+    const treeSha = rawGit(repo.dir, ["write-tree"]).stdout.trim();
+    const parent = await adapter.readRef(COORD_REF);
+    if (parent === null) throw new Error("expected an existing ref");
+    const commitSha = rawGit(repo.dir, ["commit-tree", "-p", parent, "-m", "plant symlink", treeSha]).stdout.trim();
+    rawGit(repo.dir, ["update-ref", COORD_REF, commitSha]);
+
+    const before = await adapter.readRef(COORD_REF);
+    await expectCode(recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY }), EventErrorCodes.EVENT_RECOVERY_QUARANTINE_BLOCKED);
+    const after = await adapter.readRef(COORD_REF);
+    expect(after as string | null).toBe(before as string | null);
   });
 });
 

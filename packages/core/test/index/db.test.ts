@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
 import { isCanKanError } from "../../src/errors";
 import { INDEX_SCHEMA_VERSION, indexPathFor, openIndex } from "../../src/index/db";
@@ -163,17 +163,24 @@ describe("openIndex -- a directory sitting at the index path is refused loudly",
 });
 
 describe("openIndex -- degradation, each case builds a real db then corrupts it", () => {
-  test("garbage bytes at the db path rebuild (reason: corrupt)", async () => {
+  test("garbage bytes at the db path rebuild (reason: corrupt), and R5's -wal/-shm sidecars are removed with it", async () => {
     await withEnv(undefined, () => {
       const path = indexPathFor(BOARD_KEY, process.env);
       mkdirSync(join(path, ".."), { recursive: true });
       writeFileSync(path, "not a sqlite file at all, just some bytes\0\0\0garbage");
+      // R5: this module never sets WAL itself, but must still clean up a
+      // sidecar an older or differently-configured build left behind --
+      // simulate that by planting the two files by hand.
+      writeFileSync(`${path}-wal`, "stale wal sidecar");
+      writeFileSync(`${path}-shm`, "stale shm sidecar");
 
       const index = openIndex({ boardKey: BOARD_KEY });
       try {
         expect(index.rebuilt).toBe(true);
         expect(index.discardReason).toBe("corrupt");
         expect(countTicketRows(path)).toBe(0);
+        expect(existsSync(`${path}-wal`)).toBe(false);
+        expect(existsSync(`${path}-shm`)).toBe(false);
       } finally {
         index.close();
       }

@@ -83,11 +83,35 @@ export interface TicketQuery {
   readonly ids?: readonly string[];
   readonly limit?: number;
   readonly offset?: number;
+  /**
+   * The clock lease liveness is measured against -- both the `actor`
+   * filter above and every returned `TicketState.lease.expired`. Defaults
+   * to `Date.now()`, matching `state/fold.ts`'s `ObserveAndFoldOptions.now`
+   * convention.
+   *
+   * **Fix round 3: liveness is a function of time, not a stored fact.** A
+   * lease's expiry is computed here, on every call, from the stored
+   * `lease_expires_at_ms` -- never read back from a boolean `reindex()`
+   * wrote at some earlier instant. A lease can expire with zero change to
+   * the board (no event, no file write, byte-identical `BoardState`), so
+   * any value cached at reindex time is stale the moment the clock passes
+   * it, and no invalidation strategy can detect that staleness (there is
+   * nothing to detect: the underlying data never changed). A caller that
+   * wants a deterministic, reproducible answer -- a golden test, say --
+   * must pass `now` explicitly rather than relying on the default.
+   */
+  readonly now?: number;
 }
 
+// `lease_expired_at_reindex` (schema.sql) is deliberately NOT selected here
+// -- fix round 3: it is a debug-only snapshot of what `expired` happened to
+// be at the instant `reindex()` last ran, and nothing in this module may
+// read it to answer "is this lease live" (see `TicketQuery.now`'s doc for
+// why: that question's correct answer changes with no change to the board,
+// so only a query-time computation off `lease_expires_at_ms` can be right).
 const TICKET_COLUMNS =
   "ordinal, id, path, status_from_frontmatter, status_from_events, status, closed, close_reason, display_id, " +
-  "lease_actor, lease_event_id, lease_kind, lease_until_display, lease_first_seen_ms, lease_expires_at_ms, lease_expired";
+  "lease_actor, lease_event_id, lease_kind, lease_until_display, lease_first_seen_ms, lease_expires_at_ms";
 
 interface TicketRow {
   readonly ordinal: number;
@@ -105,7 +129,6 @@ interface TicketRow {
   readonly lease_until_display: string | null;
   readonly lease_first_seen_ms: number | null;
   readonly lease_expires_at_ms: number | null;
-  readonly lease_expired: number | null;
 }
 
 interface AliasRow {
@@ -260,11 +283,23 @@ function loadDepsMap(db: Database): ReadonlyMap<number, readonly TicketState["de
  * A `LeaseState` is either fully present or fully absent (never
  * half-populated): `lease_actor IS NULL` is the single signal that
  * `TicketState.lease === undefined`, matching how `reindex.ts` writes it.
+ *
+ * **Fix round 3: `expired` is computed here, against `now`, never read
+ * back from a stored boolean.** This mirrors `state/fold.ts`'s
+ * `foldLease` expression EXACTLY, on purpose -- both the comparison
+ * (`now >= expiresAtMs`, not `>`) and the `expiresAtMs === undefined` case
+ * (counts as expired, per `LeaseState.expired`'s own doc: "never observed"
+ * is expired-or-unknown, never "not expired"). Getting either of those two
+ * details wrong reintroduces the exact defect this fix closes -- either an
+ * off-by-one at the expiry instant itself, or a never-observed lease that
+ * silently reads as live.
  */
-function rowToLease(row: TicketRow): LeaseState | undefined {
+function rowToLease(row: TicketRow, now: number): LeaseState | undefined {
   if (row.lease_actor === null) {
     return undefined;
   }
+  const expiresAtMs = row.lease_expires_at_ms ?? undefined;
+  const expired = expiresAtMs === undefined ? true : now >= expiresAtMs;
   return {
     actor: row.lease_actor as ActorId,
     // `EventId` is not importable under R1 (it lives in `events/schema.ts`)
@@ -274,12 +309,17 @@ function rowToLease(row: TicketRow): LeaseState | undefined {
     kind: row.lease_kind as LeaseState["kind"],
     leaseUntilDisplay: row.lease_until_display as string,
     firstSeenMs: row.lease_first_seen_ms ?? undefined,
-    expiresAtMs: row.lease_expires_at_ms ?? undefined,
-    expired: row.lease_expired === 1,
+    expiresAtMs,
+    expired,
   };
 }
 
-function rowToTicketState(row: TicketRow, aliasMaps: AliasMaps, depsMap: ReadonlyMap<number, readonly TicketState["deps"][number][]>): TicketState {
+function rowToTicketState(
+  row: TicketRow,
+  aliasMaps: AliasMaps,
+  depsMap: ReadonlyMap<number, readonly TicketState["deps"][number][]>,
+  now: number,
+): TicketState {
   return {
     id: row.id as TicketId,
     path: row.path,
@@ -288,7 +328,7 @@ function rowToTicketState(row: TicketRow, aliasMaps: AliasMaps, depsMap: Readonl
     status: row.status,
     closed: row.closed === 1,
     closeReason: row.close_reason ?? undefined,
-    lease: rowToLease(row),
+    lease: rowToLease(row, now),
     displayId: row.display_id ?? undefined,
     aliases: aliasMaps.merged.get(row.ordinal) ?? [],
     frontmatterAliases: aliasMaps.frontmatter.get(row.ordinal) ?? [],
@@ -315,6 +355,7 @@ export function queryTickets(index: BoardIndex, query: TicketQuery = {}): readon
 function queryTicketsUnguarded(index: BoardIndex, query: TicketQuery): readonly TicketState[] {
   assertBuilt(index);
   const db = index.db;
+  const now = query.now ?? Date.now();
 
   const clauses: string[] = [];
   const params: (string | number)[] = [];
@@ -329,10 +370,17 @@ function queryTicketsUnguarded(index: BoardIndex, query: TicketQuery): readonly 
   }
 
   if (query.actor !== undefined) {
-    // Mirrors `state/queries.ts`'s `claimedBy` precisely: an expired
-    // lease is not a claim.
-    clauses.push("lease_actor = ? AND lease_expired = 0");
-    params.push(query.actor);
+    // Fix round 3: computed against `now`, never against a stored
+    // boolean -- mirrors `state/queries.ts`'s `claimedBy` (which skips a
+    // ticket whose `lease.expired` is true) precisely: an expired lease
+    // is not a claim. `lease_expires_at_ms IS NOT NULL` is required
+    // explicitly rather than left to fall out of the `>` comparison --
+    // `NULL > ?` evaluates to `NULL` (falsy) in SQLite, which happens to
+    // give the right answer here, but leaving it implicit would make the
+    // never-observed-lease case ("expired" per `LeaseState.expired`'s own
+    // doc) depend on that SQL subtlety rather than stating it outright.
+    clauses.push("lease_actor = ? AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?");
+    params.push(query.actor, now);
   }
 
   if (query.closed !== undefined) {
@@ -376,7 +424,7 @@ function queryTicketsUnguarded(index: BoardIndex, query: TicketQuery): readonly 
 
   const aliasMaps = loadAliasMaps(db);
   const depsMap = loadDepsMap(db);
-  return rows.map((row) => rowToTicketState(row, aliasMaps, depsMap));
+  return rows.map((row) => rowToTicketState(row, aliasMaps, depsMap, now));
 }
 
 function queryOrphanedEvents(db: Database): readonly OrphanedTicketEvents[] {
@@ -416,6 +464,12 @@ function queryDuplicateTicketIds(db: Database): readonly DuplicateTicketId[] {
   }));
 }
 
+/** Options for `queryBoardState`. */
+export interface QueryBoardStateOptions {
+  /** See `TicketQuery.now`'s own doc -- same default, same fix-round-3 rationale. */
+  readonly now?: number;
+}
+
 /**
  * Reconstructs the full `BoardState` `reindex()` was last called with --
  * all three arrays. Throws `INDEX_NOT_BUILT` if `reindex()` has never run
@@ -427,9 +481,9 @@ function queryDuplicateTicketIds(db: Database): readonly DuplicateTicketId[] {
  * object-literal properties evaluate left to right, so `tickets` (which
  * calls it) always runs before `orphanedEvents`/`duplicateTicketIds`.
  */
-export function queryBoardState(index: BoardIndex): BoardState {
+export function queryBoardState(index: BoardIndex, options: QueryBoardStateOptions = {}): BoardState {
   return guardAgainstCorruption(() => ({
-    tickets: queryTicketsUnguarded(index, {}),
+    tickets: queryTicketsUnguarded(index, { now: options.now }),
     orphanedEvents: queryOrphanedEvents(index.db),
     duplicateTicketIds: queryDuplicateTicketIds(index.db),
   }));

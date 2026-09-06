@@ -99,8 +99,16 @@ import { IndexErrorCodes } from "./errors";
  * both degrade, never only one of them. `db.ts`'s probe compares with
  * `!==`, never against a list of known-bad values (M2.5's deny-list
  * lesson).
+ *
+ * Bumped to 2 in fix round 3: `schema.sql`'s `tickets.lease_expired`
+ * column was renamed to `lease_expired_at_reindex` (a debug-only snapshot,
+ * no longer read by `query.ts` for anything) and `tickets_lease`'s
+ * covering index changed shape to `(lease_actor, lease_expires_at_ms)`
+ * -- an old file's rows have no `lease_expired_at_reindex` column at all
+ * under the new name, so this must bump for the same "an old cache file
+ * cannot be read under this shape" reason as any other column rename.
  */
-export const INDEX_SCHEMA_VERSION = 1;
+export const INDEX_SCHEMA_VERSION = 2;
 
 /** Options for `openIndex`. */
 export interface OpenIndexOptions {

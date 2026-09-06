@@ -77,7 +77,7 @@ const INSERT_TICKET_SQL = `
     ordinal, id, path, status_from_frontmatter, status_from_events, status,
     closed, close_reason, display_id,
     lease_actor, lease_event_id, lease_kind, lease_until_display,
-    lease_first_seen_ms, lease_expires_at_ms, lease_expired
+    lease_first_seen_ms, lease_expires_at_ms, lease_expired_at_reindex
   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
 `;
 
@@ -140,6 +140,11 @@ export function reindex(options: ReindexOptions): ReindexResult {
         lease?.leaseUntilDisplay ?? null,
         lease?.firstSeenMs ?? null,
         lease?.expiresAtMs ?? null,
+        // Fix round 3: `lease_expired_at_reindex` is a debug-only
+        // snapshot of `lease.expired` at THIS instant -- `query.ts`
+        // never reads it back for anything. The authoritative value is
+        // recomputed at query time from `lease_expires_at_ms` (see that
+        // file's `rowToLease`).
         lease === undefined ? null : lease.expired ? 1 : 0,
       );
 

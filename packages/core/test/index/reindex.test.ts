@@ -273,7 +273,12 @@ describe("reindex -- against a real foldState() call, not only hand-built BoardS
         expect(folded.duplicateTicketIds).toHaveLength(1);
 
         reindex({ index, state: folded });
-        const roundTripped = queryBoardState(index);
+        // Fix round 3: `expired` is computed at query time from
+        // `lease_expires_at_ms`, not read back from a stored boolean --
+        // `now: 0` matches the `now` `foldState` above was called with,
+        // so the recomputed value agrees with `folded`'s own
+        // `lease.expired` (still live at `now: 0`).
+        const roundTripped = queryBoardState(index, { now: 0 });
         expect(roundTripped).toEqual(folded);
       } finally {
         index.close();

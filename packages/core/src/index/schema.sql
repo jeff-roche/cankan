@@ -66,10 +66,24 @@ CREATE TABLE tickets (
   -- A `LeaseState` is either fully present or fully absent (`query.ts`
   -- reconstructs it that way): `lease_actor IS NULL` iff every other
   -- `lease_*` column is `NULL` iff `TicketState.lease === undefined`.
-  lease_expired INTEGER
+  --
+  -- Fix round 3 (schema version 2): renamed from `lease_expired`.
+  -- Liveness is a function of the clock, not a fact about the board --
+  -- a lease can expire with zero change to the board (no event, no file
+  -- write), so a boolean frozen here at reindex time goes stale the
+  -- instant the clock passes it, with nothing for M2.15's invalidation to
+  -- detect. This column is now ONLY a debug-time snapshot of what
+  -- `expired` happened to be at the moment of this reindex -- `query.ts`
+  -- never selects it, never filters on it, and never uses it to answer
+  -- "is this lease live". The authoritative answer is computed at query
+  -- time from `lease_expires_at_ms` against the caller's `now`.
+  lease_expired_at_reindex INTEGER
 ) STRICT;
 CREATE INDEX tickets_status ON tickets(status);
-CREATE INDEX tickets_lease ON tickets(lease_actor, lease_expired);
+-- Fix round 3: covers the query-time actor filter's shape
+-- (`lease_actor = ? AND lease_expires_at_ms > ?`), not the retired
+-- `lease_expired` boolean.
+CREATE INDEX tickets_lease ON tickets(lease_actor, lease_expires_at_ms);
 CREATE INDEX tickets_closed ON tickets(closed);
 CREATE INDEX tickets_id ON tickets(id);
 

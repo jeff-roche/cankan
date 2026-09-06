@@ -194,8 +194,11 @@ export interface OpenTicketStoreOptions {
    * exemption — an empty array, and later a `kind`-keyed exemption from
    * requiring one, have each independently been shown to reopen step (c)
    * entirely (a hostile `tickets_dir` landing writes inside the
-   * repository's real git directory; see the ADR 0002 amendment for that
-   * history). See `assertValidGitDirs` for what each entry must satisfy.
+   * repository's real git directory; see
+   * `packages/core/test/store/ticketStore.test.ts`, the
+   * "gitDirs is required for every board" describe block, for that
+   * history and the test that fails if the exemption is re-added). See
+   * `assertValidGitDirs` for what each entry must satisfy.
    */
   readonly gitDirs: readonly string[];
 }
@@ -260,8 +263,10 @@ export async function openTicketStore(options: OpenTicketStoreOptions): Promise<
  * versions of this same guarantee (an empty-array escape hatch, then a
  * `kind`-keyed exemption from it) were each independently bypassed, and a
  * check keyed on a value the caller controls can always be defeated by
- * supplying a different value. See the ADR 0002 amendment for that
- * history.
+ * supplying a different value. See
+ * `packages/core/test/store/ticketStore.test.ts`, the "gitDirs is
+ * required for every board" describe block, for that history and the
+ * test that fails if the exemption is re-added.
  *
  * Each entry must additionally be: a non-empty, absolute string; already
  * **canonical** (`fs.realpath(dir) === dir`) — a non-canonical entry (a
@@ -271,25 +276,38 @@ export async function openTicketStore(options: OpenTicketStoreOptions): Promise<
  * not a file — a `--separate-git-dir` repository's `.git` is a *file*, and
  * `fs.realpath` of a file succeeds and equals itself just as readily as a
  * directory does, so this check is required, not redundant with the one
- * before it; and contain a **`HEAD`** entry, present under
- * `gitCommonDir()`'s result for every repo shape (normal,
- * `--separate-git-dir`, linked worktree, bare) — this is what rejects an
- * arbitrary unrelated existing directory, which the checks above alone
- * would accept. Every failure surfaces as `ErrorCodes.USAGE`, without
- * distinguishing "does not exist" from "exists but is wrong" in the error
- * code (fail-closed either way; the message says which rule failed).
+ * before it (it is also what rejects the naive `join(root, ".git")` for a
+ * linked worktree's linked side and a submodule's inner directory — both
+ * are also files pointing elsewhere, the same shape as `--separate-git-dir`,
+ * not just that one case); and contain something named **`HEAD`**, present
+ * under `gitCommonDir()`'s result for every repo shape (normal,
+ * `--separate-git-dir`, linked worktree, submodule, bare) — this is what
+ * rejects an arbitrary unrelated existing directory, which the checks
+ * above alone would accept. Every failure surfaces as `ErrorCodes.USAGE`,
+ * without distinguishing "does not exist" from "exists but is wrong" in
+ * the error code (fail-closed either way; the message says which rule
+ * failed).
  *
- * **Residual, stated plainly, not overclaimed:** these checks confirm each
- * `gitDirs` entry is *a* real git directory. They do not confirm it
- * belongs to *this* board's own repository — a different repository's
- * real git directory passes every check here. Closing that fully requires
- * this store to derive `gitDirs` itself (or accept a `GitAdapter`
- * directly), which needs `git/index.ts` (M2.6) — outside M2.5's `Depends
- * on` list (PLAN.md), so it is deferred to the lane that wires this
- * store's first real caller, where a `GitAdapter` is legitimately in
- * scope, rather than closed here by importing around the dependency list.
- * A future reader must not mistake the checks above for a finished
- * defence against every hostile `gitDirs` value.
+ * **Residual, stated plainly, not overclaimed:** the true boundary of what
+ * these checks confirm is narrower than "a real git directory" — it is "an
+ * existing canonical directory containing an entry named `HEAD` that
+ * `lstat` can see — it need not resolve to anything." `mkdir X && mkdir
+ * X/HEAD`, no git involved, passes both rungs; so does a dangling symlink
+ * named `HEAD` (deliberate — see rung (b) below). Framed by what that
+ * means for a caller: rungs (a)+(b) defeat a *mistaken* caller — the naive
+ * `join(root, ".git")` against a separate-git-dir/worktree/submodule
+ * layout, or an unrelated pre-existing directory. They do **not** slow a
+ * *fabricating* caller at all — a value manufactured specifically to pass
+ * these checks walks straight through. Because `gitDirs` is a deny-list,
+ * that grants such a caller no new write — it only fails to exclude the
+ * real git directory, which is exactly what this residual already
+ * permits. Closing that fully requires this store to derive `gitDirs`
+ * itself (or accept a `GitAdapter` directly), which needs `git/index.ts`
+ * (M2.6) — outside M2.5's `Depends on` list (PLAN.md), so it is deferred
+ * to the lane that wires this store's first real caller, where a
+ * `GitAdapter` is legitimately in scope, rather than closed here by
+ * importing around the dependency list. A future reader must not mistake
+ * the checks above for an identity check.
  */
 async function assertValidGitDirs(gitDirs: readonly string[]): Promise<void> {
   if (!Array.isArray(gitDirs)) {
@@ -319,9 +337,11 @@ async function assertValidGitDirs(gitDirs: readonly string[]): Promise<void> {
       throw new CanKanError(ErrorCodes.USAGE, "Every gitDirs entry must already be canonical (fs.realpath'd)");
     }
     // Rung (a): a directory, not a file. `fs.realpath` above succeeds
-    // identically for a file (a `--separate-git-dir` repo's `.git` is one)
-    // as for a directory, so that check alone accepts exactly the value
-    // ADR 0002 step (c) exists to reject.
+    // identically for a file as for a directory, so that check alone
+    // accepts exactly the value ADR 0002 step (c) exists to reject: the
+    // naive `join(root, ".git")` is a file, not the real git directory,
+    // for a --separate-git-dir repo, a linked worktree's linked side, and
+    // a submodule's inner directory alike.
     let info: Awaited<ReturnType<typeof stat>>;
     try {
       info = await stat(dir);
@@ -336,11 +356,19 @@ async function assertValidGitDirs(gitDirs: readonly string[]): Promise<void> {
         "Every gitDirs entry must be a directory, not a file (a --separate-git-dir repository's .git is a file -- pass gitCommonDir() instead)",
       );
     }
-    // Rung (b): looks like a git directory. Does not confirm it is *this*
-    // board's git directory -- see this function's doc comment's Residual
-    // paragraph.
+    // Rung (b): contains something named HEAD. Existence only -- `lstat`,
+    // not `stat`, and no `isFile()`/`isSymbolicLink()` check on the result.
+    // `core.preferSymlinkRefs=true` makes git create `.git/HEAD` as a
+    // symlink to `refs/heads/<branch>` that is dangling until the first
+    // commit: `stat` (which follows symlinks) sees ENOENT on that dangling
+    // target and would wrongly refuse a legitimate freshly-`git init`'d
+    // repository; a committed repo under the same config has a real
+    // symlink there, so `isFile()` would wrongly refuse that case too, in
+    // the opposite direction. Existence under `lstat` alone survives both.
+    // See this function's doc comment's Residual paragraph for what this
+    // does and does not confirm.
     try {
-      await stat(join(dir, "HEAD"));
+      await lstat(join(dir, "HEAD"));
     } catch (err) {
       throw new CanKanError(
         ErrorCodes.USAGE,

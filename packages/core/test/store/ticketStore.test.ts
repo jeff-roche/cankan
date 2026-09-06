@@ -685,6 +685,23 @@ describe("openTicketStore — gitDirs is required for every board, with no per-k
       }
     });
   });
+
+  test("a gitDirs entry whose HEAD is a dangling symlink -- as core.preferSymlinkRefs=true leaves a freshly-git-init'd repo, before the first commit -- is accepted: rung (b) checks existence under lstat, not resolvability (fix round 5, Minor 3)", async () => {
+    await withTestBoard(async ({ board }) => {
+      const dir = await realpath(await mkdtemp(join(tmpdir(), "cankan-store-gitdirs-dangling-head-")));
+      try {
+        await symlink("refs/heads/main", join(dir, "HEAD"));
+        // Precondition: this fixture really is dangling -- if a future
+        // change makes it resolve, this test would stop testing what its
+        // name says and should fail loudly rather than pass by accident.
+        await expect(stat(join(dir, "HEAD"))).rejects.toThrow();
+        const store = await openTicketStore({ board, gitDirs: [dir] });
+        expect(store).toBeDefined();
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 // ---- ADR 0002 step (b) write-time re-check, and step (c) git-directory exclusion (1B, Ruling R9) ----

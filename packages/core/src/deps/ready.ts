@@ -77,6 +77,32 @@
  * nothing to silently miss. See `DepsErrorCodes.EXCLUDED_LABELS_WITHOUT_
  * LABELS_FOR`.
  *
+ * **This guard runs from ONE shared function, `assertIsReadyOptionsValid`,
+ * called by BOTH `isReady` and `readySet` (fix round 2, Ruling R23) — not
+ * duplicated per call site.** `readySet` calls it once, unconditionally,
+ * before its per-ticket sweep even starts, rather than depending solely on
+ * `isReady`'s own call of it. An **empty** `BoardState` (`state.tickets`
+ * has zero entries) never runs `readySet`'s per-ticket loop body at all, so
+ * if the guard lived only inside `isReady`, a `readySet` call against an
+ * empty board, given `excludedLabels` but no `labelsFor`, would never call
+ * `isReady` even once — the misconfiguration would pass
+ * silently, returning `{ verdicts: Map(), ambiguousIds: [] }` as if nothing
+ * were wrong, exactly the same failure class this guard exists to close
+ * (verified directly, fix round 2). A single shared function also means the
+ * two call sites cannot drift apart later — the lesson fix round 2 itself
+ * exists to enforce: check every OTHER consumer of a value (or a check) you
+ * change, not just the one you're looking at.
+ *
+ * **`isReady` given no `options` at all — or `options` without a
+ * `flatDependenciesFor` FUNCTION — throws a coded error, not a bare
+ * `TypeError` (fix round 2, Ruling R28).** TypeScript already makes both a
+ * compile error at every in-repo call site, but a JS caller unguarded by the
+ * type system previously hit `options.excludedLabels` on `undefined` a few
+ * lines into this function's body — an uncoded crash with no `.code` to
+ * branch on. `assertIsReadyOptionsValid` checks this first, before the
+ * `excludedLabels`/`labelsFor` guard above, and throws
+ * `DepsErrorCodes.IS_READY_OPTIONS_REQUIRED` naming exactly what's missing.
+ *
  * Label comparison is **case-sensitive, exact string match** — deliberately
  * simple: labels are free text a user chose, not a lookup key like a ticket
  * id, and CONCEPT.md's own worked config (`icebox`, `needs-design`) never
@@ -174,6 +200,58 @@ export interface IsReadyOptions {
 
 const NO_LABELS: readonly string[] = [];
 
+/**
+ * Validates `options` before anything else looks at it — the ONE place both
+ * `isReady` and `readySet` run this check (fix round 2, Ruling R23), so the
+ * two call sites cannot drift apart. Throws `DepsErrorCodes
+ * .IS_READY_OPTIONS_REQUIRED` (Ruling R28) when `options` itself is missing
+ * or `flatDependenciesFor` isn't a function — a JS caller unguarded by
+ * TypeScript's required-parameter check otherwise hits a bare `TypeError`
+ * from `options.excludedLabels` a few lines later. Throws
+ * `DepsErrorCodes.EXCLUDED_LABELS_WITHOUT_LABELS_FOR` (Ruling R11's
+ * companion guard) when `excludedLabels` is non-empty but `labelsFor` is
+ * absent, since no ticket's labels could then ever be checked against it.
+ *
+ * `readySet` calls this ONCE, unconditionally, before its per-ticket sweep —
+ * not only relying on `isReady`'s own call of it per ticket — because an
+ * EMPTY board (`state.tickets` has zero entries) never runs that per-ticket
+ * loop body at all, which previously let this exact misconfiguration pass a
+ * `readySet` call silently (Ruling R23, see this file's header).
+ */
+function assertIsReadyOptionsValid(
+  options: IsReadyOptions | null | undefined,
+  caller: "isReady" | "readySet",
+): asserts options is IsReadyOptions {
+  // Ruling R28 (fix round 2): `options` is typed as required, but that's a
+  // TypeScript-only guarantee -- a JS caller (or an `as any` escape hatch)
+  // can still omit it, or pass something without a real
+  // `flatDependenciesFor` function. Guard it explicitly rather than letting
+  // `options.excludedLabels` a few lines below crash with a bare, uncoded
+  // TypeError.
+  if (options === undefined || options === null || typeof options.flatDependenciesFor !== "function") {
+    throw new CanKanError(
+      DepsErrorCodes.IS_READY_OPTIONS_REQUIRED,
+      `${caller}: options.flatDependenciesFor is required and must be a function — there is no "assume no flat deps" default (Ruling R11); got ${
+        options === undefined || options === null ? "no options at all" : "options without a flatDependenciesFor function"
+      }`,
+      { details: {} },
+    );
+  }
+
+  // Ruling R11's companion guard (fix round 1): excludedLabels non-empty
+  // with no labelsFor lookup is a silent misconfiguration that fails open —
+  // no label could ever be compared against it, so no exclusion could ever
+  // fire. Thrown as a coded, loud error rather than silently doing nothing.
+  const excludedLabels = options.excludedLabels ?? NO_LABELS;
+  if (excludedLabels.length > 0 && options.labelsFor === undefined) {
+    throw new CanKanError(
+      DepsErrorCodes.EXCLUDED_LABELS_WITHOUT_LABELS_FOR,
+      `${caller}: excludedLabels was non-empty (${JSON.stringify(excludedLabels)}) but no labelsFor lookup was supplied — no ticket's labels could ever be checked against it, silently disabling every exclusion`,
+      { details: { excludedLabels } },
+    );
+  }
+}
+
 /** The de-duplication key for one outstanding blocker: the resolved target's normalized id when known, else the raw id's normalized form — same as `graph.ts`'s edge de-duplication, so a typed dep and a flat dep naming the same target (directly, or through `blockedBy`'s alias-aware resolution) collapse to one reason, not two (Ruling R1's worked example). Wrapped in a one-element `JSON.stringify` tuple (Ruling R13, fix round 1) for the same reason `graph.ts`'s `edgeDedupeKey` is: consistency with that function's discipline, even though this key currently has no second field to collide against. */
 function blockerDedupeKey(rawId: string, resolvedTicket: { readonly id: TicketId } | undefined): string {
   return JSON.stringify([
@@ -194,21 +272,12 @@ function blockerDedupeKey(rawId: string, resolvedTicket: { readonly id: TicketId
  * `code` intact.
  */
 export function isReady(state: BoardState, ticketId: TicketId, options: IsReadyOptions): ReadinessVerdict {
+  // Rulings R11, R23, R28 (fix rounds 1 and 2) — see assertIsReadyOptionsValid's own doc and this file's header.
+  assertIsReadyOptionsValid(options, "isReady");
+
   const excludedLabels = options.excludedLabels ?? NO_LABELS;
   const labelsFor = options.labelsFor;
   const flatDependenciesFor = options.flatDependenciesFor;
-
-  // Ruling R11's companion guard (fix round 1): excludedLabels non-empty
-  // with no labelsFor lookup is a silent misconfiguration that fails open —
-  // no label could ever be compared against it, so no exclusion could ever
-  // fire. Thrown as a coded, loud error rather than silently doing nothing.
-  if (excludedLabels.length > 0 && labelsFor === undefined) {
-    throw new CanKanError(
-      DepsErrorCodes.EXCLUDED_LABELS_WITHOUT_LABELS_FOR,
-      `isReady: excludedLabels was non-empty (${JSON.stringify(excludedLabels)}) but no labelsFor lookup was supplied — no ticket's labels could ever be checked against it, silently disabling every exclusion`,
-      { details: { excludedLabels } },
-    );
-  }
 
   // Ruling R2: let both STATE_TICKET_ID_AMBIGUOUS and
   // STATE_TICKET_NOT_IN_BOARD_STATE escape untouched. This also validates
@@ -330,8 +399,20 @@ export interface ReadySetResult {
  * `verdicts` holds a verdict per ticket, not just the ready ones — a caller
  * wanting "why isn't X ready" for a not-yet-ready ticket needs the same
  * sweep this function already did.
+ *
+ * Validates `options` itself, ONCE, before the sweep below even starts
+ * (fix round 2, Ruling R23) — not only via `isReady`'s own per-ticket call of
+ * the same check. An **empty** `state.tickets` means the loop below never
+ * runs at all, so a misconfigured `excludedLabels`/`labelsFor` pair (or a
+ * missing `flatDependenciesFor`) would otherwise pass this function
+ * silently, returning `{ verdicts: Map(), ambiguousIds: [] }` as if nothing
+ * were wrong — the same "surface it, don't let it hide" purpose Ruling R14
+ * already established for `ambiguousIds` itself, applied here to caller
+ * misconfiguration instead of board data.
  */
 export function readySet(state: BoardState, options: IsReadyOptions): ReadySetResult {
+  assertIsReadyOptionsValid(options, "readySet");
+
   const verdicts = new Map<TicketId, ReadinessVerdict>();
   for (const ticket of state.tickets) {
     verdicts.set(ticket.id, isReady(state, ticket.id, options));

@@ -88,8 +88,15 @@
  * collision: the colliding key is never set in `nodesByKey`, so
  * `resolveTier1` returns `undefined` for it, indistinguishable at that layer
  * from an id that names no ticket at all. `buildGraph` additionally reports
- * every such key on `DependencyGraph.ambiguousIds`, because the two facts
- * below need **opposite** handling, and a caller cannot tell them apart from
+ * every such key on `DependencyGraph.collidedIds` (renamed from
+ * `ambiguousIds` — fix round 2, Ruling R24 — because withholding
+ * `IndexedById` from the public surface, see "deliberately withheld" below,
+ * dropped a three-way name collision between this field,
+ * `IndexedById.ambiguousKeys`, and `ReadySetResult.ambiguousIds` to two; this
+ * is the one that still needed distinguishing, since it holds
+ * `readonly string[]`, not `ReadySetResult.ambiguousIds`'s
+ * `readonly DuplicateTicketId[]`), because the two facts below need
+ * **opposite** handling, and a caller cannot tell them apart from
  * `resolveTier1`'s `undefined` alone:
  *
  * - **Unresolved-because-unknown** (no ticket declares this id): failing
@@ -102,19 +109,66 @@
  *   fail-closed direction, nothing to change there. But `wouldCreateCycle`
  *   is not a read-only report; it gates whether `dep add` proceeds. If it
  *   treated an ambiguous endpoint as an ordinary unresolved leaf (the way
- *   `blockers()` does), it would return `false` — "no cycle, proceed" — for
- *   a proposed edge that might close a real loop through whichever of the
- *   colliding tickets is the intended one. That is the *fail-open*
- *   direction this whole ruling exists to close, so `wouldCreateCycle`
- *   instead **refuses** (returns `true`) whenever either endpoint of the
- *   proposed edge is one of `ambiguousIds` — it never falls through to
- *   treating an ambiguous id as a leaf.
+ *   `blockers()` does), it would return "no cycle, proceed" for a proposed
+ *   edge that might close a real loop through whichever of the colliding
+ *   tickets is the intended one. That is the *fail-open* direction this
+ *   whole ruling exists to close, so `wouldCreateCycle` instead **refuses**
+ *   whenever either endpoint of the proposed edge is one of `collidedIds` —
+ *   it never falls through to treating an ambiguous *endpoint* as a leaf.
  *
  * `buildGraph` itself never throws on a collision — it records
- * `ambiguousIds` and still produces a usable graph for every other ticket,
+ * `collidedIds` and still produces a usable graph for every other ticket,
  * mirroring `state/fold.ts`'s own partition-and-report pattern
  * (`BoardState.duplicateTicketIds`) rather than refusing the whole board
  * over one ambiguous id.
+ *
+ * ## R10's fix round 1 was incomplete: an ambiguous id INTERIOR to the walk
+ * also needs refusing, not just at the two proposed endpoints (Ruling R26,
+ * fix round 2)
+ *
+ * The endpoint-only check above is not enough. `wouldCreateCycle`'s walk
+ * (below) follows same-type, *resolved* edges only — `indexById`'s collision
+ * handling means an edge whose target collided (`to === undefined`, same as
+ * an edge naming an unknown id) is invisible to that walk, exactly like a
+ * genuine leaf. If the collision sits on a node *interior* to the chain
+ * being walked — not one of the two ids `dep add` was actually called with —
+ * fix round 1 missed it entirely: the walk simply stops at that node,
+ * indistinguishable from "this branch dead-ends here, no cycle." That
+ * silently **severs the walk mid-chain**, and a cycle-creating `dep add`
+ * proceeds where it should have been refused — proven directly
+ * (`regress-interior.ts`): a `blocks` chain `a→b→c`, with a second ticket
+ * colliding with `b`'s id, and `wouldCreateCycle(c, "blocks", a)` (which
+ * *would* close the loop `a→b→c→a`) flips from correctly refusing
+ * pre-fix-round-1 to incorrectly proceeding post-fix-round-1, purely because
+ * `indexById`'s `byKey.delete` on the collision made `b`'s edge target
+ * `undefined` — indistinguishable from an edge to an unknown id, which the
+ * walk always treated as a dead end.
+ *
+ * The fix is **walk-time**, not endpoint-only: while walking from `to`
+ * looking for `from`, track every node with a same-type out-edge whose
+ * target is unresolved **because it collided** (`to === undefined` *and*
+ * `collidedIds.has(normalizeDependencyId(edge.rawId))` — collision, not mere
+ * unknown-id, is what distinguishes "this edge's real destination is hidden
+ * from us" from "this edge genuinely dead-ends here"). If the walk pops one
+ * of those nodes, refuse — the edge beyond it could lead anywhere among the
+ * colliding tickets, including back to `from`, and this graph has no way to
+ * know which. This **deliberately over-refuses** when the ambiguous branch
+ * could not actually have looped back to `from` (`fixcheck.ts`'s "collider
+ * present but on an unrelated branch" case still does *not* refuse, because
+ * the walk never reaches that branch at all — but a case where the walk
+ * *does* reach a severed node is refused even if, with the collision
+ * resolved one particular way, that branch wouldn't have closed the loop).
+ * That is the fail-closed direction R10 mandates, not a defect to optimize
+ * away: this graph cannot tell which of the colliding tickets the edge
+ * actually names, so it cannot tell whether continuing past it is safe.
+ *
+ * A **naive alternative — "refuse if `collidedIds` is non-empty anywhere in
+ * the graph, regardless of whether the walk ever reaches it"** — was
+ * considered and rejected: it refuses the unrelated-branch case above too,
+ * which is over-refusing for no safety benefit (an ambiguous id nowhere on
+ * the path between `to` and `from` cannot possibly be the hidden link that
+ * closes this particular loop). The walk-time form only pays that fail-closed
+ * cost where the ambiguity could actually matter.
  */
 
 import type { TicketId } from "../types";
@@ -185,15 +239,18 @@ export interface DependencyGraph {
   /**
    * Normalized ids claimed by more than one distinct input node (Ruling
    * R10, fix round 1) — sorted for deterministic output, analogous to
-   * `state/fold.ts`'s `BoardState.duplicateTicketIds`. `resolveTier1`
-   * already resolves any of these to `undefined` (indistinguishable from an
-   * unknown id at that layer, and `blockers()` reports both the same way —
-   * still outstanding), but `wouldCreateCycle` reads this field directly to
-   * refuse rather than treat an ambiguous endpoint as a leaf — see this
-   * file's header for why the two "unresolved" facts need opposite
-   * handling there.
+   * `state/fold.ts`'s `BoardState.duplicateTicketIds`. Named `collidedIds`,
+   * not `ambiguousIds` (fix round 2, Ruling R24) — see this file's header.
+   * `resolveTier1` already resolves any of these to `undefined`
+   * (indistinguishable from an unknown id at that layer, and `blockers()`
+   * reports both the same way — still outstanding), but `wouldCreateCycle`
+   * reads this field directly, both at the two proposed endpoints and at
+   * every node its walk passes through (Ruling R26, fix round 2), to refuse
+   * rather than treat an ambiguous id as a leaf anywhere it could hide the
+   * walk's true path — see this file's header for why the two "unresolved"
+   * facts need opposite handling there.
    */
-  readonly ambiguousIds: readonly string[];
+  readonly collidedIds: readonly string[];
 }
 
 /**
@@ -348,7 +405,7 @@ export function buildGraph(nodes: readonly DependencyGraphNode[]): DependencyGra
     }
   }
 
-  return { edges, nodesByKey, ambiguousIds: [...ambiguousKeys].sort() };
+  return { edges, nodesByKey, collidedIds: [...ambiguousKeys].sort() };
 }
 
 /**
@@ -366,7 +423,7 @@ export function buildGraph(nodes: readonly DependencyGraphNode[]): DependencyGra
  * function for it; `blockers` here is a general graph query (useful for a
  * future `dep list`-style command), not the readiness gate itself.
  *
- * **An edge whose target id is ambiguous (in `DependencyGraph.ambiguousIds`,
+ * **An edge whose target id is ambiguous (in `DependencyGraph.collidedIds`,
  * Ruling R10) is treated exactly like an edge whose target names no ticket
  * at all** — `edge.to` is `undefined` either way, and both fail closed here
  * as "still outstanding." That is deliberately the *same* handling for both
@@ -374,6 +431,24 @@ export function buildGraph(nodes: readonly DependencyGraphNode[]): DependencyGra
  * treat them differently — see this file's header for why a report-only
  * query and a gate that decides whether an add proceeds need opposite care
  * for the same ambiguity.
+ *
+ * **`blockers(g, id)` where `id` itself names an AMBIGUOUS subject
+ * over-reports, on purpose (Ruling R29, fix round 2, documented not fixed).**
+ * `id` is matched by `normalizeDependencyId(edge.from) === normalizeDependencyId(id)`
+ * — every edge whose *source* normalizes to `id`'s key, from *either*
+ * colliding ticket, since `indexById`'s collision handling only ever removes
+ * a colliding id from `nodesByKey` (the resolution-*target* side), never
+ * filters `buildGraph`'s per-node edge emission (the resolution-*source*
+ * side). So a caller asking "what blocks the ambiguous id `ck-1`" gets both
+ * `ck-1`'s and `CK-1`'s outstanding blockers merged into one list, with no
+ * way to tell which ticket contributed which edge. That is **fail-closed and
+ * correct** — this function's whole contract is "never under-report a
+ * blocker," and merging both colliders' edges can only ever add outstanding
+ * blockers, never drop a real one — but it is surprising, and future work
+ * must not "fix" it into filtering by one collider's edges only (that would
+ * be fail-*open*: silently dropping whichever ticket's blockers got
+ * filtered out, based on an arbitrary tie-break this graph has no basis for
+ * making).
  */
 export function blockers(graph: DependencyGraph, id: TicketId): readonly DependencyEdge[] {
   const key = normalizeDependencyId(id);
@@ -390,52 +465,120 @@ export function blockers(graph: DependencyGraph, id: TicketId): readonly Depende
 }
 
 /**
+ * The result of `wouldCreateCycle` — never a bare boolean (Ruling R27, fix
+ * round 2). The function refuses for two facts with **opposite remedies**:
+ * a genuine cycle (the graph shape is wrong — pick a different edge) versus
+ * an ambiguous id somewhere on the walk (the *board data* is wrong — go
+ * disambiguate that id before retrying the same edge). Collapsing both into
+ * one `true` — which fix round 1 did, permitted by that round's own ruling —
+ * would make `dep add` report "cycle detected" when the truth is "that id is
+ * ambiguous," the exact opposite-facts-opposite-remedies principle
+ * `state/queries.ts`'s `STATE_TICKET_ID_AMBIGUOUS` /
+ * `STATE_TICKET_NOT_IN_BOARD_STATE` split (M2.8) already established for
+ * this codebase (see this module's own Ruling R2). Mirrors
+ * `ReadinessVerdict`'s own discipline: a discriminated result is the primary
+ * surface, not a boolean plus an out-of-band error.
+ *
+ * `id`, where present, is the **normalized** (`normalizeDependencyId`)
+ * offending id a caller should tell the user to disambiguate —
+ * `"ambiguous-endpoint"` names `from` or `to` itself when one of them
+ * collided (prefers `from` if both did); `"ambiguous-interior"` names the
+ * **collided target id** that a same-type out-edge somewhere on the walk
+ * pointed at (Ruling R26) — NOT the node whose edge that was, which is not
+ * itself ambiguous. Either way, `id` always matches an entry in
+ * `DependencyGraph.collidedIds` exactly, so a caller can cross-reference
+ * directly without re-normalizing or re-deriving which id is the actual
+ * problem.
+ */
+export type CycleCheckResult =
+  | { readonly refused: false }
+  | { readonly refused: true; readonly reason: "cycle" }
+  | { readonly refused: true; readonly reason: "ambiguous-endpoint"; readonly id: string }
+  | { readonly refused: true; readonly reason: "ambiguous-interior"; readonly id: string };
+
+/**
  * Would adding a `type` edge from `from` to `to` close a cycle? Only
  * `"blocks"` and `"parent-child"` are ever checked (Ruling R4) — every other
- * type returns `false` immediately, never refused for cycling. A self-loop
- * (`from` and `to` naming the same ticket, tier 1) is trivially a cycle.
- * Otherwise: walk the existing same-type, resolved edges starting at `to`;
- * if that walk can already reach `from`, the proposed edge would close the
- * loop.
+ * type is never refused for cycling, immediately. A self-loop (`from` and
+ * `to` naming the same ticket, tier 1) is trivially a cycle. Otherwise: walk
+ * the existing same-type, resolved edges starting at `to`; if that walk can
+ * already reach `from`, the proposed edge would close the loop. See
+ * `CycleCheckResult`'s own doc for why the result is a discriminated union,
+ * not a boolean (Ruling R27, fix round 2).
  *
- * **Refuses (returns `true`) when either `from` or `to` is one of
- * `graph.ambiguousIds` (Ruling R10, fix round 1) — checked before the
- * self-loop/walk logic below, for `"blocks"`/`"parent-child"` only.** An
- * ambiguous id is not an ordinary leaf: `blockers()` may safely treat
- * "unresolved because ambiguous" the same as "unresolved because unknown"
- * (both fail closed to "still outstanding" there), but this function decides
- * whether an add *proceeds* — treating an ambiguous endpoint as a leaf here
- * would let a cycle-creating add through simply because this graph could not
- * tell which of the colliding tickets `from`/`to` actually names. See this
- * file's header for the fuller reasoning.
+ * **Refuses at the two proposed ENDPOINTS** when either `from` or `to` is
+ * one of `graph.collidedIds` (Ruling R10, fix round 1) — checked before the
+ * self-loop/walk logic below. **Refuses INTERIOR to the walk too** (Ruling
+ * R26, fix round 2): fix round 1 only checked the two endpoints
+ * `wouldCreateCycle` was actually called with, but the walk below can pass
+ * *through* a same-type edge whose target collided on some *other* node
+ * along the chain — and that edge's `to` is `undefined` exactly like a leaf
+ * edge to an unknown id, invisible to the walk either way. Treating a
+ * collided interior node as an ordinary dead end let a real cycle through
+ * undetected whenever the collision sat mid-chain rather than at an endpoint
+ * (`regress-interior.ts`, fix round 2's own proof — fix round 1's endpoint-
+ * only tests happened to put the collider at an endpoint every time, which
+ * is why this went unnoticed).
+ *
+ * An ambiguous id is not an ordinary leaf in either position:
+ * `blockers()` may safely treat "unresolved because ambiguous" the same as
+ * "unresolved because unknown" (both fail closed to "still outstanding"
+ * there), but this function decides whether an add *proceeds* — treating an
+ * ambiguous id as a leaf anywhere on the walk would let a cycle-creating add
+ * through simply because this graph could not tell which of the colliding
+ * tickets that id actually names. See this file's header for the fuller
+ * reasoning, including why the interior check is walk-time (only refusing
+ * where the ambiguity is actually reachable) rather than "collidedIds
+ * non-empty anywhere" (which would over-refuse unrelated adds).
  */
 export function wouldCreateCycle(
   graph: DependencyGraph,
   from: TicketId,
   type: DependencyEdgeType,
   to: TicketId,
-): boolean {
+): CycleCheckResult {
   if (!ORDERING_EDGE_TYPES.has(type)) {
-    return false;
+    return { refused: false };
   }
 
   const fromKey = normalizeDependencyId(from);
   const toKey = normalizeDependencyId(to);
+  const collided = new Set(graph.collidedIds);
 
-  if (graph.ambiguousIds.includes(fromKey) || graph.ambiguousIds.includes(toKey)) {
-    return true;
+  if (collided.has(fromKey)) {
+    return { refused: true, reason: "ambiguous-endpoint", id: fromKey };
+  }
+  if (collided.has(toKey)) {
+    return { refused: true, reason: "ambiguous-endpoint", id: toKey };
   }
 
   if (fromKey === toKey) {
-    return true;
+    return { refused: true, reason: "cycle" };
   }
 
   const adjacency = new Map<string, string[]>();
+  // Nodes with a same-type out-edge that is SEVERED — unresolved because its
+  // target collided, not because it names an unknown id (Ruling R26). Maps
+  // the severed node's key to the COLLIDED id that severed it (not just a
+  // presence flag) — that collided id is the offending id `CycleCheckResult`
+  // reports, matching `graph.collidedIds`'s own normalized form exactly, so
+  // a caller told "ambiguous-interior" learns which board id to disambiguate
+  // rather than the unrelated node that happened to name it. The walk below
+  // cannot know where a severed edge actually leads, so it must refuse
+  // rather than treat the node as a dead end whenever it reaches one.
+  const severed = new Map<string, string>();
   for (const edge of graph.edges) {
-    if (edge.type !== type || edge.to === undefined) {
+    if (edge.type !== type) {
       continue;
     }
     const a = normalizeDependencyId(edge.from);
+    if (edge.to === undefined) {
+      const rawIdKey = normalizeDependencyId(edge.rawId);
+      if (collided.has(rawIdKey) && !severed.has(a)) {
+        severed.set(a, rawIdKey);
+      }
+      continue; // an ordinary unresolved (unknown-id) edge is a genuine leaf -- not added to adjacency, not severed.
+    }
     const b = normalizeDependencyId(edge.to);
     const bucket = adjacency.get(a);
     if (bucket === undefined) {
@@ -450,17 +593,21 @@ export function wouldCreateCycle(
   while (stack.length > 0) {
     const current = stack.pop() as string;
     if (current === fromKey) {
-      return true;
+      return { refused: true, reason: "cycle" };
     }
     if (visited.has(current)) {
       continue;
     }
     visited.add(current);
+    const collidedTarget = severed.get(current);
+    if (collidedTarget !== undefined) {
+      return { refused: true, reason: "ambiguous-interior", id: collidedTarget };
+    }
     for (const next of adjacency.get(current) ?? []) {
       if (!visited.has(next)) {
         stack.push(next);
       }
     }
   }
-  return false;
+  return { refused: false };
 }

@@ -1614,42 +1614,54 @@ describe("append — expectedParent (M2.10 slice 0)", () => {
     expect(tickets).toEqual(["ck-competitor", "ck-seed"]);
   });
 
-  test("a stale expectedParent does not drive an internal retry — the caller owns it", async () => {
+  test("a CAS rejection with expectedParent set does not drive an internal retry — the caller owns it", async () => {
     const repo = await tempRepo();
     const adapter = await createGitAdapter(repo.dir);
 
     await append(adapter, COORD_REF, claim("ck-seed"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
-    const staleTip = await adapter.readRef(COORD_REF);
-    if (staleTip === null) {
+    const correctTip = await adapter.readRef(COORD_REF);
+    if (correctTip === null) {
       throw new Error("expected the seeded ref to already exist");
     }
-    await append(adapter, COORD_REF, claim("ck-competitor"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
 
     let attempts = 0;
     const hooks: AppendHooks = {
       beforeCas: async () => {
         attempts += 1;
+        // Force this attempt's `commitTreeToRef` to lose the race by moving
+        // the tip out from under it, between this attempt's read (which saw
+        // `correctTip`, matching `expectedParent`) and its commit — the
+        // identical interloper mechanism the "CAS retry re-reads" describe
+        // block above uses, but here `expectedParent` is set, so this
+        // exercises the *second* throw site (a rejected commit), not the
+        // first (a mismatched read).
+        await append(adapter, COORD_REF, claim("ck-interloper"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
       },
     };
 
-    // A generous `maxAttempts` — if a mismatched `expectedParent` were ever
-    // reported as `{ done: false }` instead of thrown, `withCasRetry` would
-    // drive this loop through up to 50 attempts (each re-reading, and each
-    // hitting the identical mismatch, since nothing here ever makes
-    // `staleTip` current again) before finally giving up with the wrong
-    // error code.
+    // A generous `maxAttempts` — if this rejection were ever reported as
+    // `{ done: false }` instead of thrown, `withCasRetry` would drive a real
+    // second attempt (and `beforeCas` would fire again) instead of
+    // propagating the error on the first.
     await expectCode(
       appendCore(
         adapter,
         COORD_REF,
         claim("ck-mine"),
-        { now: SEPT_15_MS, casRetry: { ...FAST_RETRY, maxAttempts: 50 }, expectedParent: staleTip },
+        { now: SEPT_15_MS, casRetry: { ...FAST_RETRY, maxAttempts: 50 }, expectedParent: correctTip },
         hooks,
       ),
       EventErrorCodes.EVENT_APPEND_STALE_PARENT,
     );
 
-    expect(attempts).toBeLessThanOrEqual(1);
+    // Exactly 1, not merely "at most 1": proves the commit-rejection path
+    // was genuinely exercised (a silently-hoisted or skipped check would
+    // leave this at 0, the no-op shape the test rules above warn against).
+    expect(attempts).toBe(1);
+
+    const records = await read(adapter, COORD_REF, { now: SEPT_15_MS });
+    const tickets = records.map((r) => r.event.ticket as string).sort();
+    expect(tickets).toEqual(["ck-interloper", "ck-seed"]);
   });
 
   test("a current expectedParent succeeds", async () => {

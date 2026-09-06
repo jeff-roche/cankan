@@ -45,6 +45,13 @@ function fakeConfigResult(layers: readonly LoadedLayer[]): ConfigResult {
   };
 }
 
+/** White-box process tests are not testing repository authorization. */
+function spawnTrustedHook(
+  request: Omit<Parameters<typeof spawnHook>[0], "repoTrusted">,
+) {
+  return spawnHook({ ...request, repoTrusted: true });
+}
+
 function fakeLayer(
   layer: LoadedLayer["layer"],
   file: string,
@@ -324,7 +331,7 @@ describe("PLAN.md's two 'Done when' tests", () => {
 
   test("2. a hanging hook is killed at timeout", async () => {
     const startedAt = Date.now();
-    const result = await spawnHook({
+    const result = await spawnTrustedHook({
       layer: "repo",
       file: "/fake/.cankan/config.yml",
       command: "sleep 30",
@@ -382,7 +389,7 @@ describe("obligation 3: the timeout kills the whole process group, including gra
         "wait",
       ].join("\n");
 
-      const result = await spawnHook({
+      const result = await spawnTrustedHook({
         layer: "repo",
         file: "/fake/.cankan/config.yml",
         command,
@@ -438,7 +445,7 @@ describe("obligation 3: the timeout kills the whole process group, including gra
     // A hook with no trap dies on the first SIGTERM -- this exercises the
     // "already gone by the time SIGKILL runs" path in `killGroupSafely`
     // without ever needing a signal-trapping fixture.
-    const result = await spawnHook({
+    const result = await spawnTrustedHook({
       layer: "global",
       file: "/fake/global/config.yml",
       command: "sleep 30",
@@ -474,7 +481,7 @@ describe("obligation 3: the timeout kills the whole process group, including gra
         "wait",
       ].join("\n");
 
-      const result = await spawnHook({
+      const result = await spawnTrustedHook({
         layer: "repo",
         file: "/fake/.cankan/config.yml",
         command,
@@ -545,7 +552,7 @@ describe("obligation 3: the timeout kills the whole process group, including gra
       ].join("\n");
 
       const startedAt = Date.now();
-      const result = await spawnHook({
+      const result = await spawnTrustedHook({
         layer: "repo",
         file: "/fake/.cankan/config.yml",
         command,
@@ -572,8 +579,22 @@ describe("obligation 3: the timeout kills the whole process group, including gra
 });
 
 describe("obligation 2: the five env vars, argv shape, and captured streams", () => {
-  test("6. a non-zero exit is captured in the result, not thrown", async () => {
+  test("spawnHook itself refuses an untrusted repo command before spawning", async () => {
     const result = await spawnHook({
+      layer: "repo",
+      repoTrusted: false,
+      file: "/fake/.cankan/config.yml",
+      command: "exit 99",
+      cwd: process.cwd(),
+      env: { PATH: process.env.PATH },
+      timeoutMs: DEFAULT_HOOK_TIMEOUT_MS,
+    });
+    expect(result.errorCode).toBe(HooksErrorCodes.HOOK_REPO_UNTRUSTED);
+    expect(result.exitCode).toBeNull();
+  });
+
+  test("6. a non-zero exit is captured in the result, not thrown", async () => {
+    const result = await spawnTrustedHook({
       layer: "repo",
       file: "/fake/.cankan/config.yml",
       command: "exit 3",
@@ -587,7 +608,7 @@ describe("obligation 2: the five env vars, argv shape, and captured streams", ()
   });
 
   test("7. both stdout and stderr are captured", async () => {
-    const result = await spawnHook({
+    const result = await spawnTrustedHook({
       layer: "repo",
       file: "/fake/.cankan/config.yml",
       command: "echo out-line; echo err-line 1>&2",
@@ -600,7 +621,7 @@ describe("obligation 2: the five env vars, argv shape, and captured streams", ()
   });
 
   test("8. a hook command that does not exist fails cleanly with the typed error code in the result", async () => {
-    const result = await spawnHook({
+    const result = await spawnTrustedHook({
       layer: "repo",
       file: "/fake/.cankan/config.yml",
       command: "/no/such/cankan-test-binary-xyz --flag",
@@ -622,7 +643,7 @@ describe("obligation 2: the five env vars, argv shape, and captured streams", ()
     const dir = await mkdtemp(join(tmpdir(), "cankan-hooks-injection-"));
     try {
       const outFile = join(dir, "title.txt");
-      const result = await spawnHook({
+      const result = await spawnTrustedHook({
         layer: "repo",
         file: "/fake/.cankan/config.yml",
         command: `printf '%s' "$TITLE" > '${outFile}'`,
@@ -644,7 +665,7 @@ describe("obligation 2: the five env vars, argv shape, and captured streams", ()
   });
 
   test("11. output beyond the 64 KiB cap is truncated, with the marker and the truncation flag set", async () => {
-    const result = await spawnHook({
+    const result = await spawnTrustedHook({
       layer: "repo",
       file: "/fake/.cankan/config.yml",
       // ~70000 bytes of 'a', well over the 65536-byte cap.
@@ -661,7 +682,7 @@ describe("obligation 2: the five env vars, argv shape, and captured streams", ()
   });
 
   test("output at or under the cap is not marked truncated", async () => {
-    const result = await spawnHook({
+    const result = await spawnTrustedHook({
       layer: "repo",
       file: "/fake/.cankan/config.yml",
       command: "printf 'hello'",
@@ -676,7 +697,7 @@ describe("obligation 2: the five env vars, argv shape, and captured streams", ()
 
 describe("12. NUL-byte probe (task brief §5) -- Bun 1.4.0 rejects both cases synchronously", () => {
   test("a NUL byte in an env value (e.g. attacker-influenced $TITLE) fails cleanly as HOOK_SPAWN_FAILED, not thrown", async () => {
-    const result = await spawnHook({
+    const result = await spawnTrustedHook({
       layer: "repo",
       file: "/fake/.cankan/config.yml",
       command: "true",
@@ -691,7 +712,7 @@ describe("12. NUL-byte probe (task brief §5) -- Bun 1.4.0 rejects both cases sy
   });
 
   test("a NUL byte in the resolved command string fails cleanly as HOOK_SPAWN_FAILED, not thrown", async () => {
-    const result = await spawnHook({
+    const result = await spawnTrustedHook({
       layer: "repo",
       file: "/fake/.cankan/config.yml",
       command: "echo hi\0; echo should-not-run",
@@ -846,7 +867,7 @@ describe("environment: merged, never replaced, stdin ignored, cwd explicit", () 
   });
 
   test("stdin is ignored -- a hook that reads stdin sees immediate EOF, not the terminal", async () => {
-    const result = await spawnHook({
+    const result = await spawnTrustedHook({
       layer: "repo",
       file: "/fake/.cankan/config.yml",
       command: "cat; echo done",

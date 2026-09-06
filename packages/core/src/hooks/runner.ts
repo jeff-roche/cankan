@@ -268,6 +268,13 @@ export interface HookSpawnRequest {
   /** Which config layer this command came from. #86 will need this to
    *  decide whether a repo-controlled command may run at all. */
   layer: HookLayer;
+  /**
+   * Explicit authorization for a repo-layer command. `runHooks` obtains this
+   * from the fingerprint-bound trust record; direct callers must do the
+   * equivalent. It is deliberately required so an omitted argument fails
+   * closed rather than becoming a future bypass around this chokepoint.
+   */
+  repoTrusted: boolean;
   /** Absolute path of the config file this command came from. #86 will
    *  need this to name the file a gate refuses. */
   file: string;
@@ -561,10 +568,9 @@ async function readCapped(
  * spawned" (task brief §3, obligation 1). Every hook, from every layer,
  * passes through here -- this is the only `Bun.spawn` call in this module.
  *
- * `runHooks` owns the repo trust gate because it has both the loaded config
- * and the board identity. This low-level helper deliberately assumes that
- * gate has already passed; direct callers are responsible for equivalent
- * authorization before using it.
+ * Repo authorization is enforced here as well as resolved by `runHooks`.
+ * This is defense in depth for direct callers: an untrusted repo request
+ * returns a normal non-executing outcome before `Bun.spawn` is reachable.
  *
  * **`request.env` is used exactly as given -- this function does not call
  * `sanitizeEnvValue`.** That NUL-stripping/length-capping defense (fix
@@ -578,6 +584,20 @@ export async function spawnHook(
   request: HookSpawnRequest,
 ): Promise<HookExecutionResult> {
   const startedAt = performance.now();
+
+  if (request.layer === "repo" && !request.repoTrusted) {
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorCode: HooksErrorCodes.HOOK_REPO_UNTRUSTED,
+      durationMs: Math.round(performance.now() - startedAt),
+      stdout: "",
+      stdoutTruncated: false,
+      stderr: "",
+      stderrTruncated: false,
+    };
+  }
 
   let proc: HookSubprocess;
   try {
@@ -824,6 +844,7 @@ export async function runHooks(
     }
     const execution = await spawnHook({
       layer: hook.layer,
+      repoTrusted: hook.layer !== "repo" || repoHookTrusted,
       file: hook.file,
       command: hook.command,
       cwd: options.repoRoot,

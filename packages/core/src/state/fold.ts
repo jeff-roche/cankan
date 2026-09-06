@@ -27,6 +27,16 @@
  * `takeover` with no `firstSeen` entry would have undefined expiry, exactly
  * the failure mode 7 the observation store exists to prevent.
  *
+ * **...but only when the event's `ticket` joins to a known `StoredTicket`
+ * (Ruling I3, security review).** An orphaned event (Ruling R15) is routed
+ * straight to `BoardState.orphanedEvents` and `foldState` never reads its
+ * `firstSeen` at all, so observing one would write a record under
+ * `$XDG_STATE_HOME` that nothing ever reads back and — because `discard()`
+ * is keyed per ticket lease (M2.10's) — nothing can ever reclaim either. A
+ * peer can push an unbounded number of `claim`s naming nonexistent tickets;
+ * skipping the observe call for those is what keeps the observation store
+ * bounded by real tickets rather than by whatever a peer chooses to push.
+ *
  * ## Lease expiry — the reader's own clock, never the event's
  *
  * `docs/decisions/0001-coordination-ref.md:277-286` flags lease expiry as
@@ -40,10 +50,14 @@
  * - Expiry is computed from the **reader's own first-observation time**:
  *   `firstSeen(eventId) + leaseTtlMs` vs `now` (CONCEPT.md §4:163, ADR 0001
  *   fm7).
- * - The live lease is anchored on the **most recent** `claim`/`takeover`/
- *   `renew` event for a ticket (by chain position — see below), so a
- *   `renew` genuinely extends the lease: its own `firstSeen`, not the
- *   original claim's, is what `now` is compared against.
+ * - The live lease is anchored on the **most recent** `claim`/`takeover`,
+ *   or a `renew` **from the same actor as the current anchor** (by chain
+ *   position — see below and `resolveLeaseAnchor`'s own doc for the full
+ *   state machine, including why a `renew` with no unended incumbent, or
+ *   from a different actor than the incumbent's, is not folded in at all —
+ *   Rulings M1/M2, security review). A qualifying `renew` genuinely extends
+ *   the lease: its own `firstSeen`, not the original claim's, is what `now`
+ *   is compared against.
  * - A missing `firstSeen` entry (an anchoring event this reader never
  *   observed via `observe()`) is **never** treated as "not expired" —
  *   that would let an unobserved event hold a lease forever, the wrong
@@ -164,19 +178,49 @@
  *
  * The alias graph (`alias.from`/`.to`, both ticket-id-shaped and already
  * canonicalized by `events/schema.ts`) is used for exactly one thing here:
- * populating each ticket's `aliases` list (frontmatter `cankan.aliases`
- * union any alias-event chain that resolves to this ticket), which
- * `state/queries.ts`'s `blockedBy` then uses to resolve a `deps[].id` that
- * names an old, pre-adopt id — mirroring `store/ticketStore.ts`'s own
- * `identifiersFor` (id + `display_id` + frontmatter aliases), extended with
- * the alias *events* that module's own file comment says are M2.8's to
- * fold. A malformed alias chain (a cycle, or a self-loop that should have
- * been rejected at the schema boundary but somehow reached this module
- * anyway) cannot infinite-loop the walk — see `resolveAliasTarget` below.
- * An `alias` event's own envelope `ticket` field has no specified
- * convention (nothing in CONCEPT.md or `events/schema.ts` says what it
- * should be set to) and is treated exactly like every other event kind for
- * orphan-counting purposes — it is not otherwise used.
+ * populating each ticket's `eventAliases` list, which `TicketState.aliases`
+ * merges with the frontmatter's own `frontmatterAliases` for display, and
+ * which `state/queries.ts`'s `blockedBy` uses (kept **separate** from
+ * `frontmatterAliases` there — Ruling I1, security review, below) to
+ * resolve a `deps[].id` that names an old, pre-adopt id — mirroring
+ * `store/ticketStore.ts`'s own `identifiersFor` (id + `display_id` +
+ * frontmatter aliases), extended with the alias *events* that module's own
+ * file comment says are M2.8's to fold. A malformed alias chain (a cycle,
+ * or a self-loop that should have been rejected at the schema boundary but
+ * somehow reached this module anyway) cannot infinite-loop the walk — see
+ * `resolveAllAliasTargets` below. An `alias` event's own envelope `ticket`
+ * field has no specified convention (nothing in CONCEPT.md or
+ * `events/schema.ts` says what it should be set to) and is treated exactly
+ * like every other event kind for orphan-counting purposes — it is not
+ * otherwise used.
+ *
+ * **Nothing derived from the alias graph is a mutual-exclusion input.**
+ * `eventAliases` is writable by any contributor with push access to the
+ * coordination ref (the same trust boundary every other event-log-derived
+ * field in this module already assumes — `events/schema.ts`'s `actor` note
+ * applies equally here). Two peers whose local ticket files differ can
+ * legitimately compute a different `aliases`/`blockedBy` result for the
+ * same ticket. That is acceptable for a display convenience or a readiness
+ * hint; it must never be read as agreement between peers the way a claim
+ * is — only the event log's own claim/lease events arbitrate who holds a
+ * ticket, regardless of what the alias graph says about anything.
+ *
+ * **Ruling I1 (security review) — alias resolution that gates a decision
+ * must be tiered, never a flat overwrite.** `state/queries.ts`'s
+ * `buildIdentifierIndex` is the one place an alias resolution actually
+ * decides something (`blockedBy`'s satisfied/outstanding verdict). A flat
+ * `id + displayId + frontmatterAliases + eventAliases` map, built by
+ * unconditional `Map.set()` calls, lets a later entry silently overwrite an
+ * earlier one — verified directly: a well-formed hostile
+ * `alias {from: <victim's real id>, to: <any closed ticket>}` overwrote the
+ * victim's own id entry with the attacker's chosen target, so `blockedBy`
+ * reported the victim's dependents as satisfied without the victim ever
+ * being closed. `buildIdentifierIndex` instead resolves one tier at a time,
+ * most-authoritative first (`id`, then `displayId`, then
+ * `frontmatterAliases`, then `eventAliases`), and a key already claimed by
+ * an earlier tier is never touched by a later one; a same-tier collision
+ * between two different tickets resolves to neither, reported as
+ * unresolved rather than picked arbitrarily — see that function's own doc.
  *
  * ## What this module deliberately does not do
  *
@@ -293,14 +337,42 @@ export interface TicketState {
   /** The frontmatter `cankan.display_id`, verbatim, or `undefined` when absent. `state/queries.ts`'s `blockedBy` resolves a `deps[].id` naming a display id (CONCEPT.md's own `PROJ-45` worked example) against this. */
   readonly displayId: string | undefined;
   /**
-   * Every identifier this ticket is also known by: frontmatter
-   * `cankan.aliases` (as written, on-disk casing) unioned with any
-   * `alias` event chain that resolves to this ticket (already lowercased —
-   * `events/schema.ts` canonicalizes `alias.from`/`.to`). Deduplicated by
+   * Every identifier this ticket is also known by, merged from
+   * `frontmatterAliases` and `eventAliases` below (deduplicated by
    * `normalizeTicketIdForComparison`, preferring the frontmatter-cased form
-   * when both sources name the same id.
+   * when both name the same id) — a display-only convenience for
+   * `show`/`board` ("also known as ..."). **Not for resolving a dependency
+   * or any other decision** — see `frontmatterAliases`'/`eventAliases`'
+   * own docs for why the two provenances must stay distinguishable
+   * wherever a decision (not just a display) is at stake, and see this
+   * file's own header for why nothing derived from the alias graph is a
+   * mutual-exclusion input.
    */
   readonly aliases: readonly string[];
+  /**
+   * The frontmatter's own `cankan.aliases` (as written, on-disk casing) —
+   * repo-controlled: only whoever can write this ticket's file (typically
+   * `adopt`/`renumber`, run locally) can add one. Kept separate from
+   * `eventAliases` (Ruling I1, security review) precisely so a caller
+   * resolving a dependency can weight the two differently — a hostile
+   * `alias` event pushed to the shared coordination ref must not be
+   * indistinguishable from a locally-written fact when one of them gates a
+   * readiness decision. See `state/queries.ts`'s `buildIdentifierIndex`.
+   */
+  readonly frontmatterAliases: readonly string[];
+  /**
+   * Ids that resolve to this ticket via the `alias` event graph
+   * (`fold.ts`'s alias-graph section) — already lowercased
+   * (`events/schema.ts` canonicalizes `alias.from`/`.to`).
+   * **Event-derived, therefore writable by anyone with push access to the
+   * coordination ref** (Ruling I1, security review): a well-formed
+   * `alias {from: <victim>, to: <any ticket>}` is indistinguishable, at
+   * this field alone, from a legitimate adopt/renumber redirect. Kept
+   * separate from `frontmatterAliases` so a caller resolving a dependency
+   * (`state/queries.ts`'s `blockedBy`) can refuse to let this provenance
+   * silently override a more-authoritative one.
+   */
+  readonly eventAliases: readonly string[];
   /**
    * The ticket's own `cankan.deps` entries, verbatim (`[]` when the block or
    * the field is absent) — passed through, not resolved. `state/queries.ts`'s
@@ -430,10 +502,49 @@ function joinEventsToTickets(
 // Lease folding
 // ============================================================================
 
-function isLeaseAnchorEvent(
-  event: Event,
-): event is Extract<Event, { event: LeaseAnchorKind }> {
-  return LEASE_ANCHOR_KINDS.has(event.event);
+type LeaseAnchorEvent = Extract<Event, { event: LeaseAnchorKind }>;
+
+/**
+ * Walks a ticket's lease-affecting events in chain order, tracking the
+ * current anchor (the `claim`/`takeover`/`renew` a live lease would be
+ * anchored on, or `undefined` if there is none right now):
+ *
+ * - `release`/`close`/`expire` end whatever lease is active — anchor
+ *   becomes `undefined`, regardless of what it was.
+ * - `claim`/`takeover` unconditionally become the new anchor, live or not
+ *   (M3, security review: deliberately **not** gated on whether an
+ *   existing anchor is still unexpired — `firstSeen` is reader-local, so a
+ *   "keep the incumbent if unexpired" rule would make two readers disagree
+ *   about the holder, which ADR 0001:801-825 forbids. Whether an honest
+ *   reclaim should even reach this fold as a plain `claim` at all is
+ *   M2.10's write-protocol question, not this fold's to answer by
+ *   inventing a read-side rule).
+ * - `renew` extends the current anchor **only when there is one and its
+ *   actor matches** (M1/M2, security review): a `renew` with no unended
+ *   incumbent in chain order mints a lease from nothing, and a `renew`
+ *   from a different actor than the incumbent's would silently reassign
+ *   the lease to whoever last pushed a `renew` — `actor` is not an
+ *   authenticated identity, so this is not a security boundary, but it
+ *   costs nothing to refuse both: an unqualified `renew` is simply not
+ *   folded in, leaving the prior anchor (if any) exactly as it was.
+ */
+function resolveLeaseAnchor(leaseAffecting: readonly EventRecord[]): LeaseAnchorEvent | undefined {
+  let anchor: LeaseAnchorEvent | undefined;
+
+  for (const record of leaseAffecting) {
+    const event = record.event;
+    if (event.event === "release" || event.event === "close" || event.event === "expire") {
+      anchor = undefined;
+    } else if (event.event === "claim" || event.event === "takeover") {
+      anchor = event;
+    } else if (event.event === "renew") {
+      if (anchor !== undefined && anchor.actor === event.actor) {
+        anchor = event;
+      }
+    }
+  }
+
+  return anchor;
 }
 
 function foldLease(
@@ -443,26 +554,20 @@ function foldLease(
   leaseTtlMs: number,
 ): LeaseState | undefined {
   const leaseAffecting = sortedByChainPosition(bucket.filter((r) => LEASE_AFFECTING_KINDS.has(r.event.event)));
-  if (leaseAffecting.length === 0) {
-    return undefined;
-  }
-  const last = leaseAffecting[leaseAffecting.length - 1] as EventRecord;
-  const event = last.event;
-  if (!isLeaseAnchorEvent(event)) {
-    // Most recent lease-affecting event was a release/close/expire — the
-    // lease has ended, regardless of any earlier claim/takeover/renew.
+  const anchor = resolveLeaseAnchor(leaseAffecting);
+  if (anchor === undefined) {
     return undefined;
   }
 
-  const firstSeenMs = firstSeenMap.get(event.id);
+  const firstSeenMs = firstSeenMap.get(anchor.id);
   const expiresAtMs = firstSeenMs === undefined ? undefined : firstSeenMs + leaseTtlMs;
   const expired = expiresAtMs === undefined ? true : now >= expiresAtMs;
 
   return {
-    actor: event.actor,
-    eventId: event.id,
-    kind: event.event,
-    leaseUntilDisplay: event.lease_until,
+    actor: anchor.actor,
+    eventId: anchor.id,
+    kind: anchor.event,
+    leaseUntilDisplay: anchor.lease_until,
     firstSeenMs,
     expiresAtMs,
     expired,
@@ -510,27 +615,64 @@ function foldStatusAndClose(bucket: readonly EventRecord[]): StatusFold {
 // ============================================================================
 
 /**
- * Follows the `from -> to` redirect graph from `start`, stopping the moment
- * it would revisit an already-visited node. This single guard handles both
- * a genuine cycle (`a -> b -> a`) and a self-loop (`a -> a`, which
- * `events/schema.ts`'s `aliasEventSchema` rejects at the boundary but this
- * function does not assume never reaches it): a self-loop's own target is
- * already in `visited` on the very first step, so the walk stops
- * immediately and returns `start` unchanged. Cycle detection beyond this is
- * explicitly not this module's job (CONCEPT.md §6: `dep add`'s), but a
- * malformed alias chain already in the data must not hang the fold.
+ * Resolves every node in `edges` (the `from -> to` redirect graph) to its
+ * final target, memoizing as it goes so the whole graph is resolved in
+ * amortized-linear time — **not** one from-scratch walk per node (I2,
+ * security review: the original per-call walk was O(N) per node and this
+ * function is called once per node, making the whole build O(N²); measured
+ * directly at N=16,000 that was ~4.7s for `foldState` alone, extrapolating
+ * to tens of seconds at a realistic board size, from a blob any contributor
+ * can push to).
+ *
+ * Each call to the inner `resolve` walks forward from `start`, recording
+ * every node it passes through in `path`, until it hits a node whose target
+ * is already cached (an earlier `resolve` call settled it) or a node it has
+ * already visited **on this walk** (a cycle or self-loop — the same
+ * "stop the moment a node would be revisited" guard the original
+ * `resolveAliasTarget` used, so a genuine cycle or a self-loop that reached
+ * this module despite `aliasEventSchema` rejecting one at the boundary
+ * still terminates, unchanged from before). Once the final target is known,
+ * every node recorded in `path` is cached to it too (path compression), so
+ * a later `resolve` call starting from any of them is O(1).
  */
-function resolveAliasTarget(edges: ReadonlyMap<string, string>, start: string): string {
-  let current = start;
-  const visited = new Set<string>([current]);
-  for (;;) {
-    const next = edges.get(current);
-    if (next === undefined || visited.has(next)) {
-      return current;
+function resolveAllAliasTargets(edges: ReadonlyMap<string, string>): Map<string, string> {
+  const resolved = new Map<string, string>();
+
+  function resolve(start: string): string {
+    const cached = resolved.get(start);
+    if (cached !== undefined) {
+      return cached;
     }
-    visited.add(next);
-    current = next;
+
+    const path: string[] = [];
+    const visitedThisWalk = new Set<string>([start]);
+    let current = start;
+    for (;;) {
+      const already = resolved.get(current);
+      if (already !== undefined) {
+        current = already;
+        break;
+      }
+      const next = edges.get(current);
+      if (next === undefined || visitedThisWalk.has(next)) {
+        break;
+      }
+      path.push(current);
+      visitedThisWalk.add(next);
+      current = next;
+    }
+
+    resolved.set(start, current);
+    for (const node of path) {
+      resolved.set(node, current);
+    }
+    return current;
   }
+
+  for (const from of edges.keys()) {
+    resolve(from);
+  }
+  return resolved;
 }
 
 /**
@@ -554,9 +696,10 @@ function buildAliasEventIndex(
     edges.set(event.from, event.to);
   }
 
+  const resolvedTargets = resolveAllAliasTargets(edges);
+
   const result = new Map<TicketIdLookupKey, string[]>();
-  for (const from of edges.keys()) {
-    const target = resolveAliasTarget(edges, from);
+  for (const [from, target] of resolvedTargets) {
     const targetKey = normalizeTicketIdForComparison(target);
     if (knownIds.has(targetKey)) {
       const list = result.get(targetKey);
@@ -619,6 +762,8 @@ export function foldState(
       lease,
       displayId: stored.ticket.frontmatter.cankan?.display_id,
       aliases: mergeAliases(frontmatterAliases, eventAliases),
+      frontmatterAliases,
+      eventAliases,
       deps: stored.ticket.frontmatter.cankan?.deps ?? [],
     };
   });
@@ -665,9 +810,28 @@ export async function observeAndFold(
   validateLeaseTtlMs(options.leaseTtlMs);
   const now = options.now ?? Date.now();
 
+  // I3 (security review): only observe an anchor id when its event's
+  // `ticket` actually joins to a known `StoredTicket`. `foldState` routes
+  // every orphaned event (Ruling R15) straight into `orphanedEvents` and
+  // never reads its `firstSeen` at all, so observing one writes a record
+  // under `$XDG_STATE_HOME` that nothing will ever read back — and nothing
+  // can ever reclaim it either: `discard()` is keyed per ticket lease
+  // (M2.10's), and an id belonging to no ticket has no lease to key it by.
+  // A peer can push an unbounded number of `claim`s naming nonexistent
+  // tickets; skipping the observe call here is what keeps that from
+  // growing the observation store without bound. Fail-safe in the other
+  // direction too: if the ticket file later appears, the clock for that id
+  // simply starts on that later `observeAndFold` call instead — the same
+  // "over-honor the lease, never under-honor it" direction every other
+  // missing-observation case in this module already takes.
+  const knownIds = new Set<TicketIdLookupKey>(tickets.map((t) => normalizeTicketIdForComparison(t.id)));
   const idsToObserve = new Set<EventId>();
   for (const record of events) {
-    if (LEASE_ANCHOR_KINDS.has(record.event.event)) {
+    if (!LEASE_ANCHOR_KINDS.has(record.event.event)) {
+      continue;
+    }
+    const key = normalizeTicketIdForComparison(record.event.ticket);
+    if (knownIds.has(key)) {
       idsToObserve.add(record.event.id);
     }
   }

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { isCanKanError } from "../../src/errors";
+import { firstSeen } from "../../src/events/index";
 import type { EventId, EventRecord } from "../../src/events/index";
 import { foldState, observeAndFold } from "../../src/state/fold";
 import { StateErrorCodes } from "../../src/state/errors";
@@ -289,6 +290,152 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
     expect(state.tickets[0]?.lease?.actor as string | undefined).toBe("claude-code:bob/wt-x");
     expect(state.tickets[0]?.lease?.expired).toBe(false);
   });
+
+  test("M1 (security review): a lone renew with no unended incumbent mints no lease", () => {
+    const ticket = makeStoredTicket("ck-1", "To Do");
+    const renew = fixtureEvent(
+      { event: "renew", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      "2026-01",
+      0,
+    );
+    const state = foldState([ticket], [renew], {
+      now: 0,
+      leaseTtlMs: 10_000,
+      firstSeen: new Map([[renew.event.id, 0]]),
+    });
+
+    expect(state.tickets[0]?.lease).toBeUndefined();
+  });
+
+  test("M1: a renew after the incumbent has already ended (release) also mints nothing", () => {
+    const ticket = makeStoredTicket("ck-1", "To Do");
+    const claim = fixtureEvent(
+      { event: "claim", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      "2026-01",
+      0,
+    );
+    const release = fixtureEvent({ event: "release", ticket: "ck-1" }, "2026-01", 1);
+    const dangling = fixtureEvent(
+      { event: "renew", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(2) },
+      "2026-01",
+      2,
+    );
+    const state = foldState([ticket], [claim, release, dangling], {
+      now: 0,
+      leaseTtlMs: 10_000,
+      firstSeen: new Map([
+        [claim.event.id, 0],
+        [dangling.event.id, 0],
+      ]),
+    });
+
+    expect(state.tickets[0]?.lease).toBeUndefined();
+  });
+
+  test("M2 (security review): a renew from a different actor than the incumbent neither extends nor reassigns the lease", () => {
+    const ticket = makeStoredTicket("ck-1", "To Do");
+    const claim = fixtureEvent(
+      {
+        event: "claim",
+        ticket: "ck-1",
+        actor: "claude-code:alice/wt-a",
+        lease_until: "2026-01-01T02:00:00Z",
+        id: fixedEventId(1),
+      },
+      "2026-01",
+      0,
+    );
+    const hostileRenew = fixtureEvent(
+      {
+        event: "renew",
+        ticket: "ck-1",
+        actor: "claude-code:mallory/wt-x",
+        lease_until: "2026-01-01T04:00:00Z",
+        id: fixedEventId(2),
+      },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [claim, hostileRenew], {
+      now: 500,
+      leaseTtlMs: 10_000,
+      firstSeen: new Map([
+        [claim.event.id, 0], // the incumbent's own firstSeen — this must still be what expiry is measured against
+        [hostileRenew.event.id, 0],
+      ]),
+    });
+
+    // The lease is still anchored on the original claim: same eventId, same
+    // actor. The hostile renew from a different actor was not folded in at
+    // all — it neither extended the lease nor reassigned it.
+    expect(state.tickets[0]?.lease?.eventId).toBe(claim.event.id);
+    expect(state.tickets[0]?.lease?.kind).toBe("claim");
+    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe("claude-code:alice/wt-a");
+  });
+
+  test("M2: a renew from the SAME actor still genuinely extends the lease (contrast case)", () => {
+    const ticket = makeStoredTicket("ck-1", "To Do");
+    const claim = fixtureEvent(
+      {
+        event: "claim",
+        ticket: "ck-1",
+        actor: "claude-code:alice/wt-a",
+        lease_until: "2026-01-01T02:00:00Z",
+        id: fixedEventId(1),
+      },
+      "2026-01",
+      0,
+    );
+    const sameActorRenew = fixtureEvent(
+      {
+        event: "renew",
+        ticket: "ck-1",
+        actor: "claude-code:alice/wt-a",
+        lease_until: "2026-01-01T04:00:00Z",
+        id: fixedEventId(2),
+      },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [claim, sameActorRenew], {
+      now: 500,
+      leaseTtlMs: 10_000,
+      firstSeen: new Map([
+        [claim.event.id, 0],
+        [sameActorRenew.event.id, 400],
+      ]),
+    });
+
+    expect(state.tickets[0]?.lease?.eventId).toBe(sameActorRenew.event.id);
+    expect(state.tickets[0]?.lease?.kind).toBe("renew");
+  });
+});
+
+describe("foldState — alias resolution does not blow up quadratically (I2, security review)", () => {
+  test("resolving a long alias chain (N=6000) completes well under a second, not tens of seconds", () => {
+    const N = 6000;
+    const finalId = `ck-${N}`;
+    const ticket = makeStoredTicket(finalId, "To Do");
+    // A chain a0 -> a1 -> a2 -> ... -> aN-1 -> ck-<N>. The pre-memoization
+    // implementation resolved each `from` key with its own from-scratch
+    // walk, making this O(N^2); measured directly (security review) at
+    // N=16,000 that was ~4.7s for `foldState` alone. This asserts a
+    // generous wall-clock bound, not a tight one, to avoid CI flakiness —
+    // the point is "not quadratic," not "exactly this fast."
+    const events: EventRecord[] = [];
+    for (let i = 0; i < N; i++) {
+      const from = i === 0 ? "a0" : `a${i}`;
+      const to = i === N - 1 ? finalId : `a${i + 1}`;
+      events.push(fixtureEvent({ event: "alias", ticket: "ck-x", from, to, id: fixedEventId(i) }, "2026-01", i));
+    }
+
+    const start = performance.now();
+    const state = foldState([ticket], events, { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const elapsedMs = performance.now() - start;
+
+    expect(state.tickets[0]?.aliases).toContain("a0");
+    expect(elapsedMs).toBeLessThan(2000);
+  });
 });
 
 describe("foldState — tie-break stability (Ruling R12/M2.7 contract 1): (month,line), never id", () => {
@@ -522,7 +669,7 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
     });
   });
 
-  test("a renew-only ticket (no claim in this events window) is still observed and folds a live lease", async () => {
+  test("a renew-only ticket (no claim/takeover anywhere in this window) mints no lease (M1), but is still observed", async () => {
     await withEnv(undefined, async () => {
       const ticket = makeStoredTicket("ck-1", "To Do");
       const renew = fixtureEvent(
@@ -530,10 +677,16 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
         "2026-01",
         0,
       );
-      const state = await observeAndFold("test-board-key-3", [ticket], [renew], { now: 1000, leaseTtlMs: 10_000 });
+      const boardKey = "test-board-key-3";
+      const state = await observeAndFold(boardKey, [ticket], [renew], { now: 1000, leaseTtlMs: 10_000 });
 
-      expect(state.tickets[0]?.lease?.kind).toBe("renew");
-      expect(state.tickets[0]?.lease?.expired).toBe(false);
+      // M1 (security review): a `renew` with no unended incumbent in chain
+      // order does not mint a lease from nothing.
+      expect(state.tickets[0]?.lease).toBeUndefined();
+      // It is still observed, though — M2.7's contract 2 is unconditional
+      // on kind, independent of what `foldState` later decides to do with
+      // the resulting `firstSeen` entry.
+      expect(await firstSeen(boardKey, renew.event.id)).toBe(1000);
     });
   });
 
@@ -562,6 +715,43 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
         expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.INVALID_LEASE_TTL);
       }
       expect(threw).toBe(true);
+    });
+  });
+
+  test("I3 (security review): an orphaned claim (no matching ticket file) is never observed", async () => {
+    await withEnv(undefined, async () => {
+      const claim = fixtureEvent(
+        { event: "claim", ticket: "ck-ghost", lease_until: "2099-01-01T00:00:00Z" },
+        "2026-01",
+        0,
+      );
+      const boardKey = "test-board-key-6";
+
+      const state = await observeAndFold(boardKey, [], [claim], { now: 1000, leaseTtlMs: 10_000 });
+
+      expect(state.orphanedEvents).toHaveLength(1);
+      // No observation record was ever written for this id — `foldState`
+      // routes an orphaned event straight to `orphanedEvents` and never
+      // reads its `firstSeen` at all, so a record here would be unbounded,
+      // peer-writable, unreclaimable garbage under $XDG_STATE_HOME.
+      expect(await firstSeen(boardKey, claim.event.id)).toBeNull();
+    });
+  });
+
+  test("code review minor: observeAndFold does NOT observe release/close/expire ids (only the three anchor kinds)", async () => {
+    await withEnv(undefined, async () => {
+      const ticket = makeStoredTicket("ck-1", "To Do");
+      const release = fixtureEvent({ event: "release", ticket: "ck-1" }, "2026-01", 0);
+      const boardKey = "test-board-key-7";
+
+      const state = await observeAndFold(boardKey, [ticket], [release], { now: 1000, leaseTtlMs: 10_000 });
+
+      expect(state.tickets[0]?.lease).toBeUndefined();
+      // If `observeAndFold` over-observed (every lease-affecting kind,
+      // rather than only the three anchor kinds), this would find a
+      // record. This test would also have passed under the old,
+      // under-tested membership — it specifically requires the precise set.
+      expect(await firstSeen(boardKey, release.event.id)).toBeNull();
     });
   });
 });

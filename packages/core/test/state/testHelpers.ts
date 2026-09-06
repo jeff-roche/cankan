@@ -11,12 +11,14 @@ import type { TicketId } from "../../src/types";
  * deliberately, so a test that wants "an id that sorts opposite of chain
  * position" has to pick its `n` values for that on purpose (see
  * `fold.test.ts`'s tie-break test), rather than getting it by accident.
+ * `n` up to 999,999 — wide enough for the I2 quadratic-alias-resolution
+ * regression test's several-thousand-event fixture.
  */
 export function fixedEventId(n: number): string {
-  if (n < 0 || n > 999) {
-    throw new Error("fixedEventId: n must be in [0, 999]");
+  if (n < 0 || n > 999_999) {
+    throw new Error("fixedEventId: n must be in [0, 999999]");
   }
-  return `01${"0".repeat(21)}${String(n).padStart(3, "0")}`;
+  return `01${"0".repeat(18)}${String(n).padStart(6, "0")}`;
 }
 
 /** A raw, not-yet-validated event candidate — every field `parseEvent` needs, kind-specific fields included. */

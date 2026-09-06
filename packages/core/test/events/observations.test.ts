@@ -1103,6 +1103,38 @@ describe("Fix round 3, Minor 3 -- tightening permissions never follows a symlink
  *     probe's own spawn result and folded into the skip reason. If a
  *     future CI leg still skips this test, the printed title carries the
  *     exact exit code and stderr instead of forcing another guess.
+ *
+ * Post-R55 confirmation (orchestrator, round 4) -- the ubuntu skip
+ * *is a verified true positive*, not over-caution. After this fix
+ * shipped, ubuntu CI still skipped, now with `exitCode=1, signalCode=none,
+ * stderr="unshare: write failed /proc/self/uid_map: Operation not
+ * permitted"` -- a real `EPERM` from inside a real, successfully-created
+ * user namespace, not a shell/exec/command-shape artifact. That briefly
+ * looked like a contradiction with the "the real test ran and passed in
+ * 134ms" pre-R53 job cited above, and prompted a since-reverted attempt
+ * (R56) to drop the probe for a platform-only gate. The contradiction
+ * dissolved on inspection of that pre-R53 job's actual code (commit
+ * `c20e1b5`): the capability probe was the *first statement in the test
+ * body*, before any `expect()` call, with a bare early `return` on
+ * non-zero exit -- so that job's probe failed exactly as this one does,
+ * the test asserted nothing, and bun printed `(pass)` for a test that
+ * measured nothing. The 134ms was one cold `spawnSync` of `unshare`, not
+ * a bind-mount remount. The runner image was independently confirmed
+ * identical (`20260831.293.1`) across that job and every job since, ruling
+ * out a runner-side environment change as the explanation too.
+ *
+ * Net conclusion: this CI runner genuinely lacks unprivileged user
+ * namespaces (almost certainly Ubuntu's
+ * `kernel.apparmor_restrict_unprivileged_userns=1`, which permits creating
+ * the namespace but denies the `CAP_SETUID` write to `/proc/self/uid_map`
+ * it needs to finish setup), R40's real assertion has never executed on
+ * ubuntu CI, and this probe's skip is the *correct, evidence-backed*
+ * report of that -- not a defect to fix in this test file. Getting real
+ * ubuntu coverage requires a CI-level change (e.g. a workflow step setting
+ * `kernel.apparmor_restrict_unprivileged_userns=0`, if the runner permits
+ * it), not another change to this test or its probe -- do not re-attempt
+ * a test-level fix for this gap without first checking that sysctl on the
+ * actual runner.
  */
 function probeUnshareCapability(): { readonly available: boolean; readonly reason: string } {
   let probe: Bun.ReadableSyncSubprocess;

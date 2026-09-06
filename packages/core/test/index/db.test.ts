@@ -1,7 +1,18 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { isCanKanError } from "../../src/errors";
 import { INDEX_SCHEMA_VERSION, indexPathFor, openIndex } from "../../src/index/db";
@@ -118,6 +129,49 @@ describe("openIndex -- missing file", () => {
       const cacheDir = join(index.path, "..");
       const st = statSync(cacheDir);
       expect(st.mode & 0o777).toBe(0o700);
+    });
+  });
+});
+
+describe("openIndex -- fix round 1, S1: the cache DIRECTORY's ownership/exclusivity, not just the file inside it", () => {
+  test("a pre-existing 0o777 cankan directory is tightened to 0o700, not left as-is (e7.ts: mkdir never chmods an existing directory)", async () => {
+    await withEnv(undefined, () => {
+      const path = indexPathFor(BOARD_KEY, process.env);
+      const cacheDir = join(path, "..");
+      mkdirSync(cacheDir, { recursive: true });
+      chmodSync(cacheDir, 0o777);
+      expect(statSync(cacheDir).mode & 0o777).toBe(0o777); // fixture sanity
+
+      const index = openIndex({ boardKey: BOARD_KEY });
+      try {
+        // Never throws for this -- a lax pre-existing directory this
+        // process owns is fixed in place, not refused.
+        expect(statSync(cacheDir).mode & 0o777).toBe(0o700);
+      } finally {
+        index.close();
+      }
+    });
+  });
+
+  test("a cankan directory that is a symlink to an attacker's directory is refused, never followed (e2.ts E5: mkdir(recursive) alone stats through the symlink and no-ops)", async () => {
+    await withEnv(undefined, () => {
+      const path = indexPathFor(BOARD_KEY, process.env);
+      const cacheDir = join(path, "..");
+      mkdirSync(join(cacheDir, ".."), { recursive: true });
+      const evilDir = mkdtempSync(join(tmpdir(), "cankan-evil-"));
+      symlinkSync(evilDir, cacheDir);
+
+      try {
+        openIndex({ boardKey: BOARD_KEY });
+        throw new Error("expected a throw");
+      } catch (error) {
+        expect(isCanKanError(error)).toBe(true);
+        expect(isCanKanError(error) && error.code).toBe(IndexErrorCodes.CACHE_PATH_UNAVAILABLE);
+      }
+      // Nothing landed inside the attacker's directory.
+      expect(existsSync(join(evilDir, `${createHash("sha256").update(BOARD_KEY, "utf8").digest("hex")}.db`))).toBe(
+        false,
+      );
     });
   });
 });
@@ -280,6 +334,23 @@ describe("openIndex -- degradation, each case builds a real db then corrupts it"
     });
   });
 
+  /**
+   * Fix round 1, code-review Minor (this comment): the assertion below is
+   * NOT vacuous -- deleting the `lstat` guard this test exercises does
+   * fail the `discardReason` assertion. But its *load-bearing security*
+   * assertion, that the victim file's contents are unchanged, passes with
+   * or without that guard: what actually protects the victim here is
+   * probe-then-discard plus the fact that `rmSync` on the db path removes
+   * the symlink itself, never the target it points at. A future reader
+   * should not conclude from a passing victim-contents assertion alone
+   * that the `lstat` guard is what is being tested for security -- it
+   * isn't, on its own. What the guard uniquely buys is closing the
+   * *write-through* window (the re-plant race this file's `openIndex`
+   * doc comment and `db.ts`'s own comment above the `create: true` calls
+   * both describe): without it, `initializeSchema` would write straight
+   * through a symlink SQLite opened read-write, not merely fail to
+   * unlink one.
+   */
   test("a symlink at the db path is unlinked, never followed, and the victim file is untouched (the security case)", async () => {
     await withEnv(undefined, () => {
       const path = indexPathFor(BOARD_KEY, process.env);

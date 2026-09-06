@@ -23,6 +23,15 @@
  * since `index/` itself cannot import `git/`, `board/` or `events/` to
  * derive or validate it.
  *
+ * `rebuildIndex` -- fix round 1, S2: the recovery primitive for
+ * `IndexErrorCodes.CORRUPT`, the error `queryTickets`/`queryBoardState`/
+ * `reindex` raise for page-level corruption `openIndex`'s own probe
+ * cannot see (it only reads page 1). Closes the handle, discards the file
+ * and its sidecars, and returns a fresh, empty `BoardIndex` the caller
+ * must `reindex()` before querying again -- see `rebuildIndex`'s own doc
+ * comment for the full recovery sequence and why this lives in `db.ts`
+ * rather than `query.ts`/`reindex.ts` self-healing.
+ *
  * ---- full rebuild from an already-folded `BoardState` ---------------------
  *
  * `reindex` -- **takes a `BoardState` the caller already folded** (via
@@ -67,12 +76,19 @@
  *   alone -- nothing downstream needs the raw DDL text or the ambient
  *   `*.sql` module declaration.
  * - Every internal helper in `db.ts` (`resolveCacheHome`, `probe`,
- *   `initializeSchema`, `removeIndexFileAndSidecars`, `isErrnoException`),
- *   `query.ts` (`assertBuilt`, `validateNonNegativeInt`, `loadAliasMaps`,
- *   `loadDepsMap`, `rowToTicketState`, `rowToLease`, `queryOrphanedEvents`,
- *   `queryDuplicateTicketIds`) and the prepared-statement SQL text
- *   constants in `reindex.ts` are cache-internal machinery, not part of
- *   the public surface a caller should build on.
+ *   `initializeSchema`, `removeIndexFileAndSidecars`, `isErrnoException`,
+ *   `ensurePrivateCacheDir`, `tightenCacheDirPermissions`), `query.ts`
+ *   (`assertBuilt`, `guardAgainstCorruption`, `validateNonNegativeInt`,
+ *   `loadAliasMaps`, `loadDepsMap`, `rowToTicketState`, `rowToLease`,
+ *   `queryOrphanedEvents`, `queryDuplicateTicketIds`,
+ *   `queryTicketsUnguarded`) and the prepared-statement SQL text constants
+ *   in `reindex.ts` are cache-internal machinery, not part of the public
+ *   surface a caller should build on. `db.ts`'s `isIndexCorruptionError`
+ *   is exported from that file (so `query.ts`/`reindex.ts` can share it)
+ *   but stays out of this barrel for the same reason -- it is plumbing
+ *   the fix for S2 needed, not something a caller should branch on
+ *   directly (a caller checks `CanKanError.code === IndexErrorCodes.CORRUPT`
+ *   instead).
  * - This module never re-exports anything from `state/`, `../types`, or
  *   any other module it imports -- `BoardState`/`TicketState`/`ActorId`
  *   etc. are already available from those modules' own public surfaces
@@ -81,7 +97,7 @@
  */
 
 export type { BoardIndex, IndexDiscardReason, OpenIndexOptions } from "./db";
-export { INDEX_SCHEMA_VERSION, indexPathFor, openIndex } from "./db";
+export { INDEX_SCHEMA_VERSION, indexPathFor, openIndex, rebuildIndex } from "./db";
 
 export { IndexErrorCodes } from "./errors";
 

@@ -39,6 +39,7 @@
 import type { BoardState } from "../state/index";
 import { CanKanError } from "../errors";
 import type { BoardIndex } from "./db";
+import { isIndexCorruptionError } from "./db";
 import { IndexErrorCodes } from "./errors";
 
 export interface ReindexOptions {
@@ -174,6 +175,23 @@ export function reindex(options: ReindexOptions): ReindexResult {
   try {
     run();
   } catch (cause) {
+    // Fix round 1, S2: before `IndexErrorCodes.CORRUPT` existed, a
+    // corrupt-past-the-probe file's own `DELETE FROM tickets` failed
+    // here on `SQLITE_CORRUPT`/`SQLITE_NOTADB` and was folded into the
+    // generic `REINDEX_FAILED` -- indistinguishable from a genuine
+    // programming error and, worse, the caller's *only* offered remedy
+    // failing for the same reason it was needed (verified directly,
+    // security review: `e6.ts`'s three-round wedge). Mapped to the same
+    // code `query.ts` uses so one `catch` handles corruption discovered
+    // by either a read or a write -- see that code's own doc comment for
+    // the documented recovery (`rebuildIndex()` then `reindex()` again).
+    if (isIndexCorruptionError(cause)) {
+      throw new CanKanError(
+        IndexErrorCodes.CORRUPT,
+        "the index cache is corrupt -- call rebuildIndex() then reindex() again",
+        { cause },
+      );
+    }
     throw new CanKanError(IndexErrorCodes.REINDEX_FAILED, "reindex failed to write the index cache", {
       cause,
     });

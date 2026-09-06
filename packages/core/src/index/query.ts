@@ -30,12 +30,43 @@
  * injection safety (binding already provides that), but because an
  * unvalidated `-1`/`1.5`/`NaN` would have a confusing effect on a SQL
  * `LIMIT` clause rather than a validated one.
+ *
+ * **Fix round 1, S2 -- no raw `SQLiteError` escapes this module.**
+ * `queryTickets`/`queryBoardState` both route their SQLite calls through
+ * `guardAgainstCorruption`, which maps `SQLITE_CORRUPT`/`SQLITE_NOTADB`
+ * (a page the open-time probe never reads, damaged after the fact) and a
+ * malformed `dep_json` value (a `JSON.parse` `SyntaxError`) to
+ * `IndexErrorCodes.CORRUPT` -- see that code's own doc comment for the
+ * wedge this closes and the documented recovery (`rebuildIndex()` then
+ * `reindex()`, both in `db.ts`/`reindex.ts`).
+ *
+ * **Fix round 1, M5 -- `loadAliasMaps`/`loadDepsMap` read every alias/dep
+ * row on every call regardless of `TicketQuery`, measured and left as-is.**
+ * `queryTickets({ limit: 1 })` still costs roughly what `queryTickets({})`
+ * costs, because both load the full alias/dep tables before filtering.
+ * Measured directly on the existing 5,000-ticket perf fixture
+ * (`reindex.perf.test.ts`'s `buildPerfState`, five trials each, this
+ * machine): `{ limit: 1 }` 1.6-3.7ms, `{ status: "To Do" }` (1,000 rows)
+ * 2.2-3.9ms, `{}` (5,000 rows) 5.7-7.7ms. The disproportion the brief
+ * flagged is real -- `limit: 1` does not come close to `O(1)` -- but the
+ * absolute cost is single-digit milliseconds at 5,000 tickets, roughly
+ * three orders of magnitude under issue #37's 2-second budget (which in
+ * any case covers `reindex`, not this path). Left unfixed: joining or
+ * filtering the alias/dep loads by the selected ordinals would add real
+ * complexity (both tables would need a `WHERE ticket_ordinal IN (...)`
+ * keyed off the already-filtered `tickets` result, changing the query
+ * shape from "two flat table scans" to "one dependent on the other's
+ * output") for a saving this measurement does not show is needed at any
+ * board size this project's issue #37 describes. Revisit if a future
+ * measurement on a materially larger board shows otherwise -- this is a
+ * measured judgment call, not a claim that the shape is optimal.
  */
 import type { Database } from "bun:sqlite";
 import type { BoardState, DuplicateTicketId, LeaseState, OrphanedTicketEvents, TicketState } from "../state/index";
 import { CanKanError } from "../errors";
 import type { ActorId, TicketId } from "../types";
 import type { BoardIndex } from "./db";
+import { isIndexCorruptionError } from "./db";
 import { IndexErrorCodes } from "./errors";
 
 /** Filter for `queryTickets`. All fields are ANDed together; an absent field applies no filter. */
@@ -114,6 +145,35 @@ function assertBuilt(index: BoardIndex): void {
       IndexErrorCodes.NOT_BUILT,
       "this index cache has not been reindexed yet -- call reindex() before querying it",
     );
+  }
+}
+
+/**
+ * Runs `fn`, mapping a page-level-corruption-shaped failure (see
+ * `isIndexCorruptionError` in `db.ts`) or a malformed `dep_json` value
+ * (`JSON.parse` throwing `SyntaxError`) to `IndexErrorCodes.CORRUPT` --
+ * fix round 1, S2. A `CanKanError` `fn` itself throws (`INDEX_NOT_BUILT`,
+ * `INDEX_INVALID_QUERY_LIMIT`/`OFFSET`) passes through completely
+ * unchanged: this only maps the raw, untyped errors `bun:sqlite` and
+ * `JSON.parse` throw, never re-wraps this module's own typed ones, and
+ * never swallows a genuinely unexpected error by miscategorizing it as
+ * corruption.
+ */
+function guardAgainstCorruption<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (error) {
+    if (error instanceof CanKanError) {
+      throw error;
+    }
+    if (error instanceof SyntaxError || isIndexCorruptionError(error)) {
+      throw new CanKanError(
+        IndexErrorCodes.CORRUPT,
+        "the index cache is corrupt -- call rebuildIndex() then reindex() before querying again",
+        { cause: error },
+      );
+    }
+    throw error;
   }
 }
 
@@ -222,8 +282,15 @@ function rowToTicketState(row: TicketRow, aliasMaps: AliasMaps, depsMap: Readonl
  * order, preserved rather than recomputed.
  *
  * Throws `INDEX_NOT_BUILT` if `reindex()` has never run against `index`.
+ * Throws `INDEX_CORRUPT` (fix round 1, S2) if a page holding the
+ * requested rows was damaged after the open-time probe already passed --
+ * see this file's header comment.
  */
 export function queryTickets(index: BoardIndex, query: TicketQuery = {}): readonly TicketState[] {
+  return guardAgainstCorruption(() => queryTicketsUnguarded(index, query));
+}
+
+function queryTicketsUnguarded(index: BoardIndex, query: TicketQuery): readonly TicketState[] {
   assertBuilt(index);
   const db = index.db;
 
@@ -330,13 +397,18 @@ function queryDuplicateTicketIds(db: Database): readonly DuplicateTicketId[] {
 /**
  * Reconstructs the full `BoardState` `reindex()` was last called with --
  * all three arrays. Throws `INDEX_NOT_BUILT` if `reindex()` has never run
- * against `index`.
+ * against `index`; throws `INDEX_CORRUPT` (fix round 1, S2) for
+ * after-the-probe page corruption -- see this file's header comment.
+ *
+ * `assertBuilt` is not called explicitly here (code-review Minor M3,
+ * fix round 1) -- `queryTicketsUnguarded` below calls it first, and
+ * object-literal properties evaluate left to right, so `tickets` (which
+ * calls it) always runs before `orphanedEvents`/`duplicateTicketIds`.
  */
 export function queryBoardState(index: BoardIndex): BoardState {
-  assertBuilt(index);
-  return {
-    tickets: queryTickets(index, {}),
+  return guardAgainstCorruption(() => ({
+    tickets: queryTicketsUnguarded(index, {}),
     orphanedEvents: queryOrphanedEvents(index.db),
     duplicateTicketIds: queryDuplicateTicketIds(index.db),
-  };
+  }));
 }

@@ -6,10 +6,10 @@ import { IndexErrorCodes } from "../../src/index/errors";
 import { queryBoardState, queryTickets } from "../../src/index/query";
 import { reindex } from "../../src/index/reindex";
 import { isCanKanError } from "../../src/errors";
-import { byStatus, claimedBy } from "../../src/state/index";
+import { byStatus, claimedBy, foldState } from "../../src/state/index";
 import type { ActorId, TicketId } from "../../src/types";
 import { withEnv } from "../../../test-utils/src/withEnv";
-import { buildRichBoardState, makeLease, makeTicket, sentinelState } from "./testHelpers";
+import { buildRichBoardState, makeLease, makeTicket, RICH_FIXTURE_NOW, sentinelState } from "./testHelpers";
 
 const BOARD_KEY = "query-test-board";
 
@@ -69,7 +69,12 @@ describe("exactness -- issue #37's 'Done when': queries match the fold's own ans
         expect(new Set(state.orphanedEvents.map((o) => o.cause)).size).toBe(2);
 
         reindex({ index, state });
-        const result = queryBoardState(index);
+        // Fix round 3: `expired` is computed at query time, not read back
+        // from a stored boolean -- `RICH_FIXTURE_NOW` must be passed
+        // explicitly so the recomputed value agrees with what the fixture
+        // itself asserts (see that constant's own doc for why the
+        // default `now` would not).
+        const result = queryBoardState(index, { now: RICH_FIXTURE_NOW });
         expect(result).toEqual(state);
       } finally {
         index.close();
@@ -84,7 +89,8 @@ describe("exactness -- issue #37's 'Done when': queries match the fold's own ans
         const { state } = buildRichBoardState();
         expect(state.tickets.length).toBeGreaterThan(0);
         reindex({ index, state });
-        expect(queryTickets(index, {})).toEqual(state.tickets);
+        // Fix round 3: see `RICH_FIXTURE_NOW`'s own doc.
+        expect(queryTickets(index, { now: RICH_FIXTURE_NOW })).toEqual(state.tickets);
       } finally {
         index.close();
       }
@@ -103,7 +109,8 @@ describe("exactness -- issue #37's 'Done when': queries match the fold's own ans
 
         let iterations = 0;
         for (const [status, tickets] of grouped) {
-          expect(queryTickets(index, { status })).toEqual(tickets);
+          // Fix round 3: see `RICH_FIXTURE_NOW`'s own doc.
+          expect(queryTickets(index, { status, now: RICH_FIXTURE_NOW })).toEqual(tickets);
           iterations++;
         }
         expect(iterations).toBe(grouped.size);
@@ -125,7 +132,10 @@ describe("exactness -- issue #37's 'Done when': queries match the fold's own ans
 
         let iterations = 0;
         for (const [actor, tickets] of grouped) {
-          expect(queryTickets(index, { actor })).toEqual(tickets);
+          // Fix round 3: see `RICH_FIXTURE_NOW`'s own doc -- the actor
+          // filter itself is now query-time too, not just the returned
+          // `expired` flag.
+          expect(queryTickets(index, { actor, now: RICH_FIXTURE_NOW })).toEqual(tickets);
           iterations++;
         }
         expect(iterations).toBe(grouped.size);
@@ -135,7 +145,7 @@ describe("exactness -- issue #37's 'Done when': queries match the fold's own ans
         // -- mirroring `claimedBy`, not merely "plausible" (brief section
         // 3, assertion 4).
         expect(grouped.has(ids.expiredLeaseActor)).toBe(false);
-        expect(queryTickets(index, { actor: ids.expiredLeaseActor })).toEqual([]);
+        expect(queryTickets(index, { actor: ids.expiredLeaseActor, now: RICH_FIXTURE_NOW })).toEqual([]);
       } finally {
         index.close();
       }
@@ -258,24 +268,206 @@ describe("TicketQuery filters", () => {
 });
 
 describe("queryTickets -- actor mirrors claimedBy precisely", () => {
-  test("lease_expired = 0 -- a live lease is returned, an expired one for the same-shaped query is not", async () => {
+  /**
+   * Fix round 3: rewritten. The old version of this test gave both
+   * tickets the SAME `expiresAtMs` (`makeLease()`'s shared default) and
+   * relied entirely on a hand-set, mutually contradictory `expired`
+   * literal to tell them apart -- exactly the frozen-boolean shape this
+   * fix round closes. Against the fixed implementation that literal is
+   * never read, so a fixture built that way could no longer distinguish
+   * anything; it would either pass vacuously or fail for the wrong
+   * reason. Rewritten so "live" and "expired" are genuinely different
+   * facts about time (`expiresAtMs` on either side of one shared `now`),
+   * and the fixture deliberately sets the OLD `expired` literal
+   * backwards (`false` on the actually-past-expiry lease) to prove the
+   * query never trusts it.
+   */
+  test("a live lease matches the actor filter; an otherwise-identical lease past its expiresAtMs does not, at the same query `now`", async () => {
     await withEnv(undefined, () => {
       const index = openIndex({ boardKey: BOARD_KEY });
       try {
         const liveActor = "live-actor" as ActorId;
         const expiredActor = "expired-actor" as ActorId;
+        const now = 1_000_000;
         const state = {
           tickets: [
-            makeTicket("ck-live", { lease: makeLease({ actor: liveActor, expired: false }) }),
-            makeTicket("ck-expired", { lease: makeLease({ actor: expiredActor, expired: true }) }),
+            makeTicket("ck-live", {
+              lease: makeLease({ actor: liveActor, firstSeenMs: now - 1_000, expiresAtMs: now + 1_000, expired: false }),
+            }),
+            makeTicket("ck-expired", {
+              // `expired: false` here is deliberately WRONG -- see this
+              // describe block's own comment. `expiresAtMs` is the only
+              // fact that may decide the answer.
+              lease: makeLease({ actor: expiredActor, firstSeenMs: now - 10_000, expiresAtMs: now - 1_000, expired: false }),
+            }),
           ],
           orphanedEvents: [],
           duplicateTicketIds: [],
         };
         reindex({ index, state });
 
-        expect(queryTickets(index, { actor: liveActor }).map((t) => String(t.id))).toEqual(["ck-live"]);
-        expect(queryTickets(index, { actor: expiredActor })).toEqual([]);
+        expect(queryTickets(index, { actor: liveActor, now }).map((t) => String(t.id))).toEqual(["ck-live"]);
+        expect(queryTickets(index, { actor: expiredActor, now })).toEqual([]);
+
+        const all = queryTickets(index, { now });
+        expect(all.find((t) => String(t.id) === "ck-live")?.lease?.expired).toBe(false);
+        expect(all.find((t) => String(t.id) === "ck-expired")?.lease?.expired).toBe(true);
+      } finally {
+        index.close();
+      }
+    });
+  });
+});
+
+/**
+ * Fix round 3 -- the defect this whole round closes, and its mutation
+ * proof. `query.ts` used to answer a LIVENESS question (is this lease
+ * still held) from a value frozen into the cache at `reindex()` time. A
+ * lease's expiry is a pure function of the clock, not a fact about the
+ * board: it can flip from live to expired with NO event and NO change to
+ * any ticket file, so a value cached at reindex time is stale the moment
+ * the clock passes it, and -- unlike every other staleness this cache can
+ * have -- there is nothing for an invalidation strategy to detect,
+ * because the underlying data never changed. See `TicketQuery.now`'s own
+ * doc for the fuller argument; these tests are the empirical proof, not
+ * just an assertion of the argument.
+ *
+ * Modeled directly on the repro this fix round started from
+ * (`scratchpad/sec/stale.ts`): reindex captured while a lease is live,
+ * then queried after the SAME clock has moved past `expiresAtMs`, with
+ * the board never touched in between. Every assertion below compares the
+ * query's answer to a FRESH `foldState()` call at that same later `now`
+ * -- not to a hand-asserted boolean -- so this proves agreement with the
+ * fold, not merely "some plausible-looking flag flipped".
+ */
+describe("fix round 3 -- lease liveness is computed at query time, never frozen at reindex time", () => {
+  type StoredTicketLike = Parameters<typeof foldState>[0][number];
+  type EventRecordLike = Parameters<typeof foldState>[1][number];
+  type EventLike = EventRecordLike["event"];
+
+  function claimFixture(ticketId: string, actor: string, eventId: string) {
+    const claimEvent: EventLike = {
+      event: "claim",
+      ts: "2026-01-01T00:00:00Z",
+      id: eventId as EventLike["id"],
+      actor: actor as ActorId,
+      ticket: ticketId as TicketId,
+      lease_until: "2026-01-01T02:00:00Z",
+    };
+    const ticket: StoredTicketLike = {
+      id: ticketId as TicketId,
+      path: `/fake/board/tickets/${ticketId}.md`,
+      ticket: {
+        frontmatter: { id: ticketId as TicketId, title: "T", status: "Doing" },
+        source: { raw: `---\nid: ${ticketId}\n---\n`, path: `/fake/board/tickets/${ticketId}.md` },
+      },
+    };
+    const records: EventRecordLike[] = [{ event: claimEvent, month: "2026-01", line: 0, position: 0 }];
+    return { ticket, records, eventId: claimEvent.id };
+  }
+
+  test("reindexed while live, queried later past expiry with the board byte-identical -- the query agrees with a FRESH fold at that same later `now`, not with the reindex-time snapshot", async () => {
+    await withEnv(undefined, () => {
+      const index = openIndex({ boardKey: BOARD_KEY });
+      try {
+        const leaseTtlMs = 60_000;
+        const firstSeenMs = 1_000_000;
+        const expiresAtMs = firstSeenMs + leaseTtlMs; // 1,060,000
+        const actor = "alice" as ActorId;
+        const { ticket, records, eventId } = claimFixture("ck-1", actor, "01AAAAAAAAAAAAAAAAAAAAAAAA");
+        const firstSeen = new Map([[eventId, firstSeenMs]]);
+
+        const liveNow = firstSeenMs + 10_000; // well inside the lease
+        const liveFold = foldState([ticket], records, { now: liveNow, leaseTtlMs, firstSeen });
+        expect(liveFold.tickets[0]?.lease?.expired).toBe(false); // sanity: genuinely live at reindex time
+
+        reindex({ index, state: liveFold });
+
+        // The board never changes between here and the query below --
+        // only the clock moves, well past `expiresAtMs`.
+        const afterExpiryNow = expiresAtMs + 120_000;
+        const freshFold = foldState([ticket], records, { now: afterExpiryNow, leaseTtlMs, firstSeen });
+        expect(freshFold.tickets[0]?.lease?.expired).toBe(true); // sanity: genuinely expired by then
+
+        const viaIndexTickets = queryTickets(index, { now: afterExpiryNow });
+        expect(viaIndexTickets).toEqual(freshFold.tickets);
+
+        const viaIndexBoard = queryBoardState(index, { now: afterExpiryNow });
+        expect(viaIndexBoard).toEqual(freshFold);
+
+        // And the actor filter itself caught up, not just the flag on an
+        // unfiltered read -- a second actor asking "is this free?" must
+        // get the true answer, not the reindex-time one.
+        expect(queryTickets(index, { actor, now: afterExpiryNow })).toEqual([]);
+        expect(queryTickets(index, { actor, now: liveNow })).toEqual(liveFold.tickets);
+      } finally {
+        index.close();
+      }
+    });
+  });
+
+  test("the expiry boundary instant itself: now === expiresAtMs is expired (mirrors foldState's `>=`, not `>`)", async () => {
+    await withEnv(undefined, () => {
+      const index = openIndex({ boardKey: BOARD_KEY });
+      try {
+        const leaseTtlMs = 60_000;
+        const firstSeenMs = 1_000_000;
+        const expiresAtMs = firstSeenMs + leaseTtlMs;
+        const { ticket, records, eventId } = claimFixture("ck-boundary", "boundary-actor", "01BBBBBBBBBBBBBBBBBBBBBBBB");
+        const firstSeen = new Map([[eventId, firstSeenMs]]);
+
+        const fold = foldState([ticket], records, { now: firstSeenMs, leaseTtlMs, firstSeen });
+        expect(fold.tickets[0]?.lease?.expiresAtMs).toBe(expiresAtMs); // sanity
+        reindex({ index, state: fold });
+
+        const oneMsEarly = queryTickets(index, { now: expiresAtMs - 1 });
+        const exactBoundary = queryTickets(index, { now: expiresAtMs });
+
+        const foldOneMsEarly = foldState([ticket], records, { now: expiresAtMs - 1, leaseTtlMs, firstSeen });
+        const foldAtBoundary = foldState([ticket], records, { now: expiresAtMs, leaseTtlMs, firstSeen });
+
+        expect(foldOneMsEarly.tickets[0]?.lease?.expired).toBe(false); // sanity
+        expect(foldAtBoundary.tickets[0]?.lease?.expired).toBe(true); // sanity
+
+        expect(oneMsEarly).toEqual(foldOneMsEarly.tickets);
+        expect(exactBoundary).toEqual(foldAtBoundary.tickets);
+      } finally {
+        index.close();
+      }
+    });
+  });
+
+  test("a never-observed lease (firstSeenMs/expiresAtMs undefined) is expired regardless of `now`, and never matches an actor filter -- LeaseState.expired's own 'expired-or-unknown' rule", async () => {
+    await withEnv(undefined, () => {
+      const index = openIndex({ boardKey: BOARD_KEY });
+      try {
+        const actor = "ghost-actor" as ActorId;
+        const state = {
+          tickets: [
+            makeTicket("ck-never-observed", {
+              // `expired: false` here is deliberately WRONG and
+              // deliberately inconsistent with `expiresAtMs: undefined`
+              // (a real fold could never produce this combination -- see
+              // `foldLease`) -- this is the mutation proof for this case
+              // specifically: a fixture whose stored literal says "live"
+              // must still come back `expired: true`, because that
+              // literal is never read. Asserting `true` against a
+              // fixture that ALSO says `true` would pass against the old
+              // frozen-boolean code too, proving nothing (the #97
+              // mistake this fix round exists not to repeat).
+              lease: makeLease({ actor, firstSeenMs: undefined, expiresAtMs: undefined, expired: false }),
+            }),
+          ],
+          orphanedEvents: [],
+          duplicateTicketIds: [],
+        };
+        reindex({ index, state });
+
+        for (const now of [0, 1, 1_000_000, Date.now(), Number.MAX_SAFE_INTEGER]) {
+          const [result] = queryTickets(index, { now });
+          expect(result?.lease?.expired).toBe(true);
+          expect(queryTickets(index, { actor, now })).toEqual([]);
+        }
       } finally {
         index.close();
       }

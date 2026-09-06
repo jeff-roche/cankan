@@ -53,6 +53,24 @@ export function makeLease(overrides: Partial<LeaseState> = {}): LeaseState {
   };
 }
 
+/**
+ * Fix round 3: the clock every `queryTickets(index, { now })` /
+ * `queryBoardState(index, { now })` call against a `makeLease()`-based
+ * fixture must pass, so its query-time-computed `expired` matches the
+ * `expired` the fixture literally asserts. `makeLease`'s own default
+ * `expiresAtMs` (`1_000 + 7_200_000` = 7,201,000) is a tiny absolute epoch
+ * timestamp -- any real `Date.now()` is billions of ms past it, so the
+ * *default* `now` a query would use if none were passed would report
+ * every "live" fixture lease as expired, which is not what these fixtures
+ * are testing. `RICH_FIXTURE_NOW` sits well before that boundary (and
+ * before the fractional-lease fixture's much later `expiresAtMs`, and
+ * before `1_000 + 7_200_000` with room to spare), so every "live" lease
+ * built with `makeLease()`'s defaults is genuinely live at this instant,
+ * and every never-observed lease (`expiresAtMs: undefined`) is still
+ * expired regardless of `now` -- see `LeaseState.expired`'s own doc.
+ */
+export const RICH_FIXTURE_NOW = 500_000;
+
 /** A single-ticket `BoardState` -- used wherever a test just needs *a* real, reindexable board (the "sentinel" fixture the degradation tests seed before corrupting the file). */
 export function sentinelState(id = "ck-sentinel"): BoardState {
   return { tickets: [makeTicket(id)], orphanedEvents: [], duplicateTicketIds: [] };

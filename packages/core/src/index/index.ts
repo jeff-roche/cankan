@@ -104,5 +104,5 @@ export { IndexErrorCodes } from "./errors";
 export type { ReindexOptions, ReindexResult } from "./reindex";
 export { reindex } from "./reindex";
 
-export type { TicketQuery } from "./query";
+export type { QueryBoardStateOptions, TicketQuery } from "./query";
 export { queryBoardState, queryTickets } from "./query";

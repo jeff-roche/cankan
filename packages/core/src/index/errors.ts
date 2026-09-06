@@ -124,7 +124,7 @@ export const IndexErrorCodes = {
   CORRUPT: "INDEX_CORRUPT",
   /**
    * Fix round 1, S2 follow-through: `queryTickets`/`queryBoardState` hit a
-   * `bun:sqlite` error (a `.code` starting with `SQLITE_`) that is
+   * `bun:sqlite` error (a `.code` starting with `SQLITE_`) that
    * `guardAgainstCorruption` did not recognize as `CORRUPT` above --
    * `SQLITE_IOERR`, `SQLITE_READONLY`, `SQLITE_BUSY`, `SQLITE_FULL`, and
    * the like. A genuine I/O or environment failure on the read path,

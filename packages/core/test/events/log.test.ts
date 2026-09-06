@@ -1639,16 +1639,26 @@ describe("append — expectedParent (M2.10 slice 0)", () => {
       },
     };
 
-    // A generous `maxAttempts` — if this rejection were ever reported as
-    // `{ done: false }` instead of thrown, `withCasRetry` would drive a real
-    // second attempt (and `beforeCas` would fire again) instead of
-    // propagating the error on the first.
+    // `attempts === 1` alone does not distinguish "threw" from "returned
+    // `{ done: false }`": a buggy implementation that fell through to
+    // `{ done: false }` here would still show `beforeCas` firing exactly
+    // once on attempt 1, then hit the *first* throw site on attempt 2
+    // (whose fresh `readRef` now sees the interloper's tip, not
+    // `correctTip`) — same final error code, same log contents, same
+    // `attempts` count. `withCasRetry` (`git/retry.ts`) only calls `sleep`
+    // *between* attempts (`if (attemptNumber < maxAttempts) await
+    // sleep(...)`), so counting `sleep` calls is the probe that actually
+    // tells the two apart: a genuine throw on attempt 1 never sleeps; a
+    // silent `{ done: false }` sleeps once before attempt 2.
+    let sleeps = 0;
+    const countingRetry = { backoffMs: () => 0, sleep: async () => { sleeps += 1; }, maxAttempts: 50 };
+
     await expectCode(
       appendCore(
         adapter,
         COORD_REF,
         claim("ck-mine"),
-        { now: SEPT_15_MS, casRetry: { ...FAST_RETRY, maxAttempts: 50 }, expectedParent: correctTip },
+        { now: SEPT_15_MS, casRetry: countingRetry, expectedParent: correctTip },
         hooks,
       ),
       EventErrorCodes.EVENT_APPEND_STALE_PARENT,
@@ -1658,6 +1668,10 @@ describe("append — expectedParent (M2.10 slice 0)", () => {
     // was genuinely exercised (a silently-hoisted or skipped check would
     // leave this at 0, the no-op shape the test rules above warn against).
     expect(attempts).toBe(1);
+    // Zero: proves the rejection *threw* rather than looping back through
+    // `withCasRetry` for a second attempt — the assertion this test exists
+    // for.
+    expect(sleeps).toBe(0);
 
     const records = await read(adapter, COORD_REF, { now: SEPT_15_MS });
     const tickets = records.map((r) => r.event.ticket as string).sort();

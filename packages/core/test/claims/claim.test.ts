@@ -1,4 +1,5 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { writeFixtureTickets } from "../../../test-utils/src/fixtureTickets";
 import { makeTempRepo, type TempRepo } from "../../../test-utils/src/tempRepo";
@@ -100,6 +101,26 @@ async function withTwoWorktreeBoards(
 /** Writes one minimal fixture ticket into `dir` (see `test-utils/src/fixtureTickets.ts`). */
 function fixtureTicket(id: string, title: string): { id: string; title: string; status: string; body: string } {
   return { id, title, status: "To Do", body: `Body for ${title}.` };
+}
+
+/**
+ * Writes one ticket file whose frontmatter carries a `cankan.display_id` —
+ * `writeFixtureTickets` (`test-utils/`) has no display-id hook, so the
+ * displayId-ambiguity tests below write that frontmatter block directly
+ * (the same raw-file shape `ticketStore.test.ts`'s own `rawTicket` helper
+ * uses). One file per id, so the filename itself can't collide even when
+ * two tickets are deliberately given the same `displayId`.
+ */
+async function writeFixtureTicketWithDisplayId(dir: string, id: string, title: string, displayId: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  const content = `---\nid: ${id}\ntitle: ${title}\nstatus: To Do\ncankan:\n  display_id: ${displayId}\n---\n\nBody for ${title}.\n`;
+  // `<id> - <slug>.md` is the required on-disk shape (`ticket/filename.ts`'s
+  // `FILENAME_RE`) — a bare `<id>.md` is silently invisible to `store.list()`.
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+  await writeFile(join(dir, `${id} - ${slug}.md`), content, "utf8");
 }
 
 /** A minimal, valid `close` candidate — cast at the boundary like every other branded-id caller (`TicketId`/`ActorId` carry no runtime constructor; see `types.ts`), mirroring `events/log.test.ts`'s own `claim()`/`release()` test helpers. */
@@ -507,6 +528,71 @@ test("a duplicated ticket id is rejected as ambiguous, never claimed", async () 
     // No event was appended -- the coordination ref must still be entirely
     // uninitialized.
     expect(await adapter.readRef(board.coordinationRef)).toBeNull();
+  });
+});
+
+// ============================================================================
+// 6b. A colliding `displayId` is rejected as ambiguous too — both shapes
+// `resolveTicket`'s doc comment enumerates, proven at more than one entry
+// point (`claim` and `renew`), and a legitimate unique `displayId` still
+// resolves.
+// ============================================================================
+
+test("shape 1: two tickets sharing the same displayId reject claim() as ambiguous, and append nothing", async () => {
+  await withTestBoard(async ({ board }) => {
+    await writeFixtureTicketWithDisplayId(board.ticketsDir, "ck-disp-a", "Display A", "DISP-DUP");
+    await writeFixtureTicketWithDisplayId(board.ticketsDir, "ck-disp-b", "Display B", "DISP-DUP");
+
+    await expectCode(
+      claim({ board, ticket: "DISP-DUP", actor: actorId("actor-disp-dup"), now: NOW }),
+      ClaimErrorCodes.TICKET_AMBIGUOUS,
+    );
+
+    const adapter = await createGitAdapter(board.root);
+    // No event was appended -- the coordination ref must still be entirely
+    // uninitialized, exactly like the duplicated-canonical-id case above.
+    expect(await adapter.readRef(board.coordinationRef)).toBeNull();
+  });
+});
+
+test("shape 2: one ticket's displayId colliding with a DIFFERENT ticket's canonical id rejects renew() as ambiguous, and appends nothing further", async () => {
+  await withTestBoard(async ({ board }) => {
+    // Query "ck-collide-target" matches "ck-collide-target" (the anchor
+    // ticket) by `id`, and ALSO matches "ck-collide-other" by `displayId` --
+    // the second collision shape, distinct from shape 1's "two displayIds
+    // collide with each other." The anchor is claimed BEFORE the colliding
+    // ticket exists, so the claim itself is unambiguous and only the later
+    // `renew` sees the collision.
+    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-collide-target", "Collide target")]);
+    const actor = actorId("actor-collide");
+    const claimed = await claim({ board, ticket: "ck-collide-target", actor, now: NOW });
+    expect(claimed.kind).toBe("claim");
+
+    await writeFixtureTicketWithDisplayId(board.ticketsDir, "ck-collide-other", "Collide other", "ck-collide-target");
+
+    const adapter = await createGitAdapter(board.root);
+    const refAfterClaim = await adapter.readRef(board.coordinationRef);
+    expect(refAfterClaim).not.toBeNull();
+
+    // Now that the query is ambiguous between the two tickets, `renew` --
+    // a second entry point through the same `resolveTicket` -- must reject
+    // rather than silently renewing whichever one `.find()` would have hit
+    // first.
+    await expectCode(renew({ board, ticket: "ck-collide-target", actor, now: NOW }), ClaimErrorCodes.TICKET_AMBIGUOUS);
+
+    // No further event was appended -- the ref is exactly where the earlier
+    // successful claim left it.
+    expect(await adapter.readRef(board.coordinationRef)).toBe(refAfterClaim);
+  });
+});
+
+test("a ticket with a UNIQUE displayId still resolves and claims correctly (the fix does not break legitimate display-id lookup)", async () => {
+  await withTestBoard(async ({ board }) => {
+    await writeFixtureTicketWithDisplayId(board.ticketsDir, "ck-disp-unique", "Display unique", "DISP-UNIQUE");
+
+    const result = await claim({ board, ticket: "DISP-UNIQUE", actor: actorId("actor-disp-unique"), now: NOW });
+    expect(result.kind).toBe("claim");
+    expect(result.ticket as string).toBe("ck-disp-unique");
   });
 });
 

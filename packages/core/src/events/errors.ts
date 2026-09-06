@@ -71,6 +71,33 @@ export const EventErrorCodes = {
    */
   EVENT_APPEND_INVALID_OPTION: "EVENT_APPEND_INVALID_OPTION",
   /**
+   * `append()`'s `AppendOptions.expectedParent` seam (M2.10 slice 0 —
+   * `docs/decisions/0001-coordination-ref.md:696-699`'s "read → check →
+   * build commit off-tree → `updateRefCAS` → on rejection, re-read and
+   * re-check" cycle). Raised by `appendCore`'s `withCasRetry` callback at
+   * two sites sharing one code because they are the same caller-decision-
+   * is-stale condition observed at two different points: a fresh `readRef`
+   * this attempt disagrees with `AppendOptions.expectedParent` (checked on
+   * *every* attempt, before anything else that attempt does), or
+   * `commitTreeToRef` itself was rejected while `expectedParent` was
+   * supplied (someone else's write landed between this attempt's read and
+   * its commit).
+   *
+   * **Both throw rather than report `{ done: false }` — this is the one
+   * condition `append`'s internal `withCasRetry` loop does not retry on its
+   * own.** A thrown error propagates straight out of `withCasRetry`
+   * (`git/retry.ts` retries only on `{ done: false }`), by design: a caller
+   * that supplies `expectedParent` owns the re-check (it needs `state/`'s
+   * fold, which this dispatch may not import — PLAN.md rule 2), so it must
+   * own the retry too — `append` silently re-reading and re-committing on
+   * its own behalf would paper over a decision that may no longer be valid,
+   * the exact double-claim hazard ADR 0001 exists to prevent.
+   *
+   * `details`: `{ ref, expectedParent, actualParent }` — the ref name and
+   * two SHAs (or `null`), never peer-supplied content.
+   */
+  EVENT_APPEND_STALE_PARENT: "EVENT_APPEND_STALE_PARENT",
+  /**
    * `append()`'s own read-check step found the current month file did not
    * end with a trailing newline (ADR 0001:696-699's "check" step,
    * generalized). Appending onto an un-terminated tail would fuse this

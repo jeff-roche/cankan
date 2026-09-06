@@ -177,30 +177,37 @@
  *
  * 1. **A duplicate-id conflict could be "fixed" by evicting the victim
  *    (Critical; Ruling R47).** `FIXABLE_REASONS` used to include
- *    `"duplicate-id-conflict"`, so `recover()` would drop whichever
- *    occurrence's *month happened to sort first* and keep the other —
- *    survivorship by an attacker-controlled position, not by legitimacy
- *    (ADR 0001:811-826 forbids exactly this: no attacker-independent
- *    survivor key among mutually-distrusting peers). An attacker who wanted
- *    to evict a victim's genuine claim could forge the same event id, place
- *    the forgery in an *earlier* month than the victim's real line, and
- *    wait for (or provoke) a recovery run: `recover()` would remove the
- *    victim's later, legitimate line and keep the forgery — the exact
- *    failure fm8(b) warns about, "a silently-granted double-claim." Closed
- *    by removing `"duplicate-id-conflict"` from `FIXABLE_REASONS` entirely:
- *    a duplicate-id conflict is now *always* reported `unresolved`, with a
+ *    `"duplicate-id-conflict"`, so `recover()` walked months oldest-first
+ *    and, on finding two differing occurrences of one event id, kept
+ *    whichever occurrence it reached *first* — the earlier month — and
+ *    quarantined the other. Survivorship by an attacker-controlled month
+ *    ordering, not by legitimacy (ADR 0001:811-826 forbids exactly this: no
+ *    attacker-independent survivor key among mutually-distrusting peers).
+ *    An attacker who wanted to evict a victim's genuine claim could forge
+ *    the same event id, place the forgery in an *earlier* month than the
+ *    victim's real line, and wait for (or provoke) a recovery run:
+ *    `recover()` would keep the earlier-placed forgery and quarantine the
+ *    victim's later, legitimate line — the exact failure fm8(b) warns
+ *    about, "a silently-granted double-claim." Closed by removing
+ *    `"duplicate-id-conflict"` from `FIXABLE_REASONS` entirely: a
+ *    duplicate-id conflict is now *always* reported `unresolved`, with a
  *    `remediation` naming both occurrences (their months and line numbers)
  *    so an operator resolves it by hand; `recover()` never quarantines
  *    either occurrence and never rewrites either month file for this
  *    reason, regardless of which one sorts first.
- * 2. **A blocked `events` prefix made `diagnose()`/`recover()` fail open,
- *    not closed (High; Ruling R48).** `read()`'s own top-level `events`
- *    path was never probed the way `quarantine`'s was — a blob, symlink, or
- *    gitlink planted at the bare `events` path makes every month's
- *    `readBlobFromRef` resolve as "not found" (nothing exists under a
- *    non-tree prefix), so `diagnose()` reported a clean board with zero
- *    months scanned and `recover()` reported `"clean"`, while `read()`
- *    itself would throw. Closed by probing `events` the same way
+ * 2. **A blocked `events` prefix made `read()`/`diagnose()`/`recover()` all
+ *    fail open, not closed (High; Ruling R48).** `read()`'s own top-level
+ *    `events` path was never probed the way `quarantine`'s was — a blob,
+ *    symlink, or gitlink planted at the bare `events` path makes every
+ *    month's `readBlobFromRef` resolve as "not found" (nothing exists
+ *    under a non-tree prefix), so *all three* functions treated a
+ *    completely inaccessible board as an empty one: `read()` itself
+ *    returned `[]` with no error (confirmed by direct probe for all three
+ *    shapes, pre-fix — see `task-4-report.md`'s R48 RED evidence),
+ *    `diagnose()` reported a clean board with zero months scanned, and
+ *    `recover()` reported `"clean"`. Every live claim on the board would
+ *    silently vanish from every peer's read — ADR failure mode 8(b) named
+ *    literally. Closed by probing `events` the same way
  *    `assertQuarantineDirectoryUsable` already probed `quarantine`, via a
  *    new shared, mode-aware, non-throwing discriminator,
  *    `isTreeEntryBlocked` — blocked if the prefix resolves as a real blob,

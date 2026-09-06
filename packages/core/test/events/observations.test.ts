@@ -1071,11 +1071,55 @@ describe("Fix round 3, Minor 3 -- tightening permissions never follows a symlink
  * is acceptable per R53 -- a macOS user can genuinely have a read-only
  * mount, so R40's behaviour matters there; choosing not to test it must be
  * legible, not silent.
+ *
+ * R55 (orchestrator, ubuntu CI regression introduced by R53's own fix) --
+ * in a *prior* CI job, before R53 gated this test on a probe at all, the
+ * real test below ran unconditionally on the ubuntu runner and passed,
+ * executing the actual bind-mount remount in 134ms. In a *later* job,
+ * after R53 shipped, the probe reported "present but unusable" on that
+ * same runner and skipped the test. The probe originally ran `unshare
+ * --user --mount --map-root-user true`, while the real test runs
+ * `unshare --user --mount --map-root-user bash -c <script>`: same flags,
+ * a different command operand. That is the only divergence identified so
+ * far between the two invocations -- it is a hypothesis, not a confirmed
+ * cause, since neither the pre-fix pass nor the post-fix skip reproduces
+ * on any machine this fix was developed against. The fix has two parts:
+ *
+ *  1. The probe now execs `bash -c` with a trivial, side-effect-free
+ *     script (`true`), matching the real test's command family, rather
+ *     than a bare `true` exec, so this identified divergence is closed.
+ *     It still does *not* perform a real mount -- the real test's mount
+ *     runs inside the namespace it just created, which is more than this
+ *     gate needs to check, and R55 is explicit that the probe must
+ *     exercise the same capability the test depends on and nothing
+ *     stricter. (The probe's `env` cannot match the real test's `env`
+ *     exactly -- the real test overrides `HOME`/`XDG_STATE_HOME` from a
+ *     per-test temp dir that doesn't exist yet when this probe runs at
+ *     module load, before any test setup. Neither `unshare` nor a
+ *     non-interactive `bash -c true` consults either variable, so this
+ *     is not expected to matter, but it's a difference worth naming.)
+ *  2. Because (1) is a hypothesis, the probe is now self-diagnosing:
+ *     `exitCode`, `signalCode`, and `stderr` are captured from the
+ *     probe's own spawn result and folded into the skip reason. If a
+ *     future CI leg still skips this test, the printed title carries the
+ *     exact exit code and stderr instead of forcing another guess.
  */
 function probeUnshareCapability(): { readonly available: boolean; readonly reason: string } {
-  let probe: ReturnType<typeof Bun.spawnSync>;
+  let probe: Bun.ReadableSyncSubprocess;
   try {
-    probe = Bun.spawnSync(["unshare", "--user", "--mount", "--map-root-user", "true"]);
+    // Same command family as the real test's spawn below (`unshare ...
+    // bash -c <script>`) and the same stdio shape; `env` is process.env
+    // unmodified (the real test's HOME/XDG_STATE_HOME override doesn't
+    // exist yet at module load -- see the doc comment above). Only the
+    // script body differs (a no-op instead of the real bind-mount
+    // remount), so this probe should not fail for a reason the real
+    // invocation wouldn't -- see the doc comment above for why that's a
+    // hypothesis this probe now also diagnoses, not a settled fact.
+    probe = Bun.spawnSync(["unshare", "--user", "--mount", "--map-root-user", "bash", "-c", "true"], {
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
   } catch (error) {
     // `Bun.spawnSync` throws (rather than returning a non-zero exit code)
     // when the executable itself isn't found -- confirmed directly, `code:
@@ -1090,9 +1134,14 @@ function probeUnshareCapability(): { readonly available: boolean; readonly reaso
     throw error;
   }
   if (probe.exitCode !== 0) {
+    const stderr = probe.stderr.toString().trim();
     return {
       available: false,
-      reason: "`unshare --user --mount --map-root-user` is present but exited non-zero -- present-but-unusable (e.g. a container without the needed namespace privilege), same as an absent binary for this test's purposes",
+      reason:
+        "`unshare --user --mount --map-root-user bash -c true` is present but exited non-zero -- " +
+        `present-but-unusable (e.g. a container without the needed namespace privilege), same as an ` +
+        `absent binary for this test's purposes (exitCode=${probe.exitCode}, ` +
+        `signalCode=${probe.signalCode ?? "none"}, stderr=${JSON.stringify(stderr)})`,
     };
   }
   return { available: true, reason: "" };

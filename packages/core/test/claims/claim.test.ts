@@ -163,9 +163,11 @@ test("exactly one winner under a real two-worktree race", async () => {
 // ============================================================================
 
 describe("claimCore — deterministic retry via the beforeAppend hook", () => {
-  test("a competitor claiming the SAME ticket on attempt 1 forces a real retry, then a named rejection", async () => {
-    await withTestBoard(async ({ board }) => {
-      await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-race2", "Race two")]);
+  test("a competitor claiming the SAME ticket, from a SECOND worktree, on attempt 1 forces a real retry, then a named rejection", async () => {
+    await withTwoWorktreeBoards(async ({ board, board2 }) => {
+      const ticket = fixtureTicket("ck-race2", "Race two");
+      await writeFixtureTickets(board.ticketsDir, [ticket]);
+      await writeFixtureTickets(board2.ticketsDir, [ticket]);
 
       const beforeAppendAttempts: number[] = [];
       const retriesScheduled: number[] = [];
@@ -174,11 +176,13 @@ describe("claimCore — deterministic retry via the beforeAppend hook", () => {
         beforeAppend: async (attemptNumber) => {
           beforeAppendAttempts.push(attemptNumber);
           if (beforeAppendAttempts.length === 1) {
-            // A full, independent `claim()` call for the SAME ticket,
-            // landed while this attempt's own decision is still in flight
-            // -- guaranteed (not merely probable) to move the ref's tip
-            // out from under this attempt's `expectedParent`.
-            await claim({ board, ticket: "ck-race2", actor: competitor, now: NOW });
+            // A full, independent `claim()` call from the SECOND worktree,
+            // for the SAME ticket, landed while this attempt's own decision
+            // is still in flight -- guaranteed (not merely probable) to
+            // move the ref's tip out from under this attempt's
+            // `expectedParent`, the same way a genuine second worktree
+            // would.
+            await claim({ board: board2, ticket: "ck-race2", actor: competitor, now: NOW });
           }
         },
       };
@@ -217,9 +221,11 @@ describe("claimCore — deterministic retry via the beforeAppend hook", () => {
     });
   });
 
-  test("mirror case: a competitor claiming a DIFFERENT ticket still forces a retry, which then succeeds", async () => {
-    await withTestBoard(async ({ board }) => {
-      await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-mine3", "Mine three"), fixtureTicket("ck-other3", "Other three")]);
+  test("mirror case: a competitor claiming a DIFFERENT ticket, from a SECOND worktree, still forces a retry, which then succeeds", async () => {
+    await withTwoWorktreeBoards(async ({ board, board2 }) => {
+      const tickets = [fixtureTicket("ck-mine3", "Mine three"), fixtureTicket("ck-other3", "Other three")];
+      await writeFixtureTickets(board.ticketsDir, tickets);
+      await writeFixtureTickets(board2.ticketsDir, tickets);
 
       const beforeAppendAttempts: number[] = [];
       const retriesScheduled: number[] = [];
@@ -227,7 +233,7 @@ describe("claimCore — deterministic retry via the beforeAppend hook", () => {
         beforeAppend: async (attemptNumber) => {
           beforeAppendAttempts.push(attemptNumber);
           if (beforeAppendAttempts.length === 1) {
-            await claim({ board, ticket: "ck-other3", actor: actorId("actor-competitor3"), now: NOW });
+            await claim({ board: board2, ticket: "ck-other3", actor: actorId("actor-competitor3"), now: NOW });
           }
         },
       };
@@ -313,6 +319,69 @@ test("two concurrent --force calls converge on exactly one holder, never GIT_CAS
     if (!isCanKanError(reason)) throw new Error("expected a CanKanError rejection");
     expect(reason.code).toBe(ErrorCodes.CLAIM_REJECTED);
     expect(reason.code).not.toBe(GitErrorCodes.GIT_CAS_CONTENTION_EXCEEDED);
+  });
+});
+
+test("the ping-pong guard, deterministically: a retry that observes a DIFFERENT holder than the one this call committed to forcing stops forcing and rejects", async () => {
+  // The `Promise.allSettled` test above is a real race -- it *should*
+  // interleave (git subprocess calls yield repeatedly), but that is an
+  // estimate, not a measurement, and this project has been burned by
+  // exactly that gap before (predicted ~490 subprocess spawns, measured
+  // 611). This test isolates the ping-pong rule deterministically via the
+  // `beforeAppend` hook, so it cannot pass by accident of timing.
+  await withTestBoard(async ({ board }) => {
+    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-force-pingpong", "Force ping-pong")]);
+    const original = actorId("actor-original-pp");
+    const interloperForcer = actorId("actor-interloper-forcer");
+    const myself = actorId("actor-my-force");
+
+    await claim({ board, ticket: "ck-force-pingpong", actor: original, now: NOW });
+
+    const beforeAppendAttempts: number[] = [];
+    const retriesScheduled: number[] = [];
+    const hooks: ClaimHooks = {
+      beforeAppend: async (attemptNumber) => {
+        beforeAppendAttempts.push(attemptNumber);
+        if (beforeAppendAttempts.length === 1) {
+          // By the time this fires, `myself`'s attempt 1 has already
+          // decided to force `original` and recorded it as the holder this
+          // call committed to. A second, independent forced takeover lands
+          // here -- `interloperForcer` over `original` -- before `myself`'s
+          // own append runs, so `myself`'s next attempt observes a holder
+          // that is neither `original` nor `myself`.
+          await claim({ board, ticket: "ck-force-pingpong", actor: interloperForcer, now: NOW, force: true });
+        }
+      },
+    };
+
+    const rejection = await expectCode(
+      claimCore(
+        {
+          board,
+          ticket: "ck-force-pingpong",
+          actor: myself,
+          now: NOW,
+          force: true,
+          casRetry: {
+            maxAttempts: 5,
+            backoffMs: (attemptNumber) => {
+              retriesScheduled.push(attemptNumber);
+              return 0;
+            },
+          },
+        },
+        hooks,
+      ),
+      ErrorCodes.CLAIM_REJECTED,
+    );
+
+    expect(retriesScheduled).toEqual([1]);
+    expect(beforeAppendAttempts).toEqual([1]);
+    expect(rejection.details?.reason).toBe("already-held");
+    expect(rejection.details?.holder).toBe(interloperForcer);
+    // The guard stops forcing on the very next attempt rather than chasing
+    // the interloper -- never a confusing contention error.
+    expect(rejection.code).not.toBe(GitErrorCodes.GIT_CAS_CONTENTION_EXCEEDED);
   });
 });
 

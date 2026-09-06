@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { isCanKanError } from "../../src/errors";
 import { StateErrorCodes } from "../../src/state/errors";
 import { foldState } from "../../src/state/fold";
+import type { BoardState, TicketState } from "../../src/state/fold";
 import { blockedBy, byStatus, claimedBy } from "../../src/state/queries";
 import type { ActorId, TicketId } from "../../src/types";
 import { fixtureEvent, makeStoredTicket } from "./testHelpers";
@@ -261,5 +262,58 @@ describe("blockedBy", () => {
     expect(outstanding).toHaveLength(1);
     expect(outstanding[0]?.rawId).toBe("DUP");
     expect(outstanding[0]?.resolvedTicket).toBeUndefined();
+  });
+
+  test("Ruling D1 (fix round 5, security review): a duplicated ticket id fails closed, identically regardless of array order", () => {
+    const lower = makeStoredTicket("ck-1", "To Do");
+    const upper = makeStoredTicket("CK-1", "Done");
+
+    const forward = foldState([lower, upper], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const reversed = foldState([upper, lower], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+    for (const state of [forward, reversed]) {
+      let threw = false;
+      try {
+        blockedBy(state, "ck-1" as TicketId);
+      } catch (error) {
+        threw = true;
+        expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.TICKET_NOT_IN_BOARD_STATE);
+      }
+      expect(threw).toBe(true);
+    }
+  });
+
+  test("Ruling D1: blockedBy's own defensive >1-match guard fires even if a hand-built BoardState (bypassing foldState's own dedup) contains a collision", () => {
+    // `foldState` already excludes a duplicate-id ticket from `tickets`
+    // entirely, so this shape should never occur via the real fold — this
+    // test exercises `blockedBy`'s `.filter().length > 1` branch directly,
+    // the second of the "fix both halves" pair, in case that upstream
+    // invariant is ever violated by a future change or a hand-built state.
+    const ticketA: TicketState = {
+      id: "ck-1" as TicketId,
+      path: "/a.md",
+      statusFromFrontmatter: "To Do",
+      statusFromEvents: undefined,
+      status: "To Do",
+      closed: false,
+      closeReason: undefined,
+      lease: undefined,
+      displayId: undefined,
+      aliases: [],
+      frontmatterAliases: [],
+      eventAliases: [],
+      deps: [],
+    };
+    const ticketB: TicketState = { ...ticketA, path: "/b.md" };
+    const state: BoardState = { tickets: [ticketA, ticketB], orphanedEvents: [], duplicateTicketIds: [] };
+
+    let threw = false;
+    try {
+      blockedBy(state, "ck-1" as TicketId);
+    } catch (error) {
+      threw = true;
+      expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.TICKET_NOT_IN_BOARD_STATE);
+    }
+    expect(threw).toBe(true);
   });
 });

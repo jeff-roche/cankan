@@ -9,6 +9,15 @@
  * its own inputs would quietly become the thing this rule forbids, and every
  * later module would gain a precedent to do the same.
  *
+ * **Precise scope of that claim (fix round 5): `foldState` reads neither
+ * ticket files nor the event log — it does not, however, mean this whole
+ * file never touches the filesystem.** `observeAndFold`, below, *writes*
+ * observation records under `$XDG_STATE_HOME` (via `events/observations.ts`'s
+ * `observe()`) — that is not a violation of the rule above (it reads
+ * neither a ticket file nor the event log to do it), but "reads neither
+ * input; writes observation records" is the accurate phrasing, not "never
+ * touches the filesystem."
+ *
  * ## Two functions, not one (Ruling R7, orchestrator, binding)
  *
  * `foldState` is pure — no I/O, no store access, no event-log access — so
@@ -398,12 +407,46 @@ export interface OrphanedTicketEvents {
   readonly reason: string;
 }
 
+/**
+ * Two or more `StoredTicket`s whose ids collide under
+ * `normalizeTicketIdForComparison` — e.g. `ck-1 - a.md` declaring `id: ck-1`
+ * and `CK-1 - b.md` declaring `id: CK-1` both landing in the same `tickets`
+ * array (Ruling D1, fix round 5, security review). `store/ticketStore.ts`'s
+ * `get()`/`write()`/`remove()`/`archive()` all guard this (`STORE_
+ * AMBIGUOUS_TICKET_LOOKUP`), but `list()` — this fold's natural input —
+ * deliberately does not: nothing at the store/state seam previously stopped
+ * two such files from reaching `foldState` together. See `foldState`'s own
+ * comment for what this fold does about it.
+ */
+export interface DuplicateTicketId {
+  /** The comparison-key form shared by every colliding file's `id`. */
+  readonly ticketId: TicketIdLookupKey;
+  /** Absolute paths of every `StoredTicket` sharing this normalized id, sorted for deterministic output. */
+  readonly paths: readonly string[];
+}
+
 /** The result of folding a board's tickets and events together. */
 export interface BoardState {
-  /** Every ticket that had a `StoredTicket`, folded with its events — sorted by `normalizeTicketIdForComparison(id)` ascending for deterministic output. */
+  /**
+   * Every ticket that had an unambiguous `StoredTicket`, folded with its
+   * events — sorted by `normalizeTicketIdForComparison(id)` ascending for
+   * deterministic output. A ticket whose normalized id collides with
+   * another `StoredTicket`'s is **excluded** here (Ruling D1) — see
+   * `duplicateTicketIds`.
+   */
   readonly tickets: readonly TicketState[];
   /** Every ticket id that had events but no matching file — sorted the same way. */
   readonly orphanedEvents: readonly OrphanedTicketEvents[];
+  /**
+   * Every normalized ticket id claimed by more than one `StoredTicket`
+   * (Ruling D1, fix round 5, security review) — sorted by `ticketId`
+   * ascending. Every event whose `ticket` names one of these ids is
+   * reported in `orphanedEvents` instead of being folded (there is no safe
+   * way to pick which of the colliding files it belongs to), the same
+   * "report what cannot be resolved, never guess" discipline Ruling R15
+   * already applies to an event naming no file at all.
+   */
+  readonly duplicateTicketIds: readonly DuplicateTicketId[];
 }
 
 export interface FoldStateOptions {
@@ -743,8 +786,17 @@ function foldStatusAndClose(bucket: readonly EventRecord[]): StatusFold {
  * function does not assume never reaches it) are the degenerate one-node
  * cycle case and fall out of the same logic unchanged: a node resolves to
  * itself.
+ *
+ * **Exported for tests only** (fix round 5, Important 2, security review),
+ * the same pattern as `resolveAliasTargetForTesting` below: `fold.test.ts`
+ * calls this directly with an `edges` argument wrapped to count `.get()`
+ * invocations, to assert the call count grows linearly in the input size —
+ * a deterministic, CI-load-immune replacement for the wall-clock ratio
+ * assertion an earlier fix round used (which flaked once under load). Not
+ * re-exported from `state/index.ts`; `buildAliasEventIndex` below is the
+ * only production caller.
  */
-function resolveAllAliasTargets(edges: ReadonlyMap<string, string>): Map<string, string> {
+export function resolveAllAliasTargets(edges: ReadonlyMap<string, string>): Map<string, string> {
   const resolved = new Map<string, string>();
 
   function resolveFrom(start: string): void {
@@ -926,6 +978,46 @@ function mergeAliases(frontmatterAliases: readonly string[], eventAliases: reado
 // foldState — PURE. No I/O, no store access, no event-log access.
 // ============================================================================
 
+/**
+ * Splits `tickets` into those with a unique normalized id and every
+ * duplicate group (Ruling D1). `store/ticketStore.ts`'s `list()` — this
+ * fold's natural input — deliberately does not dedupe by normalized id
+ * (only `get()`/`write()`/`remove()`/`archive()` guard `STORE_
+ * AMBIGUOUS_TICKET_LOOKUP`), so `foldState` cannot assume `tickets` arrives
+ * pre-deduplicated. A colliding id is excluded from `unique` entirely — not
+ * "picked, arbitrarily, by array order" — because array order is exactly
+ * the thing this fold must never let decide an outcome (the same invariant
+ * the alias-cycle fix, Ruling R12, already enforces on the event side).
+ */
+function partitionByDuplicateId(tickets: readonly StoredTicket[]): {
+  readonly unique: readonly StoredTicket[];
+  readonly duplicates: readonly DuplicateTicketId[];
+} {
+  const groups = new Map<TicketIdLookupKey, StoredTicket[]>();
+  for (const ticket of tickets) {
+    const key = normalizeTicketIdForComparison(ticket.id);
+    const group = groups.get(key);
+    if (group === undefined) {
+      groups.set(key, [ticket]);
+    } else {
+      group.push(ticket);
+    }
+  }
+
+  const unique: StoredTicket[] = [];
+  const duplicates: DuplicateTicketId[] = [];
+  for (const [ticketId, group] of groups) {
+    if (group.length === 1) {
+      unique.push(group[0] as StoredTicket);
+    } else {
+      duplicates.push({ ticketId, paths: group.map((t) => t.path).sort() });
+    }
+  }
+  duplicates.sort((a, b) => (a.ticketId < b.ticketId ? -1 : a.ticketId > b.ticketId ? 1 : 0));
+
+  return { unique, duplicates };
+}
+
 export function foldState(
   tickets: readonly StoredTicket[],
   events: readonly EventRecord[],
@@ -934,11 +1026,13 @@ export function foldState(
   validateLeaseTtlMs(options.leaseTtlMs);
   const { now, leaseTtlMs, firstSeen } = options;
 
-  const { byTicket, orphaned } = joinEventsToTickets(tickets, events);
-  const knownIds = new Set<TicketIdLookupKey>(tickets.map((t) => normalizeTicketIdForComparison(t.id)));
+  const { unique: uniqueTickets, duplicates: duplicateTicketIds } = partitionByDuplicateId(tickets);
+
+  const { byTicket, orphaned } = joinEventsToTickets(uniqueTickets, events);
+  const knownIds = new Set<TicketIdLookupKey>(uniqueTickets.map((t) => normalizeTicketIdForComparison(t.id)));
   const aliasEventIndex = buildAliasEventIndex(events, knownIds);
 
-  const ticketStates: TicketState[] = tickets.map((stored) => {
+  const ticketStates: TicketState[] = uniqueTickets.map((stored) => {
     const key = normalizeTicketIdForComparison(stored.id);
     const bucket = byTicket.get(key) ?? [];
     const lease = foldLease(bucket, firstSeen, now, leaseTtlMs);
@@ -978,7 +1072,7 @@ export function foldState(
     }))
     .sort((a, b) => (a.ticketId < b.ticketId ? -1 : a.ticketId > b.ticketId ? 1 : 0));
 
-  return { tickets: ticketStates, orphanedEvents };
+  return { tickets: ticketStates, orphanedEvents, duplicateTicketIds };
 }
 
 // ============================================================================
@@ -1027,7 +1121,14 @@ export async function observeAndFold(
   // fresher, and so valid for longer, than a fully historical clock would
   // say), not a mutual-exclusion one, and orthogonal to the header's
   // missing-`firstSeen`-resolves-to-expired rule above.
-  const knownIds = new Set<TicketIdLookupKey>(tickets.map((t) => normalizeTicketIdForComparison(t.id)));
+  //
+  // Ruling D1 (fix round 5, security review): the same reasoning excludes a
+  // duplicate-normalized-id ticket's events too — `foldState` (below) will
+  // route them into `orphanedEvents` (there is no safe file to attach a
+  // lease to), so observing them here would be the identical unreclaimable
+  // write I3 already exists to prevent, just reached via a colliding id
+  // instead of a missing one.
+  const knownIds = new Set<TicketIdLookupKey>(partitionByDuplicateId(tickets).unique.map((t) => normalizeTicketIdForComparison(t.id)));
   const idsToObserve = new Set<EventId>();
   for (const record of events) {
     if (!LEASE_ANCHOR_KINDS.has(record.event.event)) {

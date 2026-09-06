@@ -193,6 +193,31 @@ function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLook
  * corroborating signal this fold does not have — flagged here rather than
  * silently trusted (security review, Ruling I1 path A).
  *
+ * **Path A composes with the `eventAliases` tier (Ruling A6) into something
+ * strictly larger than either alone — fix round 5, security review.** A6 on
+ * its own needs an *already-closed* ticket to redirect a dep onto; Path A on
+ * its own can only touch a dep whose id already resolves to a real ticket.
+ * Together, one contributor with coordination-ref push and **zero repo
+ * access** can neutralize *any* `blocks` dep, including one naming an id
+ * that resolves to nothing at all: push a `close` event for one real,
+ * already-closed-or-closable ticket, then push an
+ * `alias {from: <the unresolvable dep id>, to: <that closed ticket>}` — the
+ * dep now resolves and reads satisfied. Two events, no repo write, and —
+ * because `closed` cannot be reversed without a `reopen` kind — permanent.
+ * Each half was disclosed individually above and in
+ * `BlockingDependency.resolvedTicket`'s own doc; stated here because the
+ * union is what actually matters and neither half's own disclosure said so.
+ *
+ * **Binding forward constraint, not a caveat: no downstream consumer
+ * (M2.10's `ready`/`claim --next` and anything built on them) may auto-act
+ * on a `blockedBy` result.** It may only ever be *surfaced to a human* —
+ * "here is what this fold currently believes is blocking you." The moment
+ * something automatically claims or unblocks work on the strength of an
+ * empty `blockedBy` result, the composition above stops being a readiness
+ * display and becomes an exploit: two events, no repo access, arbitrary
+ * `blocks` deps satisfied. This is Minor today only because no consumer
+ * exists yet to violate it.
+ *
  * **Not a mutual-exclusion input** — see `BlockingDependency.resolvedTicket`'s
  * own doc: two peers can legitimately compute a different result here for
  * the same ticket, and neither result decides who holds a claim.
@@ -205,14 +230,33 @@ function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLook
  */
 export function blockedBy(state: BoardState, ticketId: TicketId): readonly BlockingDependency[] {
   const key = normalizeTicketIdForComparison(ticketId);
-  const ticket = state.tickets.find((t) => normalizeTicketIdForComparison(t.id) === key);
-  if (ticket === undefined) {
+  // `.filter`, never `.find` (Ruling D1, fix round 5, security review):
+  // `foldState` already excludes a duplicate-normalized-id ticket from
+  // `state.tickets` entirely (see `partitionByDuplicateId`), so more than
+  // one match here should be unreachable in practice — but `.find` would
+  // silently pick whichever entry happens to come first in array order if
+  // that invariant were ever violated (by a future fold change, or a
+  // hand-built `BoardState`), and array order deciding an outcome is
+  // exactly what this module must never do (the same invariant the
+  // alias-cycle fix, Ruling R12, enforces on the event side). Failing
+  // closed here costs three lines and closes that hole permanently rather
+  // than trusting the invariant to hold forever upstream.
+  const matches = state.tickets.filter((t) => normalizeTicketIdForComparison(t.id) === key);
+  if (matches.length === 0) {
     throw new CanKanError(
       StateErrorCodes.TICKET_NOT_IN_BOARD_STATE,
       `ticket ${ticketId} is not present in this BoardState`,
       { details: { ticketId } },
     );
   }
+  if (matches.length > 1) {
+    throw new CanKanError(
+      StateErrorCodes.TICKET_NOT_IN_BOARD_STATE,
+      `ticket ${ticketId} matches more than one entry in this BoardState — refusing to pick one by array order`,
+      { details: { ticketId, matchCount: matches.length } },
+    );
+  }
+  const ticket = matches[0] as TicketState;
 
   const deps = ticket.deps;
   if (deps.length === 0) {

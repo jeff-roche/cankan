@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { isCanKanError } from "../../src/errors";
 import { firstSeen } from "../../src/events/index";
 import type { EventId, EventRecord } from "../../src/events/index";
-import { foldState, observeAndFold, resolveAliasTargetForTesting } from "../../src/state/fold";
+import { foldState, observeAndFold, resolveAliasTargetForTesting, resolveAllAliasTargets } from "../../src/state/fold";
 import { StateErrorCodes } from "../../src/state/errors";
 // `@jeff-roche/cankan-test-utils` is not a declared dependency of
 // `packages/core/package.json` — a relative import to the source file is
@@ -499,15 +499,6 @@ describe("foldState — alias resolution does not blow up quadratically (I2, sec
     return events;
   }
 
-  function timeFoldOverChain(n: number): number {
-    const finalId = `ck-final-${n}`;
-    const ticket = makeStoredTicket(finalId, "To Do");
-    const events = buildAliasChainEvents(n, finalId);
-    const start = performance.now();
-    foldState([ticket], events, { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
-    return performance.now() - start;
-  }
-
   test("resolving an alias chain is correct at N=6000", () => {
     const N = 6000;
     const finalId = `ck-final-${N}`;
@@ -528,37 +519,63 @@ describe("foldState — alias resolution does not blow up quadratically (I2, sec
     expect(state.tickets[0]?.aliases).toContain(`a${N - 1}`);
   });
 
-  /** The middle value of three timing samples at `n` — damps a single JIT/GC outlier the way a lone measurement can't (fix round 4, Minor 2). */
-  function medianTimeFoldOverChain(n: number): number {
-    const samples = [timeFoldOverChain(n), timeFoldOverChain(n), timeFoldOverChain(n)].sort((a, b) => a - b);
-    return samples[1] as number;
+  /** A pure `Map`-backed `from -> to` chain of length `n`, ending at `finalId`. */
+  function buildChainEdges(n: number, finalId: string): Map<string, string> {
+    const edges = new Map<string, string>();
+    for (let i = 0; i < n; i++) {
+      edges.set(`a${i}`, i === n - 1 ? finalId : `a${i + 1}`);
+    }
+    return edges;
   }
 
-  test("growing the chain 4x grows the wall-clock time roughly 4x, not ~16x (O(N), not O(N^2))", () => {
-    // A wall-clock *absolute* bound is both a CI-flakiness risk on a loaded
-    // shared runner and a weak oracle: extrapolating the review's own
-    // pre-fix measurement (~4.7s at N=16,000) down to N=6000 gives
-    // ~660ms — comfortably under almost any generous absolute bound even
-    // for the REGRESSED quadratic implementation, so an absolute-bound
-    // test at that N could not actually catch a reintroduced O(N^2)
-    // (security review, fix round 3). A *relative*-growth assertion is the
-    // correct oracle instead: quadratic growth means 4x the input gives
-    // ~16x the time; linear growth gives ~4x. N is chosen large enough that
-    // both measurements clear a few milliseconds, so JS timer granularity
-    // and GC jitter don't dominate the ratio.
-    //
-    // **Median of 3 at each N (fix round 4, Minor 2)**, not a single
-    // sample: a single-sample run of a different alias shape hit a 8.16x
-    // ratio once against this same `< 8` threshold (security review) —
-    // `main` is branch-protected on both CI legs, so a flaky assertion here
-    // is expensive. A median damps exactly the kind of one-off JIT/GC
-    // outlier that produced that spike.
-    const N = 8000;
-    const baseline = medianTimeFoldOverChain(N);
-    const fourX = medianTimeFoldOverChain(N * 4);
+  /**
+   * Runs `resolveAllAliasTargets` (exported test-only — see `fold.ts`'s own
+   * doc) over a chain of length `n`, wrapping `edges` to count `.get()`
+   * calls. `resolveAllAliasTargets` never calls `edges.get()` more than
+   * once for a node it has already resolved (the *first* thing
+   * `resolveFrom` checks is the separate, un-instrumented `resolved` map,
+   * which short-circuits before ever reaching `edges.get()` again for that
+   * node) — so this count is an exact, deterministic proxy for total
+   * algorithmic work, immune to CI load or JIT warm-up.
+   */
+  function countEdgesGetCalls(n: number): number {
+    const edges = buildChainEdges(n, "sink");
+    let getCalls = 0;
+    const countingEdges: ReadonlyMap<string, string> = {
+      get(key: string) {
+        getCalls++;
+        return edges.get(key);
+      },
+      keys() {
+        return edges.keys();
+      },
+    } as unknown as ReadonlyMap<string, string>;
+    resolveAllAliasTargets(countingEdges);
+    return getCalls;
+  }
 
-    const ratio = fourX / Math.max(baseline, 0.01);
-    expect(ratio).toBeLessThan(8); // linear predicts ~4; quadratic predicts ~16 — 8 is the midpoint, generous either way
+  test("operation-count check: edges.get() calls stay linear in N, not quadratic (fix round 5, Important 2)", () => {
+    // Replaces an earlier wall-clock ratio assertion (fix round 4): even a
+    // median of 3 samples is still measuring two noisy quantities (the
+    // baseline AND the 4x sample) on a shared CI runner, and it flaked once
+    // at 8.16x against this same threshold on a different shape (security
+    // review). An **operation count** has no such noise — it is exactly
+    // reproducible every run, on any machine, under any load — and it
+    // tests the actual invariant (how much work the algorithm does) rather
+    // than a wall-clock proxy for it. Linear predicts ~4x calls for 4x
+    // input; a reintroduced per-node from-scratch walk (the exact Critical
+    // fix round 2 introduced and round 3 corrected) would multiply by
+    // roughly the chain length too, giving ~16x or worse. Verified this
+    // assertion actually catches a quadratic mutant: temporarily reverted
+    // `resolveAllAliasTargets` to the old per-call `resolveAliasTarget`
+    // pattern (no memoization across `resolveFrom` calls), re-ran this
+    // test, watched it fail (the call count no longer stayed linear), then
+    // restored the real implementation — see the task report for the
+    // numbers observed.
+    const small = countEdgesGetCalls(1000);
+    const large = countEdgesGetCalls(4000); // 4x the input
+
+    expect(large).toBeLessThan(small * 8); // linear predicts ~4x; quadratic predicts ~16x — 8x is the generous midpoint
   });
 });
 
@@ -659,6 +676,66 @@ describe("foldState — orphaned events (Ruling R15): reported, never dropped", 
     const state = foldState([ticket], [move], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
 
     expect(state.orphanedEvents).toHaveLength(0);
+  });
+});
+
+describe("foldState — duplicate normalized ticket ids (Ruling D1, fix round 5, security review)", () => {
+  // `store/ticketStore.ts`'s `list()` — this fold's natural input — does
+  // NOT dedupe by normalized id (only `get()`/`write()`/`remove()`/
+  // `archive()` guard that). Two real files declaring the same id
+  // case-insensitively (`ck-1 - a.md` / `CK-1 - b.md`) reach `foldState`
+  // together; this fold must not pick one by array order.
+
+  test("two tickets sharing a normalized id are excluded from `tickets` and surfaced in `duplicateTicketIds`", () => {
+    const lower = makeStoredTicket("ck-1", "To Do");
+    const upper = makeStoredTicket("CK-1", "Done");
+    const state = foldState([lower, upper], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+    expect(state.tickets).toHaveLength(0);
+    expect(state.duplicateTicketIds).toHaveLength(1);
+    expect(state.duplicateTicketIds[0]?.ticketId as string | undefined).toBe("ck-1");
+    expect([...(state.duplicateTicketIds[0]?.paths ?? [])].sort()).toEqual(
+      [lower.path, upper.path].sort(),
+    );
+  });
+
+  test("events naming a duplicated id are reported as orphaned, not folded onto either file", () => {
+    const lower = makeStoredTicket("ck-1", "To Do");
+    const upper = makeStoredTicket("CK-1", "Done");
+    const claim = fixtureEvent(
+      { event: "claim", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z" },
+      "2026-01",
+      0,
+    );
+    const state = foldState([lower, upper], [claim], { now: 0, leaseTtlMs: 1000, firstSeen: new Map([[claim.event.id, 0]]) });
+
+    expect(state.tickets).toHaveLength(0);
+    expect(state.orphanedEvents).toHaveLength(1);
+    expect(state.orphanedEvents[0]?.ticketId as string | undefined).toBe("ck-1");
+  });
+
+  test("a third, unambiguous ticket is unaffected by an unrelated duplicate", () => {
+    const lower = makeStoredTicket("ck-1", "To Do");
+    const upper = makeStoredTicket("CK-1", "Done");
+    const fine = makeStoredTicket("ck-2", "To Do");
+    const state = foldState([lower, upper, fine], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+    expect(state.tickets.map((t) => t.id as string)).toEqual(["ck-2"]);
+    expect(state.duplicateTicketIds).toHaveLength(1);
+  });
+
+  test("order-independence: the result is identical with the tickets array reversed", () => {
+    const lower = makeStoredTicket("ck-1", "To Do");
+    const upper = makeStoredTicket("CK-1", "Done");
+    const fine = makeStoredTicket("ck-2", "To Do");
+
+    const forward = foldState([lower, upper, fine], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const reversed = foldState([fine, upper, lower], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+    expect(reversed.tickets.map((t) => t.id as string)).toEqual(forward.tickets.map((t) => t.id as string));
+    expect(reversed.duplicateTicketIds.map((d) => ({ ...d, ticketId: d.ticketId as string, paths: [...d.paths].sort() }))).toEqual(
+      forward.duplicateTicketIds.map((d) => ({ ...d, ticketId: d.ticketId as string, paths: [...d.paths].sort() })),
+    );
   });
 });
 

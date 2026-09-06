@@ -64,6 +64,7 @@ export type {
   LeaseState,
   ObserveAndFoldOptions,
   OrphanedTicketEvents,
+  OrphanedTicketEventsCause,
   TicketState,
 } from "./fold";
 export { foldState, observeAndFold } from "./fold";

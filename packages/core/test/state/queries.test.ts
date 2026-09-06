@@ -172,6 +172,27 @@ describe("blockedBy", () => {
     expect(blockedBy(state, "ck-1" as TicketId)).toEqual([]);
   });
 
+  test("a dep id names a frontmatter display_id (CONCEPT.md's PROJ-45 worked example) of a closed ticket — satisfied", () => {
+    const closeEvent = fixtureEvent({ event: "close", ticket: "ck-2" }, "2026-01", 0);
+    const blocker = makeStoredTicket("ck-2", "Done", { cankan: { display_id: "PROJ-45" } });
+    const ticket = makeStoredTicket("ck-1", "To Do", { cankan: { deps: [{ type: "blocks", id: "PROJ-45" }] } });
+
+    const state = foldState([ticket, blocker], [closeEvent], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+    expect(blockedBy(state, "ck-1" as TicketId)).toEqual([]);
+  });
+
+  test("a dep id names a display_id of an OPEN ticket — still outstanding", () => {
+    const blocker = makeStoredTicket("ck-2", "In Progress", { cankan: { display_id: "PROJ-45" } });
+    const ticket = makeStoredTicket("ck-1", "To Do", { cankan: { deps: [{ type: "blocks", id: "PROJ-45" }] } });
+
+    const state = foldState([ticket, blocker], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+    const outstanding = blockedBy(state, "ck-1" as TicketId);
+    expect(outstanding).toHaveLength(1);
+    expect(outstanding[0]?.resolvedTicket?.id as string | undefined).toBe("ck-2");
+  });
+
   test("multiple 'blocks' deps: only the unsatisfied ones are returned", () => {
     const done = makeStoredTicket("ck-done", "Done");
     const closeEvent = fixtureEvent({ event: "close", ticket: "ck-done" }, "2026-01", 0);

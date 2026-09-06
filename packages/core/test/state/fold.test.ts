@@ -31,6 +31,7 @@ describe("foldState — status precedence (Ruling R6)", () => {
       closed: false,
       closeReason: undefined,
       lease: undefined,
+      displayId: undefined,
       aliases: [],
       deps: [],
     });

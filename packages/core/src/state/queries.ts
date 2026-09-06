@@ -91,12 +91,19 @@ function looksCrossBoard(id: string): boolean {
  * Builds the same kind of identifier index `store/ticketStore.ts`'s
  * `identifiersFor` builds (id + `display_id` + aliases) — extended with the
  * alias *events* `TicketState.aliases` already folds in, per that file's
- * own comment naming M2.8 as the place that gap gets closed.
+ * own comment naming M2.8 as the place that gap gets closed. The brief's
+ * own wording — "Ids in `deps` may be display ids or cross-board refs" —
+ * names `display_id` explicitly, so a dep naming a Jira/GitHub display id
+ * (CONCEPT.md's own `PROJ-45` worked example) resolves here too, not only a
+ * ticket's own id or alias.
  */
 function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLookupKey, TicketState> {
   const index = new Map<TicketIdLookupKey, TicketState>();
   for (const ticket of tickets) {
     index.set(normalizeTicketIdForComparison(ticket.id), ticket);
+    if (ticket.displayId !== undefined) {
+      index.set(normalizeTicketIdForComparison(ticket.displayId), ticket);
+    }
     for (const alias of ticket.aliases) {
       index.set(normalizeTicketIdForComparison(alias), ticket);
     }

@@ -122,4 +122,18 @@ export const IndexErrorCodes = {
    * fires only for the corruption the open-time probe cannot see.
    */
   CORRUPT: "INDEX_CORRUPT",
+  /**
+   * Fix round 1, S2 follow-through: `queryTickets`/`queryBoardState` hit a
+   * `bun:sqlite` error (a `.code` starting with `SQLITE_`) that is
+   * `guardAgainstCorruption` did not recognize as `CORRUPT` above --
+   * `SQLITE_IOERR`, `SQLITE_READONLY`, `SQLITE_BUSY`, `SQLITE_FULL`, and
+   * the like. A genuine I/O or environment failure on the read path,
+   * never a "the file's contents are bad" case (that is `CORRUPT`), and
+   * with no documented recovery the way `CORRUPT` has one -- mirrors
+   * `REINDEX_FAILED`'s role on the write side. Exists so the S2 fix's
+   * "no raw `SQLiteError` may escape this module's public surface"
+   * contract holds for every SQLite failure a query can hit, not only
+   * the corruption-shaped ones.
+   */
+  QUERY_FAILED: "INDEX_QUERY_FAILED",
 } as const;

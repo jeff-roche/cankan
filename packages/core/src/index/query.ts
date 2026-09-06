@@ -38,7 +38,10 @@
  * malformed `dep_json` value (a `JSON.parse` `SyntaxError`) to
  * `IndexErrorCodes.CORRUPT` -- see that code's own doc comment for the
  * wedge this closes and the documented recovery (`rebuildIndex()` then
- * `reindex()`, both in `db.ts`/`reindex.ts`).
+ * `reindex()`, both in `db.ts`/`reindex.ts`). Any other `bun:sqlite`
+ * error (`SQLITE_IOERR`, `SQLITE_BUSY`, and the like) maps to
+ * `IndexErrorCodes.QUERY_FAILED` instead, so "no raw `SQLiteError`
+ * escapes" holds without exception, not only for the corruption cases.
  *
  * **Fix round 1, M5 -- `loadAliasMaps`/`loadDepsMap` read every alias/dep
  * row on every call regardless of `TicketQuery`, measured and left as-is.**
@@ -148,16 +151,32 @@ function assertBuilt(index: BoardIndex): void {
   }
 }
 
+function isSqliteShapedError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && code.startsWith("SQLITE_");
+}
+
 /**
  * Runs `fn`, mapping a page-level-corruption-shaped failure (see
  * `isIndexCorruptionError` in `db.ts`) or a malformed `dep_json` value
  * (`JSON.parse` throwing `SyntaxError`) to `IndexErrorCodes.CORRUPT` --
- * fix round 1, S2. A `CanKanError` `fn` itself throws (`INDEX_NOT_BUILT`,
+ * fix round 1, S2. Any *other* `bun:sqlite` error (`SQLITE_IOERR`,
+ * `SQLITE_READONLY`, `SQLITE_BUSY`, and the like -- a genuine I/O or
+ * environment failure, not a bad-contents case) is mapped to
+ * `IndexErrorCodes.QUERY_FAILED` instead, so the S2 fix's "no raw
+ * `SQLiteError` may escape this module's public surface" holds for every
+ * SQLite failure a query can hit, not only the corruption-shaped ones.
+ *
+ * A `CanKanError` `fn` itself throws (`INDEX_NOT_BUILT`,
  * `INDEX_INVALID_QUERY_LIMIT`/`OFFSET`) passes through completely
- * unchanged: this only maps the raw, untyped errors `bun:sqlite` and
- * `JSON.parse` throw, never re-wraps this module's own typed ones, and
- * never swallows a genuinely unexpected error by miscategorizing it as
- * corruption.
+ * unchanged, and anything that is not `bun:sqlite`-shaped and not a
+ * `SyntaxError` (a genuine programming-error `TypeError`, say) is
+ * re-thrown as-is: this only maps the raw, untyped errors `bun:sqlite`
+ * and `JSON.parse` throw, never re-wraps this module's own typed ones,
+ * and never swallows a genuinely unexpected error by miscategorizing it.
  */
 function guardAgainstCorruption<T>(fn: () => T): T {
   try {
@@ -172,6 +191,9 @@ function guardAgainstCorruption<T>(fn: () => T): T {
         "the index cache is corrupt -- call rebuildIndex() then reindex() before querying again",
         { cause: error },
       );
+    }
+    if (isSqliteShapedError(error)) {
+      throw new CanKanError(IndexErrorCodes.QUERY_FAILED, "the index cache query failed", { cause: error });
     }
     throw error;
   }

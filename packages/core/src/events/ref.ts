@@ -225,27 +225,38 @@ async function checkRefUsability(adapter: GitAdapter, validatedRef: string, reso
   } catch (cause) {
     // `isEventsPrefixBlocked` only interprets `GIT_BLOB_AMBIGUOUS` itself
     // (mode-checked, per its own doc comment) and rethrows anything else
-    // unexamined. Two genuinely benign shapes reach here as a result: the
-    // ref vanishing between `initRefCore`'s own `readRef` and this probe
-    // (`GIT_REF_NOT_FOUND` — fix round 3, L2's exact TOCTOU window,
+    // unexamined. `GIT_REF_NOT_FOUND` is the one genuinely benign shape
+    // that reaches here: the ref vanishing between `initRefCore`'s own
+    // `readRef` and this probe (fix round 3, L2's exact TOCTOU window),
     // reported `"absent"` immediately, matching the probe below's
-    // identical handling of the same code), and `validatedRef` resolving
-    // to something that isn't tree-ish *at all* — e.g. a ref planted
-    // straight at a blob — which makes `ls-tree` fail identically
-    // regardless of which path is probed (confirmed by direct probe:
-    // `readBlobFromRef` against both `"events"` and `USABILITY_PROBE_PATH`
-    // throws the identical `GIT_COMMAND_FAILED` when `validatedRef`
-    // resolves to a blob — not merely inferred from the second probe's own
-    // behavior). That second case is deliberately NOT reported here:
-    // falling through lets the probe below run its own, identical
-    // `readBlobFromRef` call and
-    // reach the exact same failure on its own terms, so both probes
-    // converge on one consistent `"unusable"` result (with the real cause
-    // attached) rather than this one reporting a different, premature
-    // verdict from a path collision that was never the actual defect.
+    // identical handling of the same code.
+    //
+    // **Fix round 3 follow-up #2 (orchestrator-directed):** any *other*
+    // error is reported `"unusable"` directly, here — it is NOT left to
+    // fall through to the probe below. An earlier version of this function
+    // did fall through, reasoning that `validatedRef` resolving to
+    // something that isn't tree-ish at all (e.g. a ref planted straight at
+    // a blob) makes `ls-tree` fail identically regardless of which path is
+    // probed, so both probes would "converge" on the same verdict. That
+    // reasoning was wrong for a genuinely distinct failure the reviewer
+    // constructed: a `100644` entry at `events` pointing at a **missing**
+    // object (`git mktree --missing`). There, `ls-tree` succeeds (the mode
+    // is exactly `100644`, not ambiguous) but the underlying blob content
+    // read fails with `GIT_COMMAND_FAILED` — a genuine error this probe
+    // correctly surfaces. The probe below, however, reads a *different*,
+    // *deeper* path (`USABILITY_PROBE_PATH`, nested under `events`) — since
+    // `events` isn't a tree the missing object could even be nested under,
+    // that deeper path simply "doesn't exist" and the probe below succeeds
+    // with `null`, reporting `"usable"`. Confirmed by direct probe:
+    // `read()`/`diagnose()` both correctly threw `GIT_COMMAND_FAILED` for
+    // this exact shape, while the old fall-through version of this
+    // function reported `initRef()` successful — the two probes do NOT
+    // always converge, so this function's own probe result is now
+    // authoritative rather than provisional.
     if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_REF_NOT_FOUND) {
       return { usability: "absent" };
     }
+    return { usability: "unusable", cause };
   }
   try {
     await adapter.readBlobFromRef(validatedRef, USABILITY_PROBE_PATH);

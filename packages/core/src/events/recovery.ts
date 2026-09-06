@@ -537,6 +537,25 @@ const MAX_DIAGNOSTIC_AGGREGATE_SAFETY_BYTES = 1024 * 1024 * 1024;
  * merge. 5,000 is generous for any real board's worth of genuinely distinct
  * corruption while bounding worst-case memory to a small multiple of that
  * count of small objects, not proportional to a hostile blob's line count.
+ *
+ * **Fix round 3 follow-up (Ruling R47 fallout, orchestrator-directed):**
+ * applied **independently** to fixable spans and unfixable spans (two
+ * separate counters, `fixableSpanCount`/`unfixableSpanCount` in
+ * `computeDiagnosticReport`), not to their combined total. Ruling R47 made
+ * `"duplicate-id-conflict"` the first reason that is both permanently
+ * unfixable and, when an attacker varies any field, immune to coalescing
+ * (which requires byte-identical lines) — so a single shared cap let an
+ * unbounded pile of distinct-content duplicate-id lines consume the entire
+ * budget before a genuinely repairable line later in the same window was
+ * ever scanned or reported, permanently starving `recover()`'s own ability
+ * to make progress (reproduced: 5,001 lines sharing one event id, each with
+ * a distinct `actor` — the first occurrence is recorded, not a conflict,
+ * so 5,000 `"duplicate-id-conflict"` spans, exactly this cap's own size —
+ * placed before one repairable `invalid-json` line made that line
+ * invisible across three consecutive `recover()` runs). Splitting the counter closes
+ * this without weakening either bound: each category still cannot grow
+ * without limit, and one category filling up can no longer crowd out the
+ * other.
  */
 const MAX_DIAGNOSTIC_FAILURES = 5_000;
 
@@ -990,6 +1009,13 @@ async function computeDiagnosticReport(
   let aggregateBytes = 0;
   let aggregateTooLargeReported = false;
   let pending: PendingSpan | null = null;
+  // Fix round 3 follow-up (Ruling R47 fallout, orchestrator-directed):
+  // distinct-span counts, tracked *separately* for fixable vs. unfixable
+  // reasons, each independently bounded by `MAX_DIAGNOSTIC_FAILURES` — see
+  // that constant's doc comment for why a single shared counter starves
+  // fixable content behind an unbounded pile of unfixable spans.
+  let fixableSpanCount = 0;
+  let unfixableSpanCount = 0;
   // Fix round 2 (Ruling R45(a)): the running estimate of this run's total
   // quarantine-record serialized size, updated only when a *new* span opens
   // (never for a coalesced repeat of the same span — see
@@ -1057,7 +1083,29 @@ async function computeDiagnosticReport(
       return "ok";
     }
     flushPending();
-    if (failures.length >= MAX_DIAGNOSTIC_FAILURES) {
+    // Fix round 3 follow-up (Ruling R47 fallout, orchestrator-directed):
+    // count this span against the cap that matches *its own* reason, not a
+    // single shared counter. Ruling R47 made `"duplicate-id-conflict"` the
+    // first reason that is both (a) never coalesced across differing
+    // content (coalescing requires byte-identical lines — distinct `actor`
+    // values defeat it) and (b) permanently unfixable — so a single shared
+    // `failures.length` cap let a peer flood the log with distinct-content
+    // duplicate-id lines and starve the cap before any *fixable* line
+    // later in the same window was ever even scanned or reported.
+    // Reproduced: 5,001 lines sharing one event id, each with a distinct
+    // `actor` (5,000 resulting `"duplicate-id-conflict"` spans — the first
+    // occurrence is recorded, not a conflict), placed before one genuinely
+    // repairable `invalid-json` line, made the repairable line invisible
+    // to every one of three consecutive `recover()` runs.
+    // Fixable and unfixable spans now each get their own
+    // `MAX_DIAGNOSTIC_FAILURES` budget, so an unbounded pile of one kind
+    // can never crowd out the other.
+    const isFixable = FIXABLE_REASONS.has(reason);
+    if (isFixable) {
+      if (fixableSpanCount >= MAX_DIAGNOSTIC_FAILURES) {
+        return "cap";
+      }
+    } else if (unfixableSpanCount >= MAX_DIAGNOSTIC_FAILURES) {
       return "cap";
     }
     const lineBytes = Buffer.byteLength(rawLine, "utf8");
@@ -1078,6 +1126,11 @@ async function computeDiagnosticReport(
       linePreview: safeLinePreview(rawLine),
       possiblyLossy: hasReplacementCharacter(rawLine),
     };
+    if (isFixable) {
+      fixableSpanCount++;
+    } else {
+      unfixableSpanCount++;
+    }
     // Fix round 2 (Ruling R45(a)): budget on what this span will actually
     // cost to *embed* — capped at `MAX_QUARANTINE_RAW_BYTES_PER_RECORD`,
     // since `buildQuarantineRecord` will truncate to that cap regardless of
@@ -1091,7 +1144,7 @@ async function computeDiagnosticReport(
     // necessary, for a span that will never actually cost anything to
     // write. Only a reason `buildQuarantineRecord` can actually be called
     // for contributes.
-    if (FIXABLE_REASONS.has(reason)) {
+    if (isFixable) {
       const cappedForBudget = Math.min(lineBytes, MAX_QUARANTINE_RAW_BYTES_PER_RECORD);
       estimatedQuarantineBytes += cappedForBudget * QUARANTINE_ESCAPE_EXPANSION_FACTOR + QUARANTINE_RECORD_OVERHEAD_BYTES;
     }
@@ -1099,12 +1152,31 @@ async function computeDiagnosticReport(
   }
 
   function pushTruncatedMarker(month: string, line: number | null, kind: "resource" | "count" | "budget"): void {
+    // Fix round 3 follow-up (Ruling R47 fallout, orchestrator-directed):
+    // "re-run recovery ... to make further progress" is only a true
+    // promise if this run found at least one FIXABLE span to actually act
+    // on. A "budget" truncation always implies that (only fixable spans
+    // charge the quarantine-write budget — see `recordLineFailure`), but a
+    // "resource" or "count" truncation can be reached with zero fixable
+    // spans found so far — most concretely, the exact starvation shape
+    // this follow-up closes: an unbounded pile of unfixable
+    // `duplicate-id-conflict` spans exhausts its own cap before any
+    // fixable line later in the window is ever scanned. Telling an
+    // operator to "just re-run" in that case is a false promise:
+    // `recover()` fixes nothing this run, and the next run scans the
+    // identical unresolved pile again, forever. `fixableSpanCount` here
+    // already reflects this run's final count — a truncation always ends
+    // the scan immediately after this call.
+    const canMakeProgressByRerunning = fixableSpanCount > 0;
+    const rerunAdvice = canMakeProgressByRerunning
+      ? "re-run recovery (possibly more than once) to make further progress"
+      : "recovery cannot make progress past this point on its own — every failure found so far in this run is unresolved by design (see each one's own remediation), and re-running alone will not change that; an operator must resolve at least one of them by hand first";
     const message =
       kind === "resource"
-        ? `this diagnostic run's own resource bound was reached at month ${month}; scanning stopped here — re-run recovery (possibly more than once) to make further progress`
+        ? `this diagnostic run's own resource bound was reached at month ${month}; scanning stopped here — ${rerunAdvice}`
         : kind === "count"
-          ? `this diagnostic run's own failure-count bound (${MAX_DIAGNOSTIC_FAILURES}) was reached at ${month}:${line}; scanning stopped here — re-run recovery (possibly more than once) to make further progress`
-          : `this diagnostic run's own quarantine-audit-size budget (${MAX_QUARANTINE_RUN_BUDGET_BYTES} bytes, estimated) was reached at ${month}:${line}; scanning stopped here — re-run recovery (possibly more than once) to make further progress`;
+          ? `this diagnostic run's own failure-count bound (${MAX_DIAGNOSTIC_FAILURES}) was reached at ${month}:${line}; scanning stopped here — ${rerunAdvice}`
+          : `this diagnostic run's own quarantine-audit-size budget (${MAX_QUARANTINE_RUN_BUDGET_BYTES} bytes, estimated) was reached at ${month}:${line}; scanning stopped here — ${rerunAdvice}`;
     failures.push({
       ref: validatedRef,
       commit: head,

@@ -458,6 +458,35 @@ describe("rebuildIndex -- fix round 2 items 2/3", () => {
   });
 });
 
+describe("openIndex -- fix round 2 (unbriefed, found while testing item 2, same defect class): own discard-and-rebuild sidecar sweep", () => {
+  test("a DIRECTORY at <db>-wal makes SQLite refuse to open the otherwise-healthy main file (SQLITE_CANTOPEN), which probe() maps to 'corrupt' -- openIndex's own sidecar sweep at that point must throw a typed CanKanError, never a raw ERR_FS_EISDIR", async () => {
+    await withEnv(undefined, () => {
+      const path = buildRealIndexFile(BOARD_KEY);
+      mkdirSync(`${path}-wal`);
+
+      try {
+        // The directory obstruction is not something openIndex can
+        // rebuild past on its own -- it cannot remove the directory any
+        // more than `rebuildIndex` could (item 2). What changed is the
+        // *shape* of the failure: before this fix, this call threw a raw
+        // Node ErrnoException (`ERR_FS_EISDIR`) straight out of
+        // `openIndex`, unwrapped since this module's very first commit.
+        let thrown: unknown;
+        try {
+          openIndex({ boardKey: BOARD_KEY });
+          throw new Error("expected openIndex to throw");
+        } catch (error) {
+          thrown = error;
+        }
+        expect(isCanKanError(thrown)).toBe(true);
+        expect(isCanKanError(thrown) && thrown.code).toBe(IndexErrorCodes.CACHE_PATH_UNAVAILABLE);
+      } finally {
+        rmSync(`${path}-wal`, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
 /**
  * Item 1 (fix round 2): the post-`mkdir` re-`lstat` in `ensurePrivateCacheDir`
  * (`db.ts`, immediately after the `mkdirSync` call) is now wrapped in the

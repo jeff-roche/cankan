@@ -18,7 +18,7 @@
 
 import { monotonicFactory } from "ulid";
 import { CanKanError, isCanKanError } from "../errors";
-import type { CasRetryOptions, GitAdapter } from "../git/index";
+import type { CasRetryOptions, GitAdapter, RefSha } from "../git/index";
 import { GitErrorCodes, validateCoordinationRef, withCasRetry } from "../git/index";
 import { EventErrorCodes } from "./errors";
 import { canonicalizeTicketId, isValidEventId, parseEvent } from "./schema";
@@ -696,6 +696,48 @@ const injectedClockUlidFactory = monotonicFactory();
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> & { readonly id?: EventId } : never;
 export type EventCandidate = DistributiveOmit<Event, "id">;
 
+/**
+ * `git/types.ts`'s own `Sha` shape (`^[0-9a-f]{40}$` — see that file's doc
+ * comment), duplicated here rather than imported: `git/adapter.ts`'s own
+ * `SHA_PATTERN`/`assertShaShape` are module-private and not re-exported from
+ * `git/index.ts`. Used only to validate `AppendOptions.expectedParent`'s
+ * shape below — never to *mint* a `RefSha` (that brand is a compile-time-only
+ * distinction; this file never casts a validated string to it).
+ */
+const SHA_SHAPE_PATTERN = /^[0-9a-f]{40}$/;
+
+/**
+ * Validates `AppendOptions.expectedParent`'s shape (M2.10 slice 0), at
+ * option-validation time alongside every other `AppendOptions` field this
+ * file checks, before any git invocation. Must be `undefined` (no check
+ * requested — the default, today's behavior unchanged), `null` (the caller
+ * expects the ref not to exist yet), or a string matching the repo's SHA
+ * shape (the caller expects the ref's tip to be exactly that commit).
+ *
+ * A wrong-typed value (a number, an object, a non-SHA string) throws
+ * `EVENT_APPEND_INVALID_OPTION` here rather than reaching the retry loop's
+ * own `parentSha !== options.expectedParent` comparison — a plain `!==`
+ * would not throw for a mistyped value (it would just always compare
+ * unequal, misreporting every attempt as "stale" instead of "the caller's
+ * input was never valid"), the same past-`isCanKanError` shape this file's
+ * own `ulidFactory`/`since`/`ticket`/`casRetry` checks already close. No
+ * `details` value ever echoes the invalid string itself (obligation E) —
+ * only its `typeof`, mirroring `validateTicketFilter`/`validateSince`'s
+ * discipline immediately above.
+ */
+function validateExpectedParent(expectedParent: unknown): void {
+  if (expectedParent === undefined || expectedParent === null) {
+    return;
+  }
+  if (typeof expectedParent !== "string" || !SHA_SHAPE_PATTERN.test(expectedParent)) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+      `expectedParent must be undefined, null, or a 40-hex git object id, got ${typeof expectedParent === "string" ? "a malformed string" : typeof expectedParent}`,
+      { details: { type: typeof expectedParent } },
+    );
+  }
+}
+
 export interface AppendOptions {
   /**
    * The clock `append` uses for two things: which `events/<yyyy-mm>.jsonl`
@@ -797,6 +839,55 @@ export interface AppendOptions {
    * rejected.
    */
   readonly maxExistingBlobBytes?: number;
+  /**
+   * The tip this call's decision was made against (M2.10 slice 0 — the CAS
+   * seam ADR 0001:696-699's mandated cycle needs and this file's own header
+   * comment names as out of scope for M2.7: "does not check whether the
+   * event is otherwise valid to append"). `append`'s own CAS
+   * (`updateRefCAS`, inside `withCasRetry`) serializes concurrent writers
+   * against *each other* — it says nothing about whether either writer's
+   * decision is still correct by the time its write lands. Two callers that
+   * each read "this ticket is unclaimed" and both call `append` with no
+   * `expectedParent` both succeed: the internal re-read-and-retry loop below
+   * just serializes the two writes onto the ref one after another, it never
+   * asks whether the second writer's decision is still valid once the
+   * first's event has landed — a double claim, the exact hazard ADR 0001
+   * exists to prevent. That check needs `state/` (the fold this dispatch may
+   * not import — PLAN.md rule 2), so it belongs to the caller; this option
+   * is the seam that lets the caller supply the tip its decision assumed.
+   *
+   * - Omitted (`undefined`, the default): **today's behavior, exactly** —
+   *   no check, whatever the ref currently points to on a given attempt is
+   *   accepted as that attempt's parent. Every call site that predates this
+   *   option is unaffected.
+   * - `null`: the caller's decision assumed the ref does not exist yet (the
+   *   very first event on a fresh board). If a fresh `readRef` on any
+   *   attempt finds the ref already pointing somewhere, the decision was
+   *   made against stale information.
+   * - A `RefSha`: the caller's decision assumed the ref's tip was exactly
+   *   this commit. If a fresh `readRef` on any attempt disagrees, the
+   *   decision was made against stale information.
+   *
+   * **Either mismatch throws `EVENT_APPEND_STALE_PARENT` — on purpose, and
+   * without retrying internally.** So does a `commitTreeToRef` rejection
+   * while `expectedParent` is supplied (someone else's write landed between
+   * this attempt's read and its commit): that case does **not** fall
+   * through to `{ done: false }` the way an ordinary CAS loss does.
+   * `withCasRetry` (`git/retry.ts`) re-runs its callback only on `{ done:
+   * false }` — a thrown error propagates straight out with no further
+   * attempt. **The caller owns the retry because the caller owns the
+   * re-check**: re-reading, re-deciding, and calling `append` again with a
+   * freshly-computed `expectedParent` is the caller's job, not this
+   * primitive's — silently retrying here would silently repeat whatever
+   * stale decision the caller made, defeating the entire point of this
+   * option.
+   *
+   * Validated at option-validation time (`validateExpectedParent`, above),
+   * before any git invocation: must be `undefined`, `null`, or a string
+   * matching the repo's SHA shape — a wrong-typed value surfaces as
+   * `EVENT_APPEND_INVALID_OPTION`, never a raw comparison against garbage.
+   */
+  readonly expectedParent?: RefSha | null;
 }
 
 /**
@@ -1014,6 +1105,10 @@ export async function appendCore(
       details: { type: typeof casSleep },
     });
   }
+  // M2.10 slice 0: `expectedParent`'s own shape, checked here alongside
+  // every other option-shape check — see `validateExpectedParent`'s doc
+  // comment.
+  validateExpectedParent(options.expectedParent);
 
   // The id is minted once, before the retry loop — not per attempt. A retry
   // re-reads and re-checks git-level state, but it is still the same
@@ -1076,6 +1171,25 @@ export async function appendCore(
     // `AppendHooks.beforeCas` above and `log.test.ts`'s CAS-retry test,
     // which forces a real second attempt and asserts both events survive.
     const parentSha = await adapter.readRef(validatedRef);
+
+    // M2.10 slice 0: the caller's re-check seam — see
+    // `AppendOptions.expectedParent`'s doc comment for the full "why" (the
+    // hazard this closes: two callers both deciding "unclaimed" against the
+    // same tip and both calling `append` unconditionally). Checked against
+    // *this attempt's own fresh read*, on every attempt, not hoisted above
+    // the loop — the same discipline the rest of this callback already
+    // applies to `existing`. Throws rather than returning `{ done: false }`:
+    // a mismatch here means the caller's decision, not merely this
+    // attempt's build, is stale, and only the caller (which owns the
+    // re-check) can decide what to do next.
+    if (options.expectedParent !== undefined && parentSha !== options.expectedParent) {
+      throw new CanKanError(
+        EventErrorCodes.EVENT_APPEND_STALE_PARENT,
+        "expectedParent no longer matches the ref's current tip; re-read and re-check before appending again",
+        { details: { ref: validatedRef, expectedParent: options.expectedParent, actualParent: parentSha } },
+      );
+    }
+
     let existing = "";
     if (parentSha !== null) {
       existing = (await adapter.readBlobFromRef(validatedRef, path)) ?? "";
@@ -1144,6 +1258,23 @@ export async function appendCore(
 
     if (outcome.outcome === "applied") {
       return { done: true, value: { event, month, line: priorLineCount } };
+    }
+    if (options.expectedParent !== undefined) {
+      // M2.10 slice 0: a CAS rejection while the caller is holding a
+      // specific `expectedParent` means someone else's write landed between
+      // this attempt's read (above) and this commit attempt — the caller's
+      // decision is exactly as stale as the mismatch case above, so this
+      // does not fall through to the ordinary `{ done: false }`/internal-
+      // retry path either (see `AppendOptions.expectedParent`'s doc
+      // comment). `parentSha` (this attempt's now-proven-stale read) is not
+      // reused as `actualParent` here — a fresh `readRef` reports the tip
+      // that actually caused the rejection, best-effort.
+      const actualParent = await adapter.readRef(validatedRef);
+      throw new CanKanError(
+        EventErrorCodes.EVENT_APPEND_STALE_PARENT,
+        "expectedParent's compare-and-swap was rejected by a concurrent writer; re-read and re-check before appending again",
+        { details: { ref: validatedRef, expectedParent: options.expectedParent, actualParent } },
+      );
     }
     return { done: false };
   }, withValidatedBackoff(options.casRetry));

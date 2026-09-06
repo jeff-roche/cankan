@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { decodeTime, monotonicFactory } from "ulid";
 import { isCanKanError } from "../../src/errors";
-import { createGitAdapter, GitErrorCodes, type GitAdapter } from "../../src/git/index";
+import { createGitAdapter, GitErrorCodes, type GitAdapter, type RefSha } from "../../src/git/index";
 import { EventErrorCodes } from "../../src/events/errors";
 import {
   append,
@@ -1563,6 +1563,173 @@ describe("append — fix round 3, Ruling R31/R32: every caller-supplied option i
     await expectCode(
       append(adapter, COORD_REF, claim("ck-1"), { ulidFactory: () => 1n as unknown as string }),
       EventErrorCodes.EVENT_APPEND_REJECTED,
+    );
+  });
+});
+
+// ============================================================================
+// M2.10 slice 0 — `AppendOptions.expectedParent`, the CAS seam every later
+// slice depends on (see `log.ts`'s doc comment on the option itself for the
+// full "why": `append`'s own CAS serializes concurrent writers against each
+// other, not the *decision* each writer made before calling `append`).
+// ============================================================================
+
+describe("append — expectedParent (M2.10 slice 0)", () => {
+  test("omitting expectedParent is unchanged: two sequential appends both land, the second sees the first", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    const first = await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    const second = await append(adapter, COORD_REF, claim("ck-2"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    expect(first.event.ticket as string).toBe("ck-1");
+    expect(second.event.ticket as string).toBe("ck-2");
+
+    const records = await read(adapter, COORD_REF, { now: SEPT_15_MS });
+    expect(records.map((r) => r.event.ticket as string).sort()).toEqual(["ck-1", "ck-2"]);
+  });
+
+  test("a stale expectedParent is rejected, and nothing is written", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await append(adapter, COORD_REF, claim("ck-seed"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    const staleTip = await adapter.readRef(COORD_REF);
+    if (staleTip === null) {
+      throw new Error("expected the seeded ref to already exist");
+    }
+
+    // A competing writer moves the tip out from under `staleTip`.
+    await append(adapter, COORD_REF, claim("ck-competitor"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-mine"), { now: SEPT_15_MS, casRetry: FAST_RETRY, expectedParent: staleTip }),
+      EventErrorCodes.EVENT_APPEND_STALE_PARENT,
+    );
+
+    // The log holds exactly the competitor's event and the seed — not the
+    // rejected `ck-mine` — proving the throw happened before any write.
+    const records = await read(adapter, COORD_REF, { now: SEPT_15_MS });
+    const tickets = records.map((r) => r.event.ticket as string).sort();
+    expect(tickets).toEqual(["ck-competitor", "ck-seed"]);
+  });
+
+  test("a stale expectedParent does not drive an internal retry — the caller owns it", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await append(adapter, COORD_REF, claim("ck-seed"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    const staleTip = await adapter.readRef(COORD_REF);
+    if (staleTip === null) {
+      throw new Error("expected the seeded ref to already exist");
+    }
+    await append(adapter, COORD_REF, claim("ck-competitor"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    let attempts = 0;
+    const hooks: AppendHooks = {
+      beforeCas: async () => {
+        attempts += 1;
+      },
+    };
+
+    // A generous `maxAttempts` — if a mismatched `expectedParent` were ever
+    // reported as `{ done: false }` instead of thrown, `withCasRetry` would
+    // drive this loop through up to 50 attempts (each re-reading, and each
+    // hitting the identical mismatch, since nothing here ever makes
+    // `staleTip` current again) before finally giving up with the wrong
+    // error code.
+    await expectCode(
+      appendCore(
+        adapter,
+        COORD_REF,
+        claim("ck-mine"),
+        { now: SEPT_15_MS, casRetry: { ...FAST_RETRY, maxAttempts: 50 }, expectedParent: staleTip },
+        hooks,
+      ),
+      EventErrorCodes.EVENT_APPEND_STALE_PARENT,
+    );
+
+    expect(attempts).toBeLessThanOrEqual(1);
+  });
+
+  test("a current expectedParent succeeds", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    const currentTip = await adapter.readRef(COORD_REF);
+    if (currentTip === null) {
+      throw new Error("expected the ref to already exist");
+    }
+
+    const appended = await append(adapter, COORD_REF, claim("ck-2"), {
+      now: SEPT_15_MS,
+      casRetry: FAST_RETRY,
+      expectedParent: currentTip,
+    });
+    expect(appended.event.ticket as string).toBe("ck-2");
+
+    const records = await read(adapter, COORD_REF, { now: SEPT_15_MS });
+    expect(records.map((r) => r.event.ticket as string).sort()).toEqual(["ck-1", "ck-2"]);
+  });
+
+  test("expectedParent: null succeeds on a fresh repo, where the ref does not exist yet", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    const tipBeforeAppend = await adapter.readRef(COORD_REF);
+    expect(tipBeforeAppend).toBeNull();
+
+    const appended = await append(adapter, COORD_REF, claim("ck-1"), {
+      now: SEPT_15_MS,
+      casRetry: FAST_RETRY,
+      expectedParent: null,
+    });
+    expect(appended.event.ticket as string).toBe("ck-1");
+  });
+
+  test("expectedParent: null throws once the ref already exists", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-2"), { now: SEPT_15_MS, casRetry: FAST_RETRY, expectedParent: null }),
+      EventErrorCodes.EVENT_APPEND_STALE_PARENT,
+    );
+
+    const records = await read(adapter, COORD_REF, { now: SEPT_15_MS });
+    expect(records.map((r) => r.event.ticket as string)).toEqual(["ck-1"]);
+  });
+
+  test("a number expectedParent surfaces EVENT_APPEND_INVALID_OPTION, not a raw comparison against garbage", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { expectedParent: 123 as unknown as RefSha }),
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+    );
+  });
+
+  test("an object expectedParent surfaces EVENT_APPEND_INVALID_OPTION", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { expectedParent: {} as unknown as RefSha }),
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+    );
+  });
+
+  test("a non-SHA string expectedParent surfaces EVENT_APPEND_INVALID_OPTION", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { expectedParent: "not-a-sha" as unknown as RefSha }),
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
     );
   });
 });

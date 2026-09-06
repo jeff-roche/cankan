@@ -578,6 +578,28 @@ type LeaseAnchorEvent = Extract<Event, { event: LeaseAnchorKind }>;
  * all gives Mallory nothing a bare `claim(mallory)` doesn't already give
  * her, since M3 (above) makes `claim`/`takeover` anchor unconditionally
  * regardless of any existing incumbent.
+ *
+ * **L8 also has a cross-reader property, not just a within-reader one
+ * (fix round 4, security review) — worth naming since M3's own paragraph a
+ * few lines up invokes cross-reader disagreement as a reason to *reject* a
+ * rule, and leaving this unmentioned here would read as though L8 has no
+ * such property.** With the identical log `[claim(alice), renew(mallory),
+ * renew(alice)]`, a reader whose window includes all three sees the anchor
+ * as `renew(alice)` (same-actor extension, M2), while a reader whose window
+ * has truncated `claim(alice)` out sees only `[renew(mallory),
+ * renew(alice)]` and anchors on `renew(mallory)` first (L8's first-event
+ * rule), then `renew(alice)` fails M2's same-actor check against *that*
+ * anchor and is dropped — so the narrow-window reader reports **mallory**
+ * where the wide-window reader reports **alice**. Bounded, not open-ended:
+ * mallory pushing a plain `claim` gets her the ticket in *every* window
+ * deterministically already (M3), so this path never grants her anything
+ * beyond what a `claim` already would — the renew path is strictly weaker,
+ * never stronger. The benign case (no `renew(mallory)` in the log at all)
+ * agrees across every window, and the disagreement window self-heals the
+ * moment any reader observes a real `claim` event, at which point every
+ * reader converges again. `actor` being unauthenticated (this file's own
+ * closing note) is what makes tolerating this bounded disagreement
+ * acceptable rather than a mutual-exclusion violation in its own right.
  */
 function resolveLeaseAnchor(leaseAffecting: readonly EventRecord[]): LeaseAnchorEvent | undefined {
   let anchor: LeaseAnchorEvent | undefined;

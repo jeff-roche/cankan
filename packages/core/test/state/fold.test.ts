@@ -518,8 +518,21 @@ describe("foldState — alias resolution does not blow up quadratically (I2, sec
       firstSeen: new Map(),
     });
 
+    // Every one of a0..a(N-1) is a `from` key in this chain and all of them
+    // resolve to the single known ticket at the end — `toHaveLength` plus
+    // spot-checking both ends catches a dropped or fabricated entry
+    // anywhere in the chain, not just at the one node `toContain("a0")`
+    // alone would have checked (fix round 4, Minor 3).
+    expect(state.tickets[0]?.aliases).toHaveLength(N);
     expect(state.tickets[0]?.aliases).toContain("a0");
+    expect(state.tickets[0]?.aliases).toContain(`a${N - 1}`);
   });
+
+  /** The middle value of three timing samples at `n` — damps a single JIT/GC outlier the way a lone measurement can't (fix round 4, Minor 2). */
+  function medianTimeFoldOverChain(n: number): number {
+    const samples = [timeFoldOverChain(n), timeFoldOverChain(n), timeFoldOverChain(n)].sort((a, b) => a - b);
+    return samples[1] as number;
+  }
 
   test("growing the chain 4x grows the wall-clock time roughly 4x, not ~16x (O(N), not O(N^2))", () => {
     // A wall-clock *absolute* bound is both a CI-flakiness risk on a loaded
@@ -533,9 +546,16 @@ describe("foldState — alias resolution does not blow up quadratically (I2, sec
     // ~16x the time; linear growth gives ~4x. N is chosen large enough that
     // both measurements clear a few milliseconds, so JS timer granularity
     // and GC jitter don't dominate the ratio.
+    //
+    // **Median of 3 at each N (fix round 4, Minor 2)**, not a single
+    // sample: a single-sample run of a different alias shape hit a 8.16x
+    // ratio once against this same `< 8` threshold (security review) —
+    // `main` is branch-protected on both CI legs, so a flaky assertion here
+    // is expensive. A median damps exactly the kind of one-off JIT/GC
+    // outlier that produced that spike.
     const N = 8000;
-    const baseline = timeFoldOverChain(N);
-    const fourX = timeFoldOverChain(N * 4);
+    const baseline = medianTimeFoldOverChain(N);
+    const fourX = medianTimeFoldOverChain(N * 4);
 
     const ratio = fourX / Math.max(baseline, 0.01);
     expect(ratio).toBeLessThan(8); // linear predicts ~4; quadratic predicts ~16 — 8 is the midpoint, generous either way
@@ -769,78 +789,105 @@ describe("foldState — alias map", () => {
     expect(state.tickets[0]?.aliases).toEqual(["a"]);
   });
 
-  test("property check: the memoized resolver agrees with the pre-fix from-scratch walk, node by node, across chain/cycle/tail shapes", () => {
+  test("property check: the memoized resolver agrees with the pre-fix from-scratch walk, node by node, across chain/cycle/tail/shared-sink shapes, in BOTH event orders", () => {
     // `knownTicketIds` is chosen explicitly per graph — deliberately NOT
     // derived from "every value ever used as a `to`", which would make
     // some `from` keys also count as known tickets and blur what's being
     // tested. Every node in `edges` (whether or not it's a known ticket) is
     // checked: a known-ticket target must list the node as an alias; every
     // OTHER known ticket must NOT.
-    function agreesForEveryNode(edges: ReadonlyMap<string, string>, knownTicketIds: readonly string[]): void {
+    //
+    // **Runs each shape's alias events in both the given order and reversed
+    // (fix round 4, Minor 1).** Instrumented directly: in forward-only
+    // order across these five shapes, `resolveAllAliasTargets`'s
+    // already-resolved-node "adopt the cached value" branch — the one that
+    // actually carries the Critical fix's safety claim, "`resolved` only
+    // ever holds fully-validated answers" — was never once taken (0 hits).
+    // A mutant that instead re-derives the answer from the *current* walk
+    // (`resolved.set(node, current)` instead of `resolved.set(node,
+    // already)`) passed every shape in forward order and was only killed by
+    // running `tailIntoCycle` reversed. Running every shape both ways (plus
+    // the shared-sink shape below, which forces two independent components
+    // to land on the same cached target) is what actually exercises that
+    // branch — verified by deliberately reintroducing the mutant locally,
+    // confirming this test then fails, and reverting (see the task report).
+    function agreesForEveryNode(pairs: ReadonlyArray<readonly [string, string]>, knownTicketIds: readonly string[]): void {
+      const edges = new Map(pairs); // for the reference walk only — `.get()` doesn't care about insertion order
       const knownTickets = knownTicketIds.map((id) => makeStoredTicket(id, "To Do"));
-      const events = [...edges.entries()].map(([from, to], i) =>
-        fixtureEvent({ event: "alias", ticket: "ck-x", from, to }, "2026-01", i),
-      );
-      const state = foldState(knownTickets, events, { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
-      const aliasesByTicket = new Map(state.tickets.map((t) => [t.id as string, t.aliases]));
 
-      for (const from of edges.keys()) {
-        const expectedTarget = resolveAliasTargetForTesting(edges, from);
-        for (const knownId of knownTicketIds) {
-          const shouldBeListed = knownId === expectedTarget;
-          const isListed = (aliasesByTicket.get(knownId) ?? []).includes(from);
-          expect(isListed, `${from} -> ${expectedTarget} (checked against known ticket ${knownId})`).toBe(
-            shouldBeListed,
-          );
+      function checkInEventOrder(orderedPairs: ReadonlyArray<readonly [string, string]>): void {
+        const events = orderedPairs.map(([from, to], i) =>
+          fixtureEvent({ event: "alias", ticket: "ck-x", from, to }, "2026-01", i),
+        );
+        const state = foldState(knownTickets, events, { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+        const aliasesByTicket = new Map(state.tickets.map((t) => [t.id as string, t.aliases]));
+
+        for (const from of edges.keys()) {
+          const expectedTarget = resolveAliasTargetForTesting(edges, from);
+          for (const knownId of knownTicketIds) {
+            const shouldBeListed = knownId === expectedTarget;
+            const isListed = (aliasesByTicket.get(knownId) ?? []).includes(from);
+            expect(isListed, `${from} -> ${expectedTarget} (checked against known ticket ${knownId})`).toBe(
+              shouldBeListed,
+            );
+          }
         }
       }
+
+      checkInEventOrder(pairs);
+      checkInEventOrder([...pairs].reverse());
     }
 
     // Long acyclic chain ending at a real sink.
     agreesForEveryNode(
-      new Map([
+      [
         ["a0", "a1"],
         ["a1", "a2"],
         ["a2", "sink"],
-      ]),
+      ],
       ["sink"],
     );
     // Pure 2-cycle and 3-cycle (the Critical fix's own shapes) — check
     // every node as a candidate known ticket, not just one.
     agreesForEveryNode(
-      new Map([
+      [
         ["a", "b"],
         ["b", "a"],
-      ]),
+      ],
       ["a", "b"],
     );
     agreesForEveryNode(
-      new Map([
+      [
         ["a", "b"],
         ["b", "c"],
         ["c", "a"],
-      ]),
+      ],
       ["a", "b", "c"],
     );
     // A tail feeding into a cycle (rho shape).
     agreesForEveryNode(
-      new Map([
+      [
         ["x", "a"],
         ["a", "b"],
         ["b", "a"],
-      ]),
+      ],
       ["a", "b"],
     );
     // Two independent components resolved in one call.
     agreesForEveryNode(
-      new Map([
+      [
         ["p", "q"],
         ["q", "sink1"],
         ["m", "n"],
         ["n", "m"],
-      ]),
+      ],
       ["sink1", "m", "n"],
     );
+    // A shared sink: two disjoint tails converging on the SAME already-
+    // resolved node — the shape most directly designed to force the
+    // adoption branch (a second component's walk lands on a sink an
+    // earlier component already validated).
+    agreesForEveryNode([["p", "s"], ["q", "s"]], ["s"]);
   });
 });
 

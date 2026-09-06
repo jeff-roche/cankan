@@ -4,7 +4,7 @@ import { writeFixtureTickets } from "../../../test-utils/src/fixtureTickets";
 import { makeTempRepo, type TempRepo } from "../../../test-utils/src/tempRepo";
 import { withEnv } from "../../../test-utils/src/withEnv";
 import { buildBoardRef } from "../../src/board/ref";
-import { claim, renew, type ClaimResult } from "../../src/claims/index";
+import { claim, expireStale, renew, type ClaimResult } from "../../src/claims/index";
 import { claimCore, type ClaimHooks } from "../../src/claims/claim";
 import { ClaimErrorCodes } from "../../src/claims/errors";
 import { parseDurationMs } from "../../src/claims/duration";
@@ -114,6 +114,23 @@ function closeCandidate(ticket: string, actor: string): EventCandidate {
 
 function actorId(id: string): ActorId {
   return id as ActorId;
+}
+
+/**
+ * A `claim` candidate a peer with push access could append directly (via
+ * `append`, bypassing `claim()` entirely) carrying a `lease_until` this
+ * reader never chose — the mutation-testing gap this file's own bottom
+ * section closes. `ts` is always `NOW` (a real, in-bounds instant this
+ * reader's own clock would accept); only `leaseUntil` is hostile.
+ */
+function hostileClaimCandidate(ticket: string, actor: ActorId, leaseUntil: string): EventCandidate {
+  return {
+    event: "claim",
+    ts: new Date(NOW).toISOString(),
+    actor,
+    ticket,
+    lease_until: leaseUntil,
+  } as unknown as EventCandidate;
 }
 
 // ============================================================================
@@ -726,5 +743,106 @@ test("required test 3: --force/takeover discards every id the displaced lease ha
     // The takeover's OWN new event id is observed, never discarded -- it is
     // the live anchor now, not part of the ended run.
     expect(await firstSeen(boardKey, takeover.eventId)).not.toBeNull();
+  });
+});
+
+// ============================================================================
+// Mutation-testing gap: `lease_until` is DISPLAY ONLY (this file's header,
+// and `events/schema.ts`'s `leaseUntilSchema` doc comment) -- but every
+// existing test's `lease_until` sits approximately at `firstSeen +
+// leaseTtlMs`, where the correct reader-local computation and a defective
+// one that trusted `lease_until` instead (`Date.parse(lease.leaseUntilDisplay)
+// > now`) agree, so no assertion could tell them apart. These two plant a
+// HOSTILE `claim` event directly on the coordination ref via `append` -- a
+// peer with push access, never `claim()` itself -- whose `lease_until` lies,
+// and prove this reader's own clock (`firstSeen(eventId) + leaseTtlMs`)
+// governs regardless. ADR 0001 failure mode 7.
+// ============================================================================
+
+test("ADR fm7: a far-future lease_until does not hold a ticket hostage -- expiry stays firstSeen + leaseTtlMs, never the peer-supplied field", async () => {
+  await withTestBoard(async ({ board }) => {
+    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-fm7-future", "Far future")]);
+    const actorA = actorId("actor-fm7-future-a");
+    const actorB = actorId("actor-fm7-future-b");
+
+    const adapter = await createGitAdapter(board.root);
+    const tenYearsMs = 10 * 365 * 24 * 60 * 60 * 1000;
+    const farFutureLeaseUntil = new Date(NOW + tenYearsMs).toISOString();
+    await append(adapter, board.coordinationRef, hostileClaimCandidate("ck-fm7-future", actorA, farFutureLeaseUntil), { now: NOW });
+
+    // Let the reader observe the hostile event at NOW: a dry-run sweep folds
+    // the board (`snapshotBoard` -> `observeAndFold`) and appends nothing,
+    // which is exactly what records this reader's own `firstSeen` for A's
+    // claim.
+    const observed = await expireStale({ board, actor: actorId("actor-fm7-future-sweeper"), now: NOW, dryRun: true });
+    expect(observed.dryRun).toBe(true);
+
+    const leaseTtlMs = parseDurationMs("2h"); // the board's default `claims.lease`
+    const laterNow = NOW + leaseTtlMs + 1;
+
+    // If expiry consulted the hostile (years-away) `lease_until`, this
+    // reclaim would reject forever. It must instead succeed via the normal
+    // expire-then-claim reclaim path.
+    const claimedByB = await claim({ board, ticket: "ck-fm7-future", actor: actorB, now: laterNow });
+    expect(claimedByB.kind).toBe("claim");
+    expect(claimedByB.attempts).toBe(2); // one attempt for the expire, one for the claim
+
+    const records = await read(adapter, board.coordinationRef, { now: laterNow });
+    const expireRecord = records.find((r) => r.event.event === "expire" && r.event.ticket === "ck-fm7-future");
+    const bClaimRecord = records.find((r) => r.event.id === claimedByB.eventId);
+    expect(expireRecord).toBeDefined();
+    expect(bClaimRecord).toBeDefined();
+    if (expireRecord === undefined || bClaimRecord === undefined) throw new Error("expected both records");
+    const expireBeforeClaim =
+      expireRecord.month < bClaimRecord.month || (expireRecord.month === bClaimRecord.month && expireRecord.line < bClaimRecord.line);
+    expect(expireBeforeClaim).toBe(true);
+
+    // A fresh fold shows B as the live holder.
+    const thirdRejection = await expectCode(
+      claim({ board, ticket: "ck-fm7-future", actor: actorId("actor-fm7-future-c"), now: laterNow }),
+      ErrorCodes.CLAIM_REJECTED,
+    );
+    expect(thirdRejection.details?.holder).toBe(actorB);
+  });
+});
+
+test("ADR fm7: a backdated lease_until does not make a live lease look expired -- reclaim is rejected and nothing is appended", async () => {
+  await withTestBoard(async ({ board }) => {
+    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-fm7-past", "Backdated")]);
+    const actorA = actorId("actor-fm7-past-a");
+    const actorB = actorId("actor-fm7-past-b");
+
+    const adapter = await createGitAdapter(board.root);
+    const oneHourMs = 60 * 60 * 1000;
+    const backdatedLeaseUntil = new Date(NOW - oneHourMs).toISOString();
+    await append(adapter, board.coordinationRef, hostileClaimCandidate("ck-fm7-past", actorA, backdatedLeaseUntil), { now: NOW });
+
+    // Reader observes A's claim at NOW -- firstSeen = NOW, so real expiry is
+    // NOW + leaseTtlMs (2h), well after `laterNow` below despite the
+    // backdated display field claiming this lease already ended a full hour
+    // before it was even first observed.
+    const observed = await expireStale({ board, actor: actorId("actor-fm7-past-sweeper"), now: NOW, dryRun: true });
+    expect(observed.dryRun).toBe(true);
+
+    const refBefore = await adapter.readRef(board.coordinationRef);
+    expect(refBefore).not.toBeNull();
+
+    const laterNow = NOW + 1; // well inside the real 2h TTL from firstSeen
+    const rejection = await expectCode(claim({ board, ticket: "ck-fm7-past", actor: actorB, now: laterNow }), ErrorCodes.CLAIM_REJECTED);
+    expect(rejection.details?.reason).toBe("already-held");
+    expect(rejection.details?.holder).toBe(actorA);
+
+    // No event was appended by the rejected claim attempt.
+    expect(await adapter.readRef(board.coordinationRef)).toBe(refBefore);
+
+    // `expireStale` must not sweep it either -- a live lease is never even a
+    // candidate, so the sweep's result carries no entry for this ticket at
+    // all, and the ref is untouched.
+    const sweep = await expireStale({ board, actor: actorId("actor-fm7-past-sweeper2"), now: laterNow });
+    expect(sweep.dryRun).toBe(false);
+    // Only one ticket exists on this board, and its live lease is never a
+    // candidate at all -- the sweep's own result list is empty.
+    expect(sweep.tickets.length).toBe(0);
+    expect(await adapter.readRef(board.coordinationRef)).toBe(refBefore);
   });
 });

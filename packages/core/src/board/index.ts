@@ -52,6 +52,15 @@ export {
 // ---- this module's own error codes -----------------------------------------
 export { BoardErrorCodes } from "./errors";
 
+// ---- shared path-safety primitive (1B, Ruling R5) ---------------------------
+// `isContained` is `board/ref.ts`'s own containment test -- path-component
+// semantics, never a string prefix (see that file's F1 finding). Exported
+// here, not from `ref.ts` directly (which stays internal, see the file
+// header above), so M2.5's `store/` can reuse it for ADR 0002 step (c)
+// (excluding the repository's real git directory) instead of growing a
+// second copy that could drift from this one or reopen F1's prefix bug.
+export { isContained } from "./ref";
+
 // ---- the M2.3 wire: config layers -> the resolved board --------------------
 
 export interface LoadBoardConfigOptions {

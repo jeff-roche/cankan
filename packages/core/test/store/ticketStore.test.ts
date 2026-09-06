@@ -1,9 +1,10 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { makeTempRepo, type TempRepo } from "../../../test-utils/src/tempRepo";
 import { withEnv } from "../../../test-utils/src/withEnv";
+import { BoardErrorCodes, resolveBoard } from "../../src/board/index";
 import { buildBoardRef } from "../../src/board/ref";
 import { ErrorCodes, isCanKanError } from "../../src/errors";
 import { createGitAdapter } from "../../src/git/index";
@@ -17,6 +18,21 @@ import {
 } from "../../src/store/ticketStore";
 import { TicketErrorCodes, parseTicketFile, parseTicketFilename, setCankanBlock, type ParsedTicket } from "../../src/ticket/index";
 import type { BoardRef } from "../../src/types";
+import { hermeticEnv, writeRepoConfigFile } from "../config/testHelpers";
+
+/**
+ * Runs a raw `git` command for building a fixture `bun`'s own git plumbing
+ * doesn't cover -- `git init --separate-git-dir`, specifically (R2's repro
+ * below). Mirrors `test-utils/src/tempRepo.ts`'s own local `git()` helper
+ * rather than importing it, since that one is deliberately not exported
+ * (its caller always wants the higher-level `makeTempRepo` instead).
+ */
+function runGit(cwd: string, args: string[]): void {
+  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} (cwd=${cwd}) failed:\n${result.stderr.toString()}`);
+  }
+}
 
 // ---- test helpers ---------------------------------------------------------
 
@@ -78,6 +94,18 @@ async function expectRejectsWithCode(fn: () => Promise<unknown>, code: string): 
 
 async function openStore(board: BoardRef): Promise<TicketStore> {
   return openTicketStore({ board, gitDirs: [] });
+}
+
+/** Asserts nothing exists at `path` -- `stat` must fail with `ENOENT`, not merely "the call threw." */
+async function assertDoesNotExist(path: string): Promise<void> {
+  let threw = false;
+  try {
+    await stat(path);
+  } catch (err) {
+    threw = true;
+    expect((err as { code?: unknown }).code).toBe("ENOENT");
+  }
+  expect(threw).toBe(true);
 }
 
 // ---- CRUD round trip -------------------------------------------------------
@@ -533,6 +561,281 @@ describe("openTicketStore — gitDirs is required, with an explicit empty-array 
         ErrorCodes.USAGE,
       );
       await expectRejectsWithCode(() => openTicketStore({ board, gitDirs: [""] }), ErrorCodes.USAGE);
+    });
+  });
+
+  test("a non-string gitDirs entry (e.g. a number) is rejected with USAGE -- the runtime guard's own stated justification (1B, work item 3d)", async () => {
+    await withTestBoard(async ({ board }) => {
+      await expectRejectsWithCode(
+        () => openTicketStore({ board, gitDirs: [42] as unknown as readonly string[] }),
+        ErrorCodes.USAGE,
+      );
+    });
+  });
+
+  test("an absolute but non-canonical gitDirs entry is rejected with USAGE (1B, work item 2b.1) -- a security check that silently no-ops on macOS is the exact defect this tightening exists to prevent", async () => {
+    await withTestBoard(async ({ board }) => {
+      // A directory reached through a symlinked parent -- absolute, but not
+      // what `fs.realpath` returns for it, modeling the macOS
+      // `/var/folders/...` -> `/private/var/folders/...` case without
+      // depending on the host actually being macOS.
+      const real = await mkdtemp(join(tmpdir(), "cankan-store-gitdirs-real-"));
+      const linkParent = await mkdtemp(join(tmpdir(), "cankan-store-gitdirs-link-"));
+      try {
+        const linkPath = join(linkParent, "git-dir-link");
+        await symlink(real, linkPath);
+        await expectRejectsWithCode(
+          () => openTicketStore({ board, gitDirs: [linkPath] }),
+          ErrorCodes.USAGE,
+        );
+      } finally {
+        await rm(real, { recursive: true, force: true });
+        await rm(linkParent, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+// ---- ADR 0002 step (b) write-time re-check, and step (c) git-directory exclusion (1B, Ruling R9) ----
+//
+// Every test below hands `openTicketStore()` a hand-built, hostile
+// `BoardRef` literal -- bypassing `buildBoardRef`/`resolveBoard`
+// deliberately, per the task brief's "READ THIS BEFORE YOU WRITE A SINGLE
+// TEST": `buildBoardRef` is the thing that realpaths `root`/`ticketsDir`,
+// and a hand-built literal skips that. Every temp directory built into one
+// of these literals is realpath'd first -- `mkdtemp(tmpdir())` is
+// non-canonical on macOS (`/var` -> `/private/var`), and comparing a
+// non-canonical hand-built value against this module's own (correctly
+// canonical) internal `realpath` calls would pass on Linux and fail only
+// on the macOS CI leg.
+describe("ticketStore — ADR 0002 step (b) write-time re-check and step (c) git-directory exclusion (hand-built BoardRef, R9)", () => {
+  test("a ticketsDir resolving outside root is refused, and nothing is created", async () => {
+    await withEnv(undefined, async () => {
+      const repo = await makeTempRepo();
+      const outside = await realpath(await mkdtemp(join(tmpdir(), "cankan-store-outside-")));
+      try {
+        const board: BoardRef = {
+          kind: "repo",
+          name: "hostile",
+          root: repo.dir,
+          ticketsDir: outside,
+          coordinationRef: "refs/cankan/coordination",
+        };
+        const store = await openTicketStore({ board, gitDirs: [] });
+        const targetPath = join(outside, "ck-escape1 - Escape.md");
+
+        await expectRejectsWithCode(
+          () => store.write(newTicket("ck-escape1", "Escape")),
+          StoreErrorCodes.TICKETS_DIR_UNSAFE,
+        );
+
+        await assertDoesNotExist(targetPath);
+        expect(await readdir(outside)).toEqual([]);
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+        await repo.cleanup();
+      }
+    });
+  });
+
+  test("a ticketsDir inside <root>/.git is refused by the store's own gitDirs check, and nothing is created", async () => {
+    await withEnv(undefined, async () => {
+      const repo = await makeTempRepo();
+      try {
+        // Pre-created, the way the exploit's own repro step pre-creates
+        // its target -- write()/remove()/archive() never create
+        // `ticketsDir` themselves (Ruling R4), so for this test to reach
+        // 1B's guard rather than `TICKETS_DIR_MISSING`, the hostile
+        // directory has to already exist.
+        const hostileTicketsDir = join(repo.dir, ".git", "ticket-evil");
+        await mkdir(hostileTicketsDir, { recursive: true });
+
+        const adapter = await createGitAdapter(repo.dir);
+        const gitDirs = [await adapter.gitCommonDir()];
+
+        const board: BoardRef = {
+          kind: "repo",
+          name: "hostile",
+          root: repo.dir,
+          ticketsDir: hostileTicketsDir,
+          coordinationRef: "refs/cankan/coordination",
+        };
+        const store = await openTicketStore({ board, gitDirs });
+        const targetPath = join(hostileTicketsDir, "ck-escape2 - Escape.md");
+
+        await expectRejectsWithCode(
+          () => store.write(newTicket("ck-escape2", "Escape")),
+          StoreErrorCodes.TICKETS_DIR_UNSAFE,
+        );
+
+        await assertDoesNotExist(targetPath);
+        expect(await readdir(hostileTicketsDir)).toEqual([]);
+      } finally {
+        await repo.cleanup();
+      }
+    });
+  });
+
+  test("a ticketsDir inside the real git directory under a non-.git name is refused -- the git init --separate-git-dir repro (R2), the reason this slice exists", async () => {
+    await withEnv(undefined, async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "cankan-store-sepgit-")));
+      try {
+        // Built by actually running git, not assumed -- confirmed directly
+        // (git 2.55.0, --path-format=absolute) before relying on it here:
+        // a `--separate-git-dir` repo's `.git` is a *file* pointing at
+        // `innergit`, whose first path segment under `root` is "innergit",
+        // not ".git" -- board/ref.ts's by-name check cannot see this at
+        // all, and its own file header (ref.ts:110-119) concluded (wrongly)
+        // that this had "no known unblocked exploit."
+        runGit(root, ["init", "--separate-git-dir=./innergit", "."]);
+        runGit(root, ["config", "user.name", "CanKan Test"]);
+        runGit(root, ["config", "user.email", "test@cankan.invalid"]);
+        runGit(root, ["commit", "--allow-empty", "-m", "initial commit"]);
+
+        const adapter = await createGitAdapter(root);
+        const gitCommonDir = await adapter.gitCommonDir();
+        expect(gitCommonDir).toBe(join(root, "innergit"));
+
+        // "mkdir -p innergit/refs/cankan-evil" -- succeeds today, exactly
+        // as the brief's own repro demonstrated.
+        const hostileTicketsDir = join(root, "innergit", "refs", "cankan-evil");
+        await mkdir(hostileTicketsDir, { recursive: true });
+
+        const board: BoardRef = {
+          kind: "repo",
+          name: "hostile",
+          root,
+          ticketsDir: hostileTicketsDir,
+          coordinationRef: "refs/cankan/coordination",
+        };
+        const store = await openTicketStore({ board, gitDirs: [gitCommonDir] });
+        const targetPath = join(hostileTicketsDir, "ck-escape3 - Escape.md");
+
+        await expectRejectsWithCode(
+          () => store.write(newTicket("ck-escape3", "Escape")),
+          StoreErrorCodes.TICKETS_DIR_UNSAFE,
+        );
+
+        await assertDoesNotExist(targetPath);
+        expect(await readdir(hostileTicketsDir)).toEqual([]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("a ticketsDir reached through a symlink created after the BoardRef was built is refused -- the real TOCTOU step (b)'s write-time half exists to catch -- for write(), remove(), and archive() alike", async () => {
+    await withEnv(undefined, async () => {
+      const repo = await makeTempRepo();
+      const outside = await realpath(await mkdtemp(join(tmpdir(), "cankan-store-toctou-")));
+      try {
+        const ticketsPath = join(repo.dir, "tickets");
+        await mkdir(ticketsPath);
+        const board: BoardRef = {
+          kind: "repo",
+          name: "hostile",
+          root: repo.dir,
+          ticketsDir: ticketsPath,
+          coordinationRef: "refs/cankan/coordination",
+        };
+        // The BoardRef above was built against a real, contained
+        // directory. Only *now* -- after it exists -- is that directory
+        // replaced by a symlink pointing entirely outside root, modeling
+        // the window between resolve time and a write that step (b)'s
+        // write-time half exists to close.
+        await rm(ticketsPath, { recursive: true });
+        await symlink(outside, ticketsPath);
+
+        const store = await openTicketStore({ board, gitDirs: [] });
+        const targetPath = join(outside, "ck-escape4 - Escape.md");
+
+        await expectRejectsWithCode(
+          () => store.write(newTicket("ck-escape4", "Escape")),
+          StoreErrorCodes.TICKETS_DIR_UNSAFE,
+        );
+        // Proves the shared guard covers all three write paths, not only
+        // write() -- remove()/archive() have nothing to resolve (the
+        // ticket was never written), but the guard must still fire first.
+        await expectRejectsWithCode(() => store.remove("ck-escape4"), StoreErrorCodes.TICKETS_DIR_UNSAFE);
+        await expectRejectsWithCode(() => store.archive("ck-escape4"), StoreErrorCodes.TICKETS_DIR_UNSAFE);
+
+        await assertDoesNotExist(targetPath);
+        expect(await readdir(outside)).toEqual([]);
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+        await repo.cleanup();
+      }
+    });
+  });
+});
+
+// ---- end-to-end sanity: this is M2.4's coverage, kept to exactly one case ----
+
+describe("ticketStore — end-to-end sanity (M2.4's own coverage, not this module's -- kept to one case)", () => {
+  test("end-to-end: resolveBoard() itself refuses a hostile checked-in tickets_dir before any BoardRef -- or ticket store -- ever exists", async () => {
+    await withEnv(undefined, async () => {
+      const repo = await makeTempRepo();
+      try {
+        await writeRepoConfigFile(repo.dir, "config.yml", "tickets_dir: ../outside\n");
+        await expectRejectsWithCode(
+          () => resolveBoard({ cwd: repo.dir, env: hermeticEnv() }),
+          BoardErrorCodes.TICKETS_DIR_ESCAPES_BOARD,
+        );
+      } finally {
+        await repo.cleanup();
+      }
+    });
+  });
+});
+
+// ---- ensureArchiveDir's realpath-mismatch branch (1B, work item 2b.3) ------
+
+describe("ticketStore — ensureArchiveDir's realpath-mismatch branch (fix round 1's existing test only covers the lstat branch)", () => {
+  test("a deliberately non-canonical ticketsDir (reached through a symlink) drives the realpath-mismatch branch deterministically, and archive() refuses rather than moving the ticket", async () => {
+    await withEnv(undefined, async () => {
+      // Deliberately the one place the "always realpath your hand-built
+      // ticketsDir" rule from the file header above is inverted: the
+      // non-canonicality of `ticketsDir` is the whole point of this test,
+      // driving `ensureArchiveDir`'s `realpath(archiveDir) !==
+      // join(ticketsDir, "archive")` branch, which otherwise has zero
+      // coverage in this suite (the existing symlink test only exercises
+      // the earlier `lstat` branch).
+      const base = await realpath(await mkdtemp(join(tmpdir(), "cankan-store-archivemismatch-")));
+      try {
+        const actualTickets = join(base, "actual-tickets");
+        await mkdir(actualTickets);
+        const ticketsLink = join(base, "tickets-link");
+        await symlink(actualTickets, ticketsLink);
+
+        const board: BoardRef = {
+          kind: "repo",
+          name: "mismatch",
+          root: base,
+          // Non-canonical on purpose: this is a symlink, not its resolved
+          // target, so `join(ticketsDir, "archive")` (built from the
+          // symlink) can never equal `realpath(archiveDir)` (fully
+          // resolved) even though both name the same directory.
+          ticketsDir: ticketsLink,
+          coordinationRef: "refs/cankan/coordination",
+        };
+        const store = await openTicketStore({ board, gitDirs: [] });
+
+        const written = await store.write(newTicket("ck-mismatch1", "Archive mismatch"));
+        await expectRejectsWithCode(() => store.archive("ck-mismatch1"), StoreErrorCodes.UNSAFE_TICKET_PATH);
+
+        // Refused before any *move*: the ticket is still exactly where it
+        // was written, never renamed into `archive/`. `ensureArchiveDir`
+        // does still `mkdir` the (harmless, correctly-located) archive
+        // directory itself before its realpath comparison catches the
+        // mismatch -- that mkdir is not the hazard this branch guards
+        // against, the `rename` that never runs afterward is.
+        const onDisk = await readFile(written.path, "utf8");
+        expect(onDisk.length).toBeGreaterThan(0);
+        expect(await readdir(actualTickets)).toContain("archive");
+        expect(await readdir(join(actualTickets, "archive"))).toEqual([]);
+      } finally {
+        await rm(base, { recursive: true, force: true });
+      }
     });
   });
 });

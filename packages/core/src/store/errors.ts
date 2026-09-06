@@ -69,6 +69,23 @@ export const StoreErrorCodes = {
    */
   AMBIGUOUS_TICKET_LOOKUP: "STORE_AMBIGUOUS_TICKET_LOOKUP",
   /**
+   * ADR 0002 step (b)'s write-time half, and step (c) (1B, Ruling R9/R5):
+   * before `write()`, `remove()`, or `archive()` touch the filesystem, the
+   * store re-realpaths `board.ticketsDir` and re-asserts it is still
+   * contained by `board.root` and outside every directory in `gitDirs`
+   * (`isContained`, reused from `board/ref.ts` rather than re-derived).
+   * Distinct from `UNSAFE_TICKET_PATH` above: that code guards one
+   * *filename* joined onto an already-trusted directory; this one guards
+   * the directory itself, which can have been replaced by a symlink, or
+   * can point inside the repository's real git directory, since
+   * `resolveBoard()`/`buildBoardRef` last checked it — or can simply never
+   * have gone through either, in the case of a hand-built `BoardRef`.
+   * Nothing is written when this fires; see `ticketStore.ts`'s
+   * `assertTicketsDirContained` for the residual TOCTOU window this does
+   * not close.
+   */
+  TICKETS_DIR_UNSAFE: "STORE_TICKETS_DIR_UNSAFE",
+  /**
    * `remove()` or `archive()` was asked for a ticket id/display-id/alias
    * that `get()`'s own resolution found no match for. Distinct from `get()`
    * itself, which returns `undefined` on a miss rather than throwing — a

@@ -5,8 +5,16 @@ export function rankBetween(before?: number, after?: number): number {
   if (after !== undefined && !Number.isFinite(after)) throw new Error("after rank must be finite");
   if (before !== undefined && after !== undefined && before >= after) throw new Error("before rank must be less than after rank");
   if (before === undefined && after === undefined) return DEFAULT_RANK_STEP;
-  if (before === undefined) return (after as number) - DEFAULT_RANK_STEP;
-  if (after === undefined) return before + DEFAULT_RANK_STEP;
+  if (before === undefined) {
+    const result = (after as number) - DEFAULT_RANK_STEP;
+    if (!Number.isFinite(result) || result === after) throw new Error("no representable rank between values");
+    return result;
+  }
+  if (after === undefined) {
+    const result = before + DEFAULT_RANK_STEP;
+    if (!Number.isFinite(result) || result === before) throw new Error("no representable rank between values");
+    return result;
+  }
   const midpoint = before / 2 + after / 2;
   if (!Number.isFinite(midpoint) || midpoint === before || midpoint === after) throw new Error("no representable rank between values");
   return midpoint;

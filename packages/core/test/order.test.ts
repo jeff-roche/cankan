@@ -38,6 +38,11 @@ describe("ranks", () => {
     expect(rankBetween(1000, 2000)).toBe(1500);
     expect(normalizeRanks([{ ordinal: 99 }, { ordinal: 1 }]).map((item) => item.ordinal)).toEqual([1000, 2000]);
   });
+
+  test("rejects one-sided ranks that floating point cannot move", () => {
+    expect(() => rankBetween(Number.MAX_VALUE)).toThrow("no representable rank");
+    expect(() => rankBetween(undefined, Number.MAX_VALUE)).toThrow("no representable rank");
+  });
 });
 
 describe("queues", () => {

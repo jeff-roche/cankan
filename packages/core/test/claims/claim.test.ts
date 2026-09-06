@@ -4,7 +4,7 @@ import { writeFixtureTickets } from "../../../test-utils/src/fixtureTickets";
 import { makeTempRepo, type TempRepo } from "../../../test-utils/src/tempRepo";
 import { withEnv } from "../../../test-utils/src/withEnv";
 import { buildBoardRef } from "../../src/board/ref";
-import { claim, type ClaimResult } from "../../src/claims/index";
+import { claim, renew, type ClaimResult } from "../../src/claims/index";
 import { claimCore, type ClaimHooks } from "../../src/claims/claim";
 import { ClaimErrorCodes } from "../../src/claims/errors";
 import { parseDurationMs } from "../../src/claims/duration";
@@ -598,5 +598,133 @@ describe("claim — rejection paths", () => {
         ClaimErrorCodes.INVALID_OPTION,
       );
     });
+  });
+});
+
+// ============================================================================
+// Fix round finding A: `lease: "1h"`/`lease_until` display-only behaviour had
+// ZERO test coverage — this is all-lane contract 1, the single most
+// load-bearing untested behaviour in the module. The override must change
+// the appended event's `lease_until` field and MUST NOT change this reader's
+// own expiry computation.
+// ============================================================================
+
+test("finding A: claim's own --lease overrides only the appended event's lease_until display field, never this reader's own expiry computation", async () => {
+  await withTestBoard(async ({ board }) => {
+    await writeRepoConfigFile(board.root, "config.yml", "claims:\n  lease: 2h\n");
+    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-finding-a", "Finding A")]);
+    const actor = actorId("actor-finding-a");
+
+    const result = await claim({ board, ticket: "ck-finding-a", actor, now: NOW, lease: "1h" });
+    const expectedOverrideLeaseUntil = new Date(NOW + parseDurationMs("1h")).toISOString();
+    expect(result.leaseUntil).toBe(expectedOverrideLeaseUntil);
+
+    const adapter = await createGitAdapter(board.root);
+    const records = await read(adapter, board.coordinationRef, { now: NOW });
+    const claimRecord = records.find((r) => r.event.id === result.eventId);
+    if (claimRecord?.event.event !== "claim") throw new Error("expected a claim record");
+    expect(claimRecord.event.lease_until).toBe(expectedOverrideLeaseUntil);
+
+    // The board's configured lease is 2h, so this reader's own expiry is
+    // `firstSeen(eventId) + 2h`, not `NOW + 1h`. At `NOW + 1h + 1` (past the
+    // DISPLAYED override, well short of the real 2h expiry) the ticket must
+    // still be reported live -- proven by a competing claim still being
+    // rejected as `already-held`, never treated as an expired reclaim.
+    const stillLiveAt = NOW + parseDurationMs("1h") + 1;
+    const rejection = await expectCode(
+      claim({ board, ticket: "ck-finding-a", actor: actorId("actor-finding-a-competitor"), now: stillLiveAt }),
+      ErrorCodes.CLAIM_REJECTED,
+    );
+    expect(rejection.details?.reason).toBe("already-held");
+    expect(rejection.details?.holder).toBe(actor);
+  });
+});
+
+// ============================================================================
+// Fix round finding C: `ClaimParams.parent` is public surface but was never
+// exercised by a test.
+// ============================================================================
+
+test("finding C: a claim carrying parent writes it onto the appended event", async () => {
+  await withTestBoard(async ({ board }) => {
+    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-finding-c", "Finding C")]);
+    const actor = actorId("actor-finding-c-agent");
+    const parent = actorId("actor-finding-c-human");
+
+    const result = await claim({ board, ticket: "ck-finding-c", actor, parent, now: NOW });
+
+    const adapter = await createGitAdapter(board.root);
+    const records = await read(adapter, board.coordinationRef, { now: NOW });
+    const claimRecord = records.find((r) => r.event.id === result.eventId);
+    expect(claimRecord?.event.parent).toBe(parent);
+  });
+});
+
+// ============================================================================
+// Fix round finding D: `INVALID_LEASE_DURATION` was only unit-tested via
+// direct `parseDurationMs` calls -- the wiring between `claim()` and the
+// parser was unverified.
+// ============================================================================
+
+describe("finding D: INVALID_LEASE_DURATION reached through claim(), not just parseDurationMs directly", () => {
+  test("a malformed params.lease reaches CLAIM_INVALID_LEASE_DURATION through claim()", async () => {
+    await withTestBoard(async ({ board }) => {
+      await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-finding-d1", "Finding D1")]);
+      await expectCode(
+        claim({ board, ticket: "ck-finding-d1", actor: actorId("actor-finding-d1"), now: NOW, lease: "not-a-duration" }),
+        ClaimErrorCodes.INVALID_LEASE_DURATION,
+      );
+      // Fails before any git invocation -- no event appended, ref untouched.
+      const adapter = await createGitAdapter(board.root);
+      expect(await adapter.readRef(board.coordinationRef)).toBeNull();
+    });
+  });
+
+  test("a malformed claims.lease in a real .cankan/config.yml reaches CLAIM_INVALID_LEASE_DURATION through claim()", async () => {
+    await withTestBoard(async ({ board }) => {
+      // `"0h"` passes `config/schema.ts`'s shape-only `durationSchema`
+      // regex (identical pattern to `parseDurationMs`'s own) but fails
+      // `parseDurationMs`'s semantic "must resolve to a positive number of
+      // milliseconds" check -- so this reaches `claim()` via a genuinely
+      // valid config file, not a schema rejection.
+      await writeRepoConfigFile(board.root, "config.yml", "claims:\n  lease: 0h\n");
+      await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-finding-d2", "Finding D2")]);
+      await expectCode(
+        claim({ board, ticket: "ck-finding-d2", actor: actorId("actor-finding-d2"), now: NOW }),
+        ClaimErrorCodes.INVALID_LEASE_DURATION,
+      );
+    });
+  });
+});
+
+// ============================================================================
+// Required test 3: the displaced lease's ids are discarded on --force/
+// takeover, not just this file's earlier `--force` behavioral tests.
+// ============================================================================
+
+test("required test 3: --force/takeover discards every id the displaced lease had accumulated", async () => {
+  await withTestBoard(async ({ board }) => {
+    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-takeover-discard", "Takeover discard")]);
+    const originalHolder = actorId("actor-takeover-discard-original");
+    const forcer = actorId("actor-takeover-discard-forcer");
+    const adapter = await createGitAdapter(board.root);
+    const boardKey = await boardKeyFor(adapter);
+
+    const original = await claim({ board, ticket: "ck-takeover-discard", actor: originalHolder, now: NOW });
+    const renewed = await renew({ board, ticket: "ck-takeover-discard", actor: originalHolder, now: NOW + 10 * 60_000 });
+
+    for (const id of [original.eventId, renewed.eventId]) {
+      expect(typeof (await firstSeen(boardKey, id))).toBe("number");
+    }
+
+    const takeover = await claim({ board, ticket: "ck-takeover-discard", actor: forcer, now: NOW + 20 * 60_000, force: true });
+    expect(takeover.kind).toBe("takeover");
+
+    for (const id of [original.eventId, renewed.eventId]) {
+      expect(await firstSeen(boardKey, id)).toBeNull();
+    }
+    // The takeover's OWN new event id is observed, never discarded -- it is
+    // the live anchor now, not part of the ended run.
+    expect(await firstSeen(boardKey, takeover.eventId)).not.toBeNull();
   });
 });

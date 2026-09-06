@@ -1,19 +1,28 @@
 /**
- * `claims/index.ts` — the public surface of M2.10 slice 1: `claim()`, its
- * parameter/result types, this module's own error codes, and the duration
- * parser it depends on.
+ * `claims/index.ts` — the public surface of M2.10: `claim`, `renew`,
+ * `release`, `expireStale`, their parameter/result types, this module's own
+ * error codes, and the duration parser they depend on.
  *
- * **Deliberately not re-exported here**: `claimCore` (`claim.ts`) — the
- * test-only seam behind `claim` — and its `ClaimHooks` type. A test reaches
- * them via a relative import to the source file, the same pattern
+ * **Deliberately not re-exported here**: `claimCore`/`renewCore`/
+ * `releaseCore`/`expireStaleCore` (`claim.ts`) — the test-only seams behind
+ * `claim`/`renew`/`release`/`expireStale` — and their `ClaimHooks`/
+ * `RenewHooks`/`ReleaseHooks`/`ExpireStaleHooks` types. A test reaches them
+ * via a relative import to the source file, the same pattern
  * `events/index.ts` documents for `appendCore`/`initRefCore`/`recoverCore`.
- *
- * `renew`, `release`, `expireStale`, and the observation-id discard sweep
- * are slice 2 — not built yet.
  */
 
-export { claim } from "./claim";
-export type { ClaimParams, ClaimResult } from "./claim";
+export { claim, expireStale, release, renew } from "./claim";
+export type {
+  ClaimParams,
+  ClaimResult,
+  ExpireStaleParams,
+  ExpireStaleResult,
+  ExpireStaleTicketResult,
+  ReleaseParams,
+  ReleaseResult,
+  RenewParams,
+  RenewResult,
+} from "./claim";
 
 export { ClaimErrorCodes } from "./errors";
 

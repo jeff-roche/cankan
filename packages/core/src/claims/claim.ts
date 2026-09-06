@@ -75,9 +75,9 @@
 import { CanKanError, ErrorCodes, isCanKanError } from "../errors";
 import type { BoardRef, ActorId, TicketId } from "../types";
 import type { CasAttemptResult, CasRetryOptions, GitAdapter, RefSha } from "../git/index";
-import { createGitAdapter, withCasRetry } from "../git/index";
-import type { AppendedEvent, EventCandidate, EventId } from "../events/index";
-import { append, boardKeyFor, observe, read } from "../events/index";
+import { createGitAdapter, GitErrorCodes, withCasRetry } from "../git/index";
+import type { AppendedEvent, EventCandidate, EventId, EventRecord } from "../events/index";
+import { append, boardKeyFor, discard, observe, read } from "../events/index";
 import { EventErrorCodes } from "../events/errors";
 import type { BoardState, TicketState } from "../state/index";
 import { claimedBy, observeAndFold } from "../state/index";
@@ -163,6 +163,19 @@ async function resolveClaimContext(params: ResolveClaimContextParams): Promise<C
 interface BoardSnapshot {
   readonly parentSha: RefSha | null;
   readonly state: BoardState;
+  /**
+   * The exact `read()` result `state` was folded from, in this same call —
+   * slice 2's discard walk (`computeDiscardRun`, below) derives its id set
+   * from this, never from a second `read()`. Re-reading here would be the
+   * identical double-tip hazard this function's own doc comment (above)
+   * documents for `readRef`: a second `read()` resolves the ref
+   * independently and can observe a tip newer than the one this attempt's
+   * `parentSha`/`state` were captured against. `expectedParent` already
+   * guarantees nothing landed between this read and this attempt's append,
+   * so this field, not a fresh read, is the complete picture of whatever
+   * lease this attempt's append is about to end.
+   */
+  readonly events: readonly EventRecord[];
 }
 
 /**
@@ -199,7 +212,7 @@ async function snapshotBoard(ctx: ClaimContext): Promise<BoardSnapshot> {
   const events = await read(ctx.adapter, ctx.ref, { now: ctx.now, trailingMonths: ctx.trailingMonths });
   const { tickets } = await ctx.store.list();
   const state = await observeAndFold(ctx.boardKey, tickets, events, { now: ctx.now, leaseTtlMs: ctx.leaseTtlMs });
-  return { parentSha, state };
+  return { parentSha, state, events };
 }
 
 // ============================================================================
@@ -305,7 +318,14 @@ function resolveTicket(state: BoardState, ticketQuery: string): TicketState {
 // `CLAIM_REJECTED` — the shared, seeded code, sub-cased by `details.reason`
 // ============================================================================
 
-type ClaimRejectionReason = "already-held" | "already-held-by-you" | "max-per-actor" | "closed";
+type ClaimRejectionReason =
+  | "already-held"
+  | "already-held-by-you"
+  | "max-per-actor"
+  | "closed"
+  | "not-held"
+  | "not-holder"
+  | "lease-expired";
 
 /** Every "you asked to hold this ticket and you do not" outcome shares this one code (M3.10 maps it to exit 3) — see `claims/errors.ts`'s own header for the ruling. */
 function claimRejected(reason: ClaimRejectionReason, ticket: TicketId, extra?: Readonly<Record<string, unknown>>): CanKanError {
@@ -316,6 +336,153 @@ function claimRejected(reason: ClaimRejectionReason, ticket: TicketId, extra?: R
 
 function isStaleParentError(err: unknown): boolean {
   return isCanKanError(err) && err.code === EventErrorCodes.EVENT_APPEND_STALE_PARENT;
+}
+
+// ============================================================================
+// The append-or-retry helper (fix round, finding B) — every append this
+// module ever makes goes through this, never a hand-copied try/catch.
+// ============================================================================
+
+/**
+ * Appends `candidate` with `parentSha` as `expectedParent`. Returns the
+ * appended event on success, or `undefined` if the CAS was lost
+ * (`EVENT_APPEND_STALE_PARENT`) — the caller's own attempt function must
+ * translate that into `{ done: false }` so `withCasRetry` re-runs it from a
+ * fresh `snapshotBoard`. Every other error propagates unchanged: a broad
+ * catch that funnels an unrelated failure into a retry would silently repeat
+ * whatever stale decision the caller made, which is a correctness defect,
+ * not robustness (this file's own header, and the brief this module was
+ * built from, are both explicit about this).
+ *
+ * **Extracted once, used at every append site in this module, old and
+ * new** — `claim.ts:528-535` and `:549-556` (pre-slice-2) duplicated this
+ * exact shape twice already; `renew`, `release`, and `expireStale` would
+ * have made it five copies.
+ */
+async function appendOrRetry(
+  ctx: ClaimContext,
+  candidate: EventCandidate,
+  parentSha: RefSha | null,
+): Promise<AppendedEvent | undefined> {
+  try {
+    return await append(ctx.adapter, ctx.ref, candidate, { now: ctx.now, expectedParent: parentSha });
+  } catch (err) {
+    if (isStaleParentError(err)) {
+      return undefined;
+    }
+    throw err;
+  }
+}
+
+// ============================================================================
+// The discard walk — deriving a terminated lease's full id set from the log
+// this module already read, and cleaning up the observation store for it.
+// ============================================================================
+
+/** The three event kinds that start or extend a lease — mirrors `state/fold.ts`'s own (file-private) `LEASE_ANCHOR_KINDS`; duplicated here because that module withholds it (`state/index.ts`'s own doc comment: internal folding machinery, not a public export). */
+const LEASE_ANCHOR_EVENT_KINDS: ReadonlySet<string> = new Set(["claim", "takeover", "renew"]);
+/** Every event kind that can end a lease outright, alongside the three above — mirrors `state/fold.ts`'s (file-private) `LEASE_AFFECTING_KINDS` for the same reason. */
+const LEASE_AFFECTING_EVENT_KINDS: ReadonlySet<string> = new Set([...LEASE_ANCHOR_EVENT_KINDS, "release", "close", "expire"]);
+
+/**
+ * `(month, line)` chain-position comparator — mirrors `state/fold.ts`'s own
+ * (file-private) `compareChainPosition`, duplicated here for the same
+ * withholding reason as the kind sets above. **Never `EventRecord.position`**
+ * (that field's own doc comment: meaningful only within the single `read()`
+ * call that produced it) and **never `ts`** (peer-supplied) — `(month,
+ * line)` is the one coordinate `read()` documents as stable across calls.
+ */
+function compareChainPosition(a: EventRecord, b: EventRecord): number {
+  if (a.month !== b.month) {
+    return a.month < b.month ? -1 : 1;
+  }
+  return a.line - b.line;
+}
+
+/**
+ * Every claim/takeover/renew event id that the lease on `ticketId` currently
+ * ending has ever accumulated — the exact set `discard()` must be called for
+ * once this module's own terminating append (`release`, `expire`, or
+ * `takeover`) has landed.
+ *
+ * `events` is the pre-append `read()` result a `snapshotBoard()` call
+ * already produced for this attempt — **never a fresh `read()`** (see
+ * `BoardSnapshot.events`'s own doc comment for why). Filtered to this
+ * ticket's own lease-affecting events, sorted by chain position
+ * (`(month, line)` — the one coordinate stable across `read()` calls; never
+ * `position`, never `ts`), then walked oldest to newest: a
+ * `release`/`close`/`expire` resets the accumulator (whatever came before it
+ * already belongs to a lease this reader's own log shows as already ended,
+ * and slice 1's own "previous, already-terminated lease" test proves those
+ * ids must be left alone), and every `claim`/`takeover`/`renew` appends its
+ * id to the (possibly just-reset) run.
+ *
+ * **Collects every id in the run, not only the one `state/fold.ts`'s
+ * `resolveLeaseAnchor` would treat as anchor.** `observeAndFold` calls
+ * `observe()` on every `claim`/`takeover`/`renew` it reads for a known
+ * ticket, whether or not the fold treats it as the anchor (a cross-actor
+ * `renew` against a live anchor, for instance, mints no anchor but *was*
+ * observed) — an id that was observed but excluded here would be exactly
+ * the leak this slice exists to close.
+ *
+ * **Known, accepted limit** (documented at this file's own header, and
+ * repeated here because it is this function's own boundary): only events
+ * inside `events` — i.e. inside the caller's `trailingMonths` window — can
+ * ever be found. A lease renewed across a wider span than that window loses
+ * its oldest ids from this walk. Widening the window unboundedly to "fix"
+ * this would reintroduce the O(months) sequential-subprocess cost `read()`'s
+ * own doc comment measures directly (611 spawns at `trailingMonths: 120`);
+ * this function does not attempt to.
+ */
+function computeDiscardRun(events: readonly EventRecord[], ticketId: TicketId): readonly EventId[] {
+  const key = normalizeTicketIdForComparison(ticketId);
+  const relevant = events.filter(
+    (r) => LEASE_AFFECTING_EVENT_KINDS.has(r.event.event) && normalizeTicketIdForComparison(r.event.ticket) === key,
+  );
+  const sorted = [...relevant].sort(compareChainPosition);
+
+  let run: EventId[] = [];
+  for (const record of sorted) {
+    const kind = record.event.event;
+    if (kind === "release" || kind === "close" || kind === "expire") {
+      run = [];
+    } else if (LEASE_ANCHOR_EVENT_KINDS.has(kind)) {
+      run.push(record.event.id);
+    }
+  }
+  return run;
+}
+
+/**
+ * Discards every id in `ids` — idempotent, over-discarding within a run is
+ * safe (`discard`'s own doc comment), under-discarding is the defect this
+ * slice exists to close. Called **only after** the terminating append has
+ * already landed (never before — a failed append followed by a discard
+ * would let a still-live lease look freshly-observed to the next reader and
+ * be honored for another full TTL, fail-open in the wrong direction).
+ *
+ * If a `discard()` call fails (`EVENT_OBSERVATION_STORE_UNAVAILABLE` — an
+ * unwritable or unreadable store, per ADR failure mode 7), the error is
+ * re-thrown with `details.appended: true` added. The terminating append has
+ * already landed by the time this ever runs — the lease is genuinely ended,
+ * so there is no double-claim risk in this failure, but a caller that
+ * retries the same operation after seeing this error would otherwise get a
+ * confusing `not-held`/`not-holder` rejection on the retry (the lease it
+ * thinks it still needs to end is already gone) and could misread that as
+ * "my release was lost." `details.appended: true` lets a caller tell the
+ * two situations apart.
+ */
+async function runDiscardWalk(ctx: ClaimContext, ids: readonly EventId[]): Promise<void> {
+  for (const id of ids) {
+    try {
+      await discard(ctx.boardKey, id);
+    } catch (err) {
+      if (isCanKanError(err)) {
+        throw new CanKanError(err.code, err.message, { cause: err, details: { ...err.details, appended: true } });
+      }
+      throw err;
+    }
+  }
 }
 
 // ============================================================================
@@ -455,7 +622,7 @@ async function claimAttempt(
   attemptNumber: number,
   forceState: { holder: ActorId | undefined },
 ): Promise<CasAttemptResult<ClaimSuccess>> {
-  const { parentSha, state } = await snapshotBoard(ctx);
+  const { parentSha, state, events } = await snapshotBoard(ctx);
   const ticketState = resolveTicket(state, params.ticket);
 
   // Decide. Order is this module's own choice (the brief enumerates the
@@ -514,10 +681,13 @@ async function claimAttempt(
     // per attempt: a competitor landing between this append and the next
     // fold is caught by that next fold, not papered over here.
     //
-    // TODO(slice 2): an `expire` (like a `takeover`) terminates a displaced
-    // lease and so carries the same observation-id discard obligation that
-    // lease's own anchor event has — `discard()` is not called here; the
-    // discard sweep is slice 2's `expireStale` work.
+    // An `expire` (like a `takeover`, below) terminates a displaced lease
+    // and so carries the same observation-id discard obligation that
+    // lease's own anchor event has — `computeDiscardRun` derives the full
+    // run from `events`, the pre-append read this attempt already made,
+    // BEFORE the append (this attempt's decision, and therefore the run it
+    // is built from, is only valid until the append either lands or is
+    // rejected).
     const expireCandidate: EventCandidate = {
       event: "expire",
       ts: nowIso,
@@ -525,34 +695,29 @@ async function claimAttempt(
       ticket: ticketState.id,
       ...parentField,
     };
-    try {
-      await append(ctx.adapter, ctx.ref, expireCandidate, { now: ctx.now, expectedParent: parentSha });
-    } catch (err) {
-      if (isStaleParentError(err)) {
-        return { done: false };
-      }
-      throw err;
+    const expireDisplacedRun = computeDiscardRun(events, ticketState.id);
+    const expireAppended = await appendOrRetry(ctx, expireCandidate, parentSha);
+    if (expireAppended === undefined) {
+      return { done: false };
     }
+    await runDiscardWalk(ctx, expireDisplacedRun);
     return { done: false };
   }
 
   const leaseUntilIso = new Date(ctx.now + leaseMs).toISOString();
   const kind: "claim" | "takeover" = useForce ? "takeover" : "claim";
-  // TODO(slice 2): a `takeover` also terminates the displaced lease and so
-  // carries the same observation-id discard obligation as the `expire`
-  // branch above — not built here.
+  // A `takeover` also terminates the displaced lease and so carries the
+  // same observation-id discard obligation as the `expire` branch above —
+  // computed from the pre-append `events`, before the append; empty for a
+  // plain `claim` against an unclaimed ticket (nothing to displace).
+  const takeoverDisplacedRun = useForce ? computeDiscardRun(events, ticketState.id) : [];
   const candidate: EventCandidate = useForce
     ? { event: "takeover", ts: nowIso, actor: params.actor, ticket: ticketState.id, lease_until: leaseUntilIso, ...parentField }
     : { event: "claim", ts: nowIso, actor: params.actor, ticket: ticketState.id, lease_until: leaseUntilIso, ...parentField };
 
-  let appended: AppendedEvent;
-  try {
-    appended = await append(ctx.adapter, ctx.ref, candidate, { now: ctx.now, expectedParent: parentSha });
-  } catch (err) {
-    if (isStaleParentError(err)) {
-      return { done: false };
-    }
-    throw err;
+  const appended = await appendOrRetry(ctx, candidate, parentSha);
+  if (appended === undefined) {
+    return { done: false };
   }
 
   // ADR fm7: "an appender records its own append at the moment it appends."
@@ -560,6 +725,7 @@ async function claimAttempt(
   // will — without this, this process's own lease would never expire for
   // this reader (`firstSeenMs` would stay `undefined` forever).
   await observe(ctx.boardKey, appended.event.id, { now: ctx.now });
+  await runDiscardWalk(ctx, takeoverDisplacedRun);
 
   return {
     done: true,
@@ -603,4 +769,437 @@ export async function claimCore(params: ClaimParams, hooks: ClaimHooks): Promise
  */
 export function claim(params: ClaimParams): Promise<ClaimResult> {
   return claimCore(params, {});
+}
+
+// ============================================================================
+// `renew` — extends a live lease this actor already holds
+// ============================================================================
+
+export interface RenewParams {
+  readonly board: BoardRef;
+  /** The id, display id, or alias as the user typed it — resolved the same way `ClaimParams.ticket` is (see this file's header). */
+  readonly ticket: string;
+  readonly actor: ActorId;
+  /** A duration string overriding the event's `lease_until` **display** field only — same semantics as `ClaimParams.lease` (see this file's header). */
+  readonly lease?: string;
+  /** Injectable clock — see `ClaimParams.now`. */
+  readonly now?: number;
+  /** Overrides the lease-derived default (`computeTrailingMonths`). */
+  readonly trailingMonths?: number;
+  /** Validated by this module — see `ClaimParams.casRetry`. */
+  readonly casRetry?: CasRetryOptions;
+}
+
+export interface RenewResult {
+  readonly ticket: TicketId;
+  readonly actor: ActorId;
+  readonly eventId: EventId;
+  /** The `lease_until` written on the appended event — display only. */
+  readonly leaseUntil: string;
+  /** How many CAS attempts this call made before succeeding. */
+  readonly attempts: number;
+}
+
+/** Test-only injection point for `renewCore`'s internal retry loop — same pattern as `ClaimHooks`. Not part of the public surface. */
+export interface RenewHooks {
+  readonly beforeAppend?: (attemptNumber: number) => Promise<void>;
+}
+
+interface RenewSuccess {
+  readonly ticketId: TicketId;
+  readonly eventId: EventId;
+  readonly leaseUntil: string;
+  readonly attempts: number;
+}
+
+/**
+ * One CAS attempt for `renew`. The ticket must have a lease that is **live**
+ * and anchored to **this** actor:
+ *
+ * - No lease at all → `not-held`.
+ * - Lease held by a different actor → `not-holder` (distinct from
+ *   `not-held` — a caller needs to tell the two apart).
+ * - Lease observed **expired** → `lease-expired`, fail closed **even though
+ *   this actor is the anchor**: a `renew` appended after expiry would
+ *   re-anchor the lease by chain position for every reader that has not yet
+ *   expired it, resurrecting a lease this holder no longer owns (this
+ *   file's header, `TicketState.lease.expired`'s own doc comment). The
+ *   caller's remedy is `claim` again, not a forced renew.
+ *
+ * `renew` does **not** discard anything — the lease continues, so its
+ * earlier ids are still part of it, discarded only when the lease
+ * terminates (`release`/`expireStale`/a competing `takeover`). Each `renew`
+ * *adds* one id to that eventual set.
+ */
+async function renewAttempt(
+  ctx: ClaimContext,
+  params: RenewParams,
+  leaseMs: number,
+  hooks: RenewHooks,
+  attemptNumber: number,
+): Promise<CasAttemptResult<RenewSuccess>> {
+  const { parentSha, state } = await snapshotBoard(ctx);
+  const ticketState = resolveTicket(state, params.ticket);
+  const lease = ticketState.lease;
+
+  if (lease === undefined) {
+    throw claimRejected("not-held", ticketState.id);
+  }
+  if (lease.actor !== params.actor) {
+    throw claimRejected("not-holder", ticketState.id, { holder: lease.actor });
+  }
+  if (lease.expired) {
+    throw claimRejected("lease-expired", ticketState.id);
+  }
+
+  await hooks.beforeAppend?.(attemptNumber);
+
+  const nowIso = new Date(ctx.now).toISOString();
+  const leaseUntilIso = new Date(ctx.now + leaseMs).toISOString();
+  const candidate: EventCandidate = {
+    event: "renew",
+    ts: nowIso,
+    actor: params.actor,
+    ticket: ticketState.id,
+    lease_until: leaseUntilIso,
+  };
+
+  const appended = await appendOrRetry(ctx, candidate, parentSha);
+  if (appended === undefined) {
+    return { done: false };
+  }
+
+  // Same ADR fm7 obligation `claimAttempt` observes: an appender records its
+  // own append at the moment it appends, or this reader's own renewal would
+  // never be seen as live by itself.
+  await observe(ctx.boardKey, appended.event.id, { now: ctx.now });
+
+  return {
+    done: true,
+    value: { ticketId: ticketState.id, eventId: appended.event.id, leaseUntil: leaseUntilIso, attempts: attemptNumber },
+  };
+}
+
+/** `renew()`'s implementation, plus the test-only `hooks` seam. `renew()` calls this with no hooks. */
+export async function renewCore(params: RenewParams, hooks: RenewHooks): Promise<RenewResult> {
+  const now = params.now ?? Date.now();
+  const casRetry = validateCasRetry(params.casRetry);
+  const leaseOverrideMs = params.lease !== undefined ? parseDurationMs(params.lease) : undefined;
+
+  const ctx = await resolveClaimContext({ board: params.board, now, trailingMonths: params.trailingMonths });
+  const leaseMs = leaseOverrideMs ?? ctx.leaseTtlMs;
+
+  const success = await withCasRetry<RenewSuccess>((attemptNumber) => renewAttempt(ctx, params, leaseMs, hooks, attemptNumber), casRetry);
+
+  return {
+    ticket: success.ticketId,
+    actor: params.actor,
+    eventId: success.eventId,
+    leaseUntil: success.leaseUntil,
+    attempts: success.attempts,
+  };
+}
+
+/** Extends `params.actor`'s own live lease on a ticket. See `renewAttempt`'s doc comment for the three rejection cases. */
+export function renew(params: RenewParams): Promise<RenewResult> {
+  return renewCore(params, {});
+}
+
+// ============================================================================
+// `release` — ends a live lease this actor already holds
+// ============================================================================
+
+export interface ReleaseParams {
+  readonly board: BoardRef;
+  /** The id, display id, or alias as the user typed it — resolved the same way `ClaimParams.ticket` is. */
+  readonly ticket: string;
+  readonly actor: ActorId;
+  /** Injectable clock — see `ClaimParams.now`. */
+  readonly now?: number;
+  /** Overrides the lease-derived default (`computeTrailingMonths`). */
+  readonly trailingMonths?: number;
+  /** Validated by this module — see `ClaimParams.casRetry`. */
+  readonly casRetry?: CasRetryOptions;
+}
+
+export interface ReleaseResult {
+  readonly ticket: TicketId;
+  readonly actor: ActorId;
+  readonly eventId: EventId;
+  /** How many CAS attempts this call made before succeeding. */
+  readonly attempts: number;
+}
+
+/** Test-only injection point for `releaseCore`'s internal retry loop — same pattern as `ClaimHooks`. Not part of the public surface. */
+export interface ReleaseHooks {
+  readonly beforeAppend?: (attemptNumber: number) => Promise<void>;
+}
+
+interface ReleaseSuccess {
+  readonly ticketId: TicketId;
+  readonly eventId: EventId;
+  readonly attempts: number;
+}
+
+/**
+ * One CAS attempt for `release`. Same three rejections as `renew`
+ * (`not-held`, `not-holder`, `lease-expired`) — releasing a lease this actor
+ * no longer holds could destroy a successor's.
+ *
+ * **Why `expectedParent` matters here specifically**: `resolveLeaseAnchor`
+ * (`state/fold.ts`) clears the anchor on **any** `release`, with **no actor
+ * check**. Without `expectedParent`, an honest holder's `release` landing by
+ * chain position *after* a competitor's `expire` + `claim` would destroy the
+ * *new* holder's lease. With it, this attempt's `release` loses its CAS,
+ * re-reads, sees this actor no longer holds the ticket, and rejects
+ * (`not-holder` or `not-held`, whichever the fresh fold shows) instead of
+ * ever landing.
+ *
+ * The schema forbids `lease_until` on a `release` event — the candidate
+ * below carries no such field.
+ */
+async function releaseAttempt(
+  ctx: ClaimContext,
+  params: ReleaseParams,
+  hooks: ReleaseHooks,
+  attemptNumber: number,
+): Promise<CasAttemptResult<ReleaseSuccess>> {
+  const { parentSha, state, events } = await snapshotBoard(ctx);
+  const ticketState = resolveTicket(state, params.ticket);
+  const lease = ticketState.lease;
+
+  if (lease === undefined) {
+    throw claimRejected("not-held", ticketState.id);
+  }
+  if (lease.actor !== params.actor) {
+    throw claimRejected("not-holder", ticketState.id, { holder: lease.actor });
+  }
+  if (lease.expired) {
+    throw claimRejected("lease-expired", ticketState.id);
+  }
+
+  await hooks.beforeAppend?.(attemptNumber);
+
+  const nowIso = new Date(ctx.now).toISOString();
+  const candidate: EventCandidate = {
+    event: "release",
+    ts: nowIso,
+    actor: params.actor,
+    ticket: ticketState.id,
+  };
+  const run = computeDiscardRun(events, ticketState.id);
+
+  const appended = await appendOrRetry(ctx, candidate, parentSha);
+  if (appended === undefined) {
+    return { done: false };
+  }
+
+  // Discard AFTER the terminating append succeeded, never before (this
+  // file's header, and `runDiscardWalk`'s own doc comment).
+  await runDiscardWalk(ctx, run);
+
+  return { done: true, value: { ticketId: ticketState.id, eventId: appended.event.id, attempts: attemptNumber } };
+}
+
+/** `release()`'s implementation, plus the test-only `hooks` seam. `release()` calls this with no hooks. */
+export async function releaseCore(params: ReleaseParams, hooks: ReleaseHooks): Promise<ReleaseResult> {
+  const now = params.now ?? Date.now();
+  const casRetry = validateCasRetry(params.casRetry);
+  const ctx = await resolveClaimContext({ board: params.board, now, trailingMonths: params.trailingMonths });
+
+  const success = await withCasRetry<ReleaseSuccess>((attemptNumber) => releaseAttempt(ctx, params, hooks, attemptNumber), casRetry);
+
+  return { ticket: success.ticketId, actor: params.actor, eventId: success.eventId, attempts: success.attempts };
+}
+
+/** Ends `params.actor`'s own live lease on a ticket. See `releaseAttempt`'s doc comment for the three rejection cases and why the CAS matters here specifically. */
+export function release(params: ReleaseParams): Promise<ReleaseResult> {
+  return releaseCore(params, {});
+}
+
+// ============================================================================
+// `expireStale` — sweeps every observed-expired lease on the board
+// ============================================================================
+
+export interface ExpireStaleParams {
+  readonly board: BoardRef;
+  /** The actor recorded on every `expire` event this sweep appends — the sweeping caller, never the original holder (ruling, slice 1; mirrors `claimAttempt`'s own reclaim path). */
+  readonly actor: ActorId;
+  /** Injectable clock — see `ClaimParams.now`. */
+  readonly now?: number;
+  /** Overrides the lease-derived default (`computeTrailingMonths`). */
+  readonly trailingMonths?: number;
+  /** Validated by this module — see `ClaimParams.casRetry`. Applied independently to each ticket's own CAS cycle. */
+  readonly casRetry?: CasRetryOptions;
+  /** Reports what would expire and appends nothing (CONCEPT.md L550: `cankan expire [--dry-run]`). A dry run discards nothing either. */
+  readonly dryRun?: boolean;
+}
+
+/**
+ * `"skipped"` covers both dispositions the brief's ruling keeps distinct
+ * from a hard abort: this ticket was renewed underneath the sweep (a fresh
+ * fold no longer shows its lease as expired), or this ticket's own CAS
+ * cycle exhausted its attempts against unrelated contention
+ * (`GIT_CAS_CONTENTION_EXCEEDED`) — `reason` tells the two apart. Neither
+ * one aborts the sweep; only an observation-store failure does (a thrown
+ * `EVENT_OBSERVATION_STORE_UNAVAILABLE`, which propagates out of
+ * `expireStale` entirely rather than appearing in this list at all).
+ */
+export interface ExpireStaleTicketResult {
+  readonly ticket: TicketId;
+  readonly outcome: "expired" | "skipped";
+  /** Present when `outcome` is `"expired"` and this was not a dry run. */
+  readonly eventId?: EventId;
+  /** Present when `outcome` is `"skipped"`. */
+  readonly reason?: "renewed" | "cas-exhausted";
+}
+
+export interface ExpireStaleResult {
+  readonly dryRun: boolean;
+  readonly tickets: readonly ExpireStaleTicketResult[];
+}
+
+/** Test-only injection point for `expireStaleCore`'s internal per-ticket retry loops — same pattern as `ClaimHooks`, keyed additionally by which ticket's cycle is about to append. Not part of the public surface. */
+export interface ExpireStaleHooks {
+  readonly beforeAppend?: (ticket: TicketId, attemptNumber: number) => Promise<void>;
+}
+
+type ExpireAttemptValue = { readonly kind: "expired"; readonly eventId: EventId } | { readonly kind: "skipped" };
+
+/**
+ * One ticket's own CAS cycle: re-snapshot, confirm the lease is *still*
+ * observed expired (a fresh fold may show it renewed, or ended some other
+ * way, since the sweep's initial candidate-selection fold), and if so,
+ * append `expire` and run the discard walk for the lease it just ended.
+ *
+ * `lease.expired` is a reader-local observation, never an arbiter (this
+ * file's header) — it decides only whether this cycle *attempts* an
+ * expire; the CAS decides whether it lands.
+ */
+async function expireStaleAttempt(
+  ctx: ClaimContext,
+  ticketId: TicketId,
+  actor: ActorId,
+  hooks: ExpireStaleHooks,
+  attemptNumber: number,
+): Promise<CasAttemptResult<ExpireAttemptValue>> {
+  const key = normalizeTicketIdForComparison(ticketId);
+  const { parentSha, state, events } = await snapshotBoard(ctx);
+  const ticketState = state.tickets.find((t) => normalizeTicketIdForComparison(t.id) === key);
+  const lease = ticketState?.lease;
+
+  if (ticketState === undefined || lease === undefined || !lease.expired) {
+    // No longer eligible: renewed, released/closed, or already expired by
+    // someone else since the sweep's own candidate-selection fold. A
+    // decision-level loss, not a store failure — skip this ticket, do not
+    // abort the sweep.
+    return { done: true, value: { kind: "skipped" } };
+  }
+
+  await hooks.beforeAppend?.(ticketId, attemptNumber);
+
+  const nowIso = new Date(ctx.now).toISOString();
+  const candidate: EventCandidate = {
+    event: "expire",
+    ts: nowIso,
+    actor,
+    ticket: ticketState.id,
+  };
+  const run = computeDiscardRun(events, ticketState.id);
+
+  const appended = await appendOrRetry(ctx, candidate, parentSha);
+  if (appended === undefined) {
+    return { done: false };
+  }
+
+  // An observation-store failure here (`EVENT_OBSERVATION_STORE_UNAVAILABLE`)
+  // is a throw, not a `{ done: false }` — it propagates straight out of
+  // `withCasRetry`, out of this function, and out of the calling loop in
+  // `expireStaleCore`, aborting the whole sweep (ADR failure mode 7: an
+  // unwritable/unreadable store must not be shrugged off, or every
+  // remaining ticket's records leak silently and no lease ever expires
+  // again for this reader).
+  await runDiscardWalk(ctx, run);
+
+  return { done: true, value: { kind: "expired", eventId: appended.event.id } };
+}
+
+/**
+ * Sweeps `ticketId`'s own CAS cycle to completion, translating the two
+ * per-ticket-skip dispositions (renewed underneath the sweep, or this
+ * ticket's own CAS cycle exhausting `GIT_CAS_CONTENTION_EXCEEDED` against
+ * unrelated contention) into a result entry rather than letting either
+ * abort the sweep. Any other error — most importantly
+ * `EVENT_OBSERVATION_STORE_UNAVAILABLE` from the discard walk or an
+ * `observe()` call — propagates unchanged, aborting the sweep.
+ */
+async function sweepOneTicket(
+  ctx: ClaimContext,
+  ticketId: TicketId,
+  actor: ActorId,
+  hooks: ExpireStaleHooks,
+  casRetry: CasRetryOptions | undefined,
+): Promise<ExpireStaleTicketResult> {
+  try {
+    const outcome = await withCasRetry<ExpireAttemptValue>(
+      (attemptNumber) => expireStaleAttempt(ctx, ticketId, actor, hooks, attemptNumber),
+      casRetry,
+    );
+    if (outcome.kind === "expired") {
+      return { ticket: ticketId, outcome: "expired", eventId: outcome.eventId };
+    }
+    return { ticket: ticketId, outcome: "skipped", reason: "renewed" };
+  } catch (err) {
+    if (isCanKanError(err) && err.code === GitErrorCodes.GIT_CAS_CONTENTION_EXCEEDED) {
+      // This ticket's own cycle lost the race repeatedly against unrelated
+      // contention — a per-ticket skip (this file's header: "your CAS lost
+      // the race" is explicitly grouped with "renewed underneath you" as a
+      // decision-level loss), never a reason to abort tickets not yet
+      // swept.
+      return { ticket: ticketId, outcome: "skipped", reason: "cas-exhausted" };
+    }
+    throw err;
+  }
+}
+
+/**
+ * `expireStale()`'s implementation, plus the test-only `hooks` seam.
+ * `expireStale()` calls this with no hooks.
+ *
+ * Folds the board **once** (`snapshotBoard`, this module's only tip reader)
+ * to select every ticket whose lease is currently observed expired — that
+ * one fold is the candidate list for the whole sweep; it is never re-run
+ * mid-sweep. Each candidate then gets its own independent CAS cycle
+ * (`sweepOneTicket`), so a competitor renewing or reclaiming one ticket
+ * mid-sweep affects only that ticket's own outcome, never the others'.
+ *
+ * A dry run reports the same candidate list with no event appended and
+ * nothing discarded — it does not even enter the per-ticket loop.
+ */
+export async function expireStaleCore(params: ExpireStaleParams, hooks: ExpireStaleHooks): Promise<ExpireStaleResult> {
+  const now = params.now ?? Date.now();
+  const casRetry = validateCasRetry(params.casRetry);
+  const ctx = await resolveClaimContext({ board: params.board, now, trailingMonths: params.trailingMonths });
+  const dryRun = params.dryRun ?? false;
+
+  const { state } = await snapshotBoard(ctx);
+  const candidates = state.tickets.filter((t) => t.lease?.expired);
+
+  if (dryRun) {
+    return {
+      dryRun: true,
+      tickets: candidates.map((t) => ({ ticket: t.id, outcome: "expired" as const })),
+    };
+  }
+
+  const tickets: ExpireStaleTicketResult[] = [];
+  for (const candidate of candidates) {
+    tickets.push(await sweepOneTicket(ctx, candidate.id, params.actor, hooks, casRetry));
+  }
+  return { dryRun: false, tickets };
+}
+
+/** Sweeps the board, ending every lease this reader currently observes as expired. See `expireStaleAttempt`'s and `sweepOneTicket`'s doc comments for the failure-disposition ruling this implements. */
+export function expireStale(params: ExpireStaleParams): Promise<ExpireStaleResult> {
+  return expireStaleCore(params, {});
 }

@@ -263,6 +263,66 @@ describe("isReady", () => {
     });
   });
 
+  describe("Ruling R22(a) (fix round 2) — a TYPED dep resolved via blockedBy's alias tiering and a FLAT dep resolved directly, naming the SAME OPEN ticket, dedupe to ONE blocker", () => {
+    // R12's own dedup test uses a CLOSED target and asserts satisfaction —
+    // it cannot tell dedup-by-resolved-identity apart from dedup-by-raw-
+    // string, because there is nothing left to report once satisfied. This
+    // test uses an OPEN target so a blocker survives on both sides, and only
+    // fails if the two sides were incorrectly deduped by their (different)
+    // RAW ids rather than by the ticket each one actually resolves to.
+    test("typed dep names an ALIAS that resolves to ck-open; flat dep names ck-open DIRECTLY — one blocked reason, not two", () => {
+      const open = makeStoredTicket("ck-open", "To Do"); // open, unclaimed -- a real, outstanding blocker
+      const aliasToOpen = fixtureEvent({ event: "alias", ticket: "ck-open", from: "ck-alias", to: "ck-open" }, "2026-01", 0);
+      const ticket = makeStoredTicket("ck-1", "To Do", { cankan: { deps: [{ type: "blocks", id: "ck-alias" }] } });
+      const state = foldState([ticket, open], [aliasToOpen], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+      const verdict = isReady(state, "ck-1" as TicketId, { flatDependenciesFor: () => ["ck-open"] });
+
+      expect(verdict.ready).toBe(false);
+      const blockedReasons = verdict.reasons.filter((r) => r.kind === "blocked");
+      expect(blockedReasons).toHaveLength(1);
+      expect(blockedReasons[0]?.kind === "blocked" && blockedReasons[0].resolvedTicket?.id).toBe("ck-open" as TicketId);
+    });
+  });
+
+  describe("Ruling R28 (fix round 2) — isReady given no options (or options missing flatDependenciesFor) throws a coded error, not a bare TypeError", () => {
+    test("no options argument at all -> throws DEPS_IS_READY_OPTIONS_REQUIRED, not a TypeError", () => {
+      const ticket = makeStoredTicket("ck-1", "To Do");
+      const state = foldState([ticket], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+      // Cast past TypeScript's own required-parameter check -- this proves
+      // the RUNTIME guard, which is what a JS caller (or an `as any` escape
+      // hatch) actually hits.
+      const isReadyUnsafe = isReady as unknown as (state: unknown, ticketId: unknown) => unknown;
+
+      let threw = false;
+      try {
+        isReadyUnsafe(state, "ck-1" as TicketId);
+      } catch (error) {
+        threw = true;
+        expect(error instanceof TypeError).toBe(false);
+        expect(isCanKanError(error) && error.code).toBe(DepsErrorCodes.IS_READY_OPTIONS_REQUIRED);
+      }
+      expect(threw).toBe(true);
+    });
+
+    test("options present but flatDependenciesFor is not a function -> throws the same coded error", () => {
+      const ticket = makeStoredTicket("ck-1", "To Do");
+      const state = foldState([ticket], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+      const isReadyUnsafe = isReady as unknown as (state: unknown, ticketId: unknown, options: unknown) => unknown;
+
+      let threw = false;
+      try {
+        isReadyUnsafe(state, "ck-1" as TicketId, { excludedLabels: [] });
+      } catch (error) {
+        threw = true;
+        expect(error instanceof TypeError).toBe(false);
+        expect(isCanKanError(error) && error.code).toBe(DepsErrorCodes.IS_READY_OPTIONS_REQUIRED);
+      }
+      expect(threw).toBe(true);
+    });
+  });
+
   describe("Ruling R11 (fix round 1) — excludedLabels without labelsFor throws loudly instead of silently disabling every exclusion", () => {
     test("excludedLabels non-empty, labelsFor absent -> throws DEPS_EXCLUDED_LABELS_WITHOUT_LABELS_FOR", () => {
       const ticket = makeStoredTicket("ck-1", "To Do");
@@ -384,6 +444,39 @@ describe("readySet", () => {
       expect(sweep.ambiguousIds).toEqual(state.duplicateTicketIds);
       expect(sweep.ambiguousIds).toHaveLength(1);
       expect(String(sweep.ambiguousIds[0]?.ticketId)).toBe("ck-dup");
+    });
+  });
+
+  describe("Ruling R23 (fix round 2) — readySet's options-misconfiguration guard fires even on an EMPTY board", () => {
+    test("excludedLabels non-empty, labelsFor absent, on a board with ZERO tickets, still throws instead of silently returning an empty-but-valid-looking sweep", () => {
+      const state = foldState([], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+      let threw = false;
+      try {
+        readySet(state, { ...NO_FLAT_DEPS, excludedLabels: ["icebox"] });
+      } catch (error) {
+        threw = true;
+        expect(isCanKanError(error) && error.code).toBe(DepsErrorCodes.EXCLUDED_LABELS_WITHOUT_LABELS_FOR);
+      }
+      // Pre-fix (round 1), this NEVER threw: state.tickets is empty, so
+      // readySet's per-ticket loop body -- the only place the guard used to
+      // live, inside isReady -- never ran even once, and readySet returned
+      // `{ verdicts: Map(), ambiguousIds: [] }` as if nothing were wrong.
+      expect(threw).toBe(true);
+    });
+
+    test("the SAME misconfiguration on a NON-empty board also throws (unaffected — this is not a special case for empty boards)", () => {
+      const ticket = makeStoredTicket("ck-1", "To Do");
+      const state = foldState([ticket], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+      let threw = false;
+      try {
+        readySet(state, { ...NO_FLAT_DEPS, excludedLabels: ["icebox"] });
+      } catch (error) {
+        threw = true;
+        expect(isCanKanError(error) && error.code).toBe(DepsErrorCodes.EXCLUDED_LABELS_WITHOUT_LABELS_FOR);
+      }
+      expect(threw).toBe(true);
     });
   });
 });

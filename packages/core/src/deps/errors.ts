@@ -10,12 +10,12 @@
  *
  * **Prefixed `DEPS_`**, following `state/`'s and `store/`'s convention.
  *
- * Both codes below are **caller-programming-error** signals, not ordinary
- * "not ready" outcomes — `isReady` never returns a `ReadinessVerdict` with
- * `ready: false` for either condition, it throws. Neither is reachable
- * through this module's own `Depends on` (`state/` alone) misbehaving; both
- * exist because `isReady`'s options are caller-supplied (Ruling R6) and a
- * caller can misuse them.
+ * Every code below is a **caller-programming-error** signal, not an ordinary
+ * "not ready" outcome — `isReady` never returns a `ReadinessVerdict` with
+ * `ready: false` for any of these, it throws. None is reachable through this
+ * module's own `Depends on` (`state/` alone) misbehaving; all three exist
+ * because `isReady`'s options are caller-supplied (Ruling R6) and a caller
+ * can misuse them.
  */
 export const DepsErrorCodes = {
   /**
@@ -28,8 +28,30 @@ export const DepsErrorCodes = {
    * required-ness exists to close. `excludedLabels` absent or empty with
    * `labelsFor` absent stays legal (there is nothing to exclude, so nothing
    * to silently miss).
+   *
+   * Thrown by **both** `isReady` and `readySet` (fix round 2, Ruling R23):
+   * `readySet` validates this once, unconditionally, before its per-ticket
+   * sweep — not only via `isReady`'s own copy of the same check — because an
+   * **empty** board's sweep never calls `isReady` at all (the loop body
+   * never runs), which previously let this exact misconfiguration pass
+   * `readySet` silently, returning an empty-but-valid-looking result instead
+   * of throwing.
    */
   EXCLUDED_LABELS_WITHOUT_LABELS_FOR: "DEPS_EXCLUDED_LABELS_WITHOUT_LABELS_FOR",
+  /**
+   * `isReady` (or `readySet`, which validates the same options up front) was
+   * called without a well-formed `options` argument — either `options`
+   * itself is missing (`undefined`/`null`), or `options.flatDependenciesFor`
+   * is not a function (fix round 2, Ruling R28). TypeScript already makes
+   * both a compile error at every in-repo call site (`flatDependenciesFor`
+   * has been required since fix round 1, Ruling R11), but a JS caller
+   * unguarded by the type system previously got a bare, uncoded `TypeError`
+   * from `options.excludedLabels` a few lines into `isReady`'s body instead
+   * of a diagnosable error naming exactly what was missing — the same
+   * "coded error over an engine crash" discipline Ruling R15's cast-removal
+   * already established for this module.
+   */
+  IS_READY_OPTIONS_REQUIRED: "DEPS_IS_READY_OPTIONS_REQUIRED",
   /**
    * `isReady` called `state.blockedBy(state, ticketId)` and it returned
    * without throwing — which, by contract 3 and Ruling R2, should guarantee

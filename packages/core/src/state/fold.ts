@@ -92,10 +92,19 @@
  *   first-observation time, never the event's own timestamp.
  *
  * Ruled:
- * 1. **Claim, lease, actor and aliases come from the event log only.** The
- *    frontmatter `cankan:` block is never an input to claim/lease
- *    determination — confirmed by `ticket/schema.ts`'s `cankanBlockSchema`,
- *    which has no `claim` and no `actor` field at all.
+ * 1. **Claim, lease and actor come from the event log only.** The frontmatter
+ *    `cankan:` block is never an input to claim/lease determination —
+ *    confirmed by `ticket/schema.ts`'s `cankanBlockSchema`, which has no
+ *    `claim` and no `actor` field at all. **Deliberate, disclosed deviation
+ *    for `aliases` specifically:** `TicketState.aliases` is the event log's
+ *    alias chain **plus** the frontmatter's own `cankan.aliases` cache, not
+ *    the event log alone — see this file's "alias graph" section below for
+ *    why (in short: `store/ticketStore.ts`'s `get()` already resolves
+ *    frontmatter aliases, and `read()`'s default two-month window would
+ *    otherwise make this fold's alias resolution strictly *weaker* than the
+ *    store's for the same id). Flagged as a rule-1 deviation, not a silent
+ *    reinterpretation — if a reviewer wants literal "event log only,"
+ *    `foldState`'s call to `mergeAliases` is the one line to change.
  * 2. **Status:** the base is frontmatter `status`. Status-bearing events
  *    (`move` only — see Ruling R14 below) fold on top in `(month, line)`
  *    order. An `external-write` event **resets the base**: a `move` ordered
@@ -281,6 +290,8 @@ export interface TicketState {
   readonly closeReason: string | undefined;
   /** The ticket's current lease, or `undefined` if none is currently live. */
   readonly lease: LeaseState | undefined;
+  /** The frontmatter `cankan.display_id`, verbatim, or `undefined` when absent. `state/queries.ts`'s `blockedBy` resolves a `deps[].id` naming a display id (CONCEPT.md's own `PROJ-45` worked example) against this. */
+  readonly displayId: string | undefined;
   /**
    * Every identifier this ticket is also known by: frontmatter
    * `cankan.aliases` (as written, on-disk casing) unioned with any
@@ -297,7 +308,7 @@ export interface TicketState {
    * known ids/`display_id`s/aliases; this fold does not resolve dependency
    * ids itself, only surfaces the raw list so a query can.
    */
-  readonly deps: NonNullable<CankanBlock["deps"]>;
+  readonly deps: ReadonlyArray<NonNullable<CankanBlock["deps"]>[number]>;
 }
 
 /** One ticket id that had events pointing at it but no matching `StoredTicket` (Ruling R15). */
@@ -606,6 +617,7 @@ export function foldState(
       closed,
       closeReason,
       lease,
+      displayId: stored.ticket.frontmatter.cankan?.display_id,
       aliases: mergeAliases(frontmatterAliases, eventAliases),
       deps: stored.ticket.frontmatter.cankan?.deps ?? [],
     };

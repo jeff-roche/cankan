@@ -23,6 +23,23 @@
  * `packages/core/src` or `packages/cli` (confirmed by grep for
  * `parseDuration|durationToMs|toMillis|msFrom`), so this test carries its
  * own tiny, local one rather than reaching into `src/` to add one.
+ *
+ * **Fix round (mutation finding, see the report):** the claim event's
+ * `lease_until` is set to `HOSTILE_LEASE_UNTIL`, a century past `T0`,
+ * deliberately far from the correct expiry `T0 + leaseTtlMs`. Contract 1
+ * ("`lease_until` is DISPLAY ONLY; expiry is `firstSeen(eventId) +
+ * leaseTtlMs` vs `now`") forbids deriving expiry from the peer-supplied
+ * `lease_until` at all. An earlier revision of this file set `lease_until:
+ * new Date(T0 + leaseTtlMs).toISOString()`, which is arithmetically
+ * identical to the correct expiry — a fold that wrongly derived expiry from
+ * `lease_until` instead of `firstSeen + leaseTtlMs` was indistinguishable
+ * from a correct one, and the mutation `expiresAtMs =
+ * Date.parse(anchor.lease_until)` in `state/fold.ts` still passed every
+ * assertion here. With a hostile `lease_until`, that same mutation reports
+ * the lease live for a century and fails the `T0 + leaseTtlMs + 1` probe
+ * below (assertion 8, part 2), and the display-only passthrough assertion
+ * pins that the hostile value still surfaces verbatim in `leaseUntilDisplay`
+ * while having zero effect on `expired`.
  */
 
 import { mkdir, writeFile } from "node:fs/promises";
@@ -160,6 +177,9 @@ test("M2.9 smoke: board resolution -> config -> ticket store -> event log -> fol
       const T0 = Date.now();
       const nowIso = new Date(T0).toISOString();
       const claimActor = "agent:smoke-claimant" as ActorId;
+      // Hostile: a century past T0, nowhere near the correct expiry
+      // `T0 + leaseTtlMs` — see the header comment's "Fix round" note.
+      const HOSTILE_LEASE_UNTIL = new Date(T0 + 100 * 365 * 86_400_000).toISOString();
 
       const createAppended = await append(
         adapter,
@@ -188,7 +208,10 @@ test("M2.9 smoke: board resolution -> config -> ticket store -> event log -> fol
           actor: claimActor,
           ticket: TICKET_C.id as TicketId,
           event: "claim",
-          lease_until: new Date(T0 + leaseTtlMs).toISOString(),
+          // Adversarial on purpose — see HOSTILE_LEASE_UNTIL above. A correct
+          // fold must ignore this for expiry and only echo it in the display
+          // field (asserted below).
+          lease_until: HOSTILE_LEASE_UNTIL,
         },
         { now: T0 },
       );
@@ -238,6 +261,10 @@ test("M2.9 smoke: board resolution -> config -> ticket store -> event log -> fol
       expect(lease1.kind).toBe("claim");
       expect(lease1.eventId).toBe(claimAppended.event.id);
       expect(lease1.expired).toBe(false);
+      // Display-only passthrough: the hostile `lease_until` must survive
+      // verbatim into the display field while having zero effect on
+      // `expired` above — proving expiry did not derive from it.
+      expect(lease1.leaseUntilDisplay).toBe(HOSTILE_LEASE_UNTIL);
 
       // Assertion 9: the only direct proof contract 2's observation path
       // actually ran.

@@ -29,18 +29,20 @@
  *
  * - `LeaseAnchorKind` and every other internal type/function in `fold.ts`
  *   (`compareChainPosition`, `joinEventsToTickets`, `resolveLeaseAnchor`,
- *   `foldLease`, `foldStatusAndClose`, `resolveAllAliasTargets`,
- *   `resolveCycleAndTail`, `buildAliasEventIndex`, `mergeAliases`,
- *   `validateLeaseTtlMs`) and `queries.ts` (`buildIdentifierIndex`,
- *   `looksCrossBoard`) are internal folding/query machinery, not part of the
- *   public surface a caller should build on directly.
- * - `fold.ts`'s `resolveAliasTargetForTesting` **is** exported from that
- *   file directly (the same pattern `ticketStore.ts`'s
- *   `assertSafeTicketPath` uses for `store/ticketStore.test.ts` — a test
- *   reaches it via a relative import to the source file), but is not
- *   re-exported here: it is the pre-memoization reference walk
- *   `fold.test.ts` checks the real (memoized) alias resolution against, not
- *   something a caller has any use for.
+ *   `foldLease`, `foldStatusAndClose`, `resolveCycleAndTail`,
+ *   `buildAliasEventIndex`, `mergeAliases`, `validateLeaseTtlMs`) and
+ *   `queries.ts` (`buildIdentifierIndex`, `looksCrossBoard`) are internal
+ *   folding/query machinery, not part of the public surface a caller should
+ *   build on directly.
+ * - `fold.ts`'s `resolveAliasTargetForTesting` and `resolveAllAliasTargets`
+ *   **are** exported from that file directly (the same pattern
+ *   `ticketStore.ts`'s `assertSafeTicketPath` uses for
+ *   `store/ticketStore.test.ts` — a test reaches them via a relative import
+ *   to the source file), but neither is re-exported here: the former is the
+ *   pre-memoization reference walk, the latter is the real memoized
+ *   resolver exposed so `fold.test.ts` can wrap its `edges` argument to
+ *   count operations (an O(N) regression check immune to CI timing noise) —
+ *   neither is something a caller has any use for.
  * - `discard()` — the observation-store's release-time cleanup — is **not**
  *   re-exported here, and is not even imported by `fold.ts`. That belongs
  *   with `expireStale()` in M2.10; this module only ever calls `observe()`.
@@ -55,6 +57,7 @@ export { StateErrorCodes } from "./errors";
 
 export type {
   BoardState,
+  DuplicateTicketId,
   FoldStateOptions,
   LeaseState,
   ObserveAndFoldOptions,

@@ -201,6 +201,8 @@ export interface OpenTicketStoreOptions {
    * `assertValidGitDirs` for what each entry must satisfy.
    */
   readonly gitDirs: readonly string[];
+  /** Called after a successful write, remove, or archive so derived indexes can be dirtied. */
+  readonly onWrite?: () => void;
 }
 
 /**
@@ -231,6 +233,20 @@ export interface OpenTicketStoreOptions {
 export async function openTicketStore(options: OpenTicketStoreOptions): Promise<TicketStore> {
   const { board, gitDirs } = options;
   await assertValidGitDirs(gitDirs);
+  if (options.onWrite !== undefined && typeof options.onWrite !== "function") {
+    throw new CanKanError(ErrorCodes.USAGE, "onWrite must be a function");
+  }
+  const notifyWrite = (): void => {
+    try {
+      const result = options.onWrite?.();
+      if (result !== undefined && typeof (result as unknown as { then?: unknown }).then === "function") {
+        void (result as unknown as Promise<unknown>).catch(() => undefined);
+      }
+    } catch {
+      // Invalidation is advisory. A successful filesystem mutation must not
+      // be reported as failed merely because cache notification failed.
+    }
+  };
   const ticketsDir = board.ticketsDir;
   const guardWrite = (): Promise<string> => assertTicketsDirContained(ticketsDir, board.root, gitDirs);
   return {
@@ -238,15 +254,21 @@ export async function openTicketStore(options: OpenTicketStoreOptions): Promise<
     get: (lookup) => getTicket(ticketsDir, lookup),
     write: async (ticket) => {
       const real = await guardWrite();
-      return writeTicket(real, ticket);
+      const result = await writeTicket(real, ticket);
+      notifyWrite();
+      return result;
     },
     remove: async (lookup) => {
       const real = await guardWrite();
-      return removeTicket(real, lookup);
+      const result = await removeTicket(real, lookup);
+      notifyWrite();
+      return result;
     },
     archive: async (lookup) => {
       const real = await guardWrite();
-      return archiveTicket(real, lookup);
+      const result = await archiveTicket(real, lookup);
+      notifyWrite();
+      return result;
     },
   };
 }

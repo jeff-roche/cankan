@@ -172,6 +172,10 @@ function assertBuilt(index: BoardIndex): void {
       "this index cache has not been reindexed yet -- call reindex() before querying it",
     );
   }
+  const dirty = index.db.query("SELECT value FROM cankan_meta WHERE key = 'dirty'").get() as { value: string } | null;
+  if (dirty?.value === "1") {
+    throw new CanKanError(IndexErrorCodes.STALE, "this index cache is stale; refresh it before querying");
+  }
 }
 
 function isSqliteShapedError(error: unknown): boolean {

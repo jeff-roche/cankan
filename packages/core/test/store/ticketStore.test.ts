@@ -132,7 +132,8 @@ async function assertDoesNotExist(path: string): Promise<void> {
 describe("ticketStore — CRUD round trip", () => {
   test("write -> get -> list -> archive -> remove", async () => {
     await withTestBoard(async ({ board }) => {
-      const store = await openStore(board, await realGitDirsFor(board));
+      let notifications = 0;
+      const store = await openTicketStore({ board, gitDirs: await realGitDirsFor(board), onWrite: () => { notifications += 1; } });
       const ticket = newTicket("ck-roundtrip1", "Round trip ticket");
 
       const written = await store.write(ticket);
@@ -160,6 +161,7 @@ describe("ticketStore — CRUD round trip", () => {
       await store.write(newTicket("ck-roundtrip2", "Second ticket"));
       await store.remove("ck-roundtrip2");
       expect(await store.get("ck-roundtrip2")).toBeUndefined();
+      expect(notifications).toBe(4);
     });
   });
 });

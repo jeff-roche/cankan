@@ -106,3 +106,12 @@ export { reindex } from "./reindex";
 
 export type { QueryBoardStateOptions, TicketQuery } from "./query";
 export { queryBoardState, queryTickets } from "./query";
+
+export type { EnsureIndexFreshOptions, FreshBoardQueryOptions, FreshTicketQueryOptions, IndexValidity, IndexValidityInputs } from "./invalidate";
+export {
+  ensureIndexFresh,
+  createIndexInvalidator,
+  invalidateIndex,
+  queryBoardStateFresh,
+  queryTicketsFresh,
+} from "./invalidate";

@@ -1054,107 +1054,71 @@ describe("Fix round 3, Minor 3 -- tightening permissions never follows a symlink
  * but unusable" (a container without the right namespace privilege, exit
  * code non-zero) from "present and usable"; it never handled "not present
  * at all," so the uncaught `ENOENT` failed the test outright on macOS CI
- * instead of skipping it. (The general shape -- discriminate "expected,
- * legitimate absence of a capability" from "an unexpected failure" by a
- * real, specific signal rather than guessing -- mirrors fix round 2's L3
- * hard-link diagnosis (`HARD_LINK_UNSUPPORTED_CODES`, below): reused here
- * as a pattern, not as shared code, since the concrete signal -- an errno
- * on a thrown spawn error, versus an errno on a syscall result -- differs.)
- *
- * Both failure shapes are probed for up front, synchronously, at module
- * load -- *before* `test()` is called -- so the capability (and, when
- * absent, *why*) can be baked into the test's own title via
- * `test.skipIf`. That's deliberate: it's what makes a `bun test` run PRINT
- * a skip line naming `unshare` and Linux, rather than the test either
- * silently no-op'ing (the previous behaviour, an early `return` with no
- * assertions and no visible trace) or crashing outright. Neither of those
- * is acceptable per R53 -- a macOS user can genuinely have a read-only
- * mount, so R40's behaviour matters there; choosing not to test it must be
- * legible, not silent.
+ * instead of skipping it. R53's fix added a pre-flight probe
+ * (`Bun.spawnSync(["unshare", ..., "true"])`, caught for `ENOENT`) and used
+ * `test.skipIf` so a skip -- and why -- is legible in the test's own title,
+ * rather than the test either silently no-op'ing (the original code's
+ * early `return` with no assertions and no visible trace, still present in
+ * the pre-R53 diff below) or crashing outright.
  *
  * R55 (orchestrator, ubuntu CI regression introduced by R53's own fix) --
- * in a *prior* CI job, before R53 gated this test on a probe at all, the
- * real test below ran unconditionally on the ubuntu runner and passed,
- * executing the actual bind-mount remount in 134ms. In a *later* job,
- * after R53 shipped, the probe reported "present but unusable" on that
- * same runner and skipped the test. The probe originally ran `unshare
- * --user --mount --map-root-user true`, while the real test runs
- * `unshare --user --mount --map-root-user bash -c <script>`: same flags,
- * a different command operand. That is the only divergence identified so
- * far between the two invocations -- it is a hypothesis, not a confirmed
- * cause, since neither the pre-fix pass nor the post-fix skip reproduces
- * on any machine this fix was developed against. The fix has two parts:
+ * after R53 shipped, ubuntu CI's probe reported "present but exited
+ * non-zero" and skipped the test, on a runner where an *earlier* CI job
+ * (before R53 existed) had run the unguarded pre-R53 code and reported
+ * `(pass)`. R55's hypothesis: the probe ran `unshare ... true` while the
+ * real test ran `unshare ... bash -c <script>` -- same flags, a different
+ * command operand -- and that divergence was the false negative. The fix
+ * made the probe use the same command family (`bash -c true`) and made it
+ * self-diagnosing (`exitCode`/`signalCode`/`stderr` folded into the skip
+ * reason), explicitly flagged in that fix's own comment as a hypothesis,
+ * not a confirmed cause, since it didn't reproduce on any dev machine.
  *
- *  1. The probe now execs `bash -c` with a trivial, side-effect-free
- *     script (`true`), matching the real test's command family, rather
- *     than a bare `true` exec, so this identified divergence is closed.
- *     It still does *not* perform a real mount -- the real test's mount
- *     runs inside the namespace it just created, which is more than this
- *     gate needs to check, and R55 is explicit that the probe must
- *     exercise the same capability the test depends on and nothing
- *     stricter. (The probe's `env` cannot match the real test's `env`
- *     exactly -- the real test overrides `HOME`/`XDG_STATE_HOME` from a
- *     per-test temp dir that doesn't exist yet when this probe runs at
- *     module load, before any test setup. Neither `unshare` nor a
- *     non-interactive `bash -c true` consults either variable, so this
- *     is not expected to matter, but it's a difference worth naming.)
- *  2. Because (1) is a hypothesis, the probe is now self-diagnosing:
- *     `exitCode`, `signalCode`, and `stderr` are captured from the
- *     probe's own spawn result and folded into the skip reason. If a
- *     future CI leg still skips this test, the printed title carries the
- *     exact exit code and stderr instead of forcing another guess.
+ * R56 (orchestrator, R55's fix measured and found insufficient) -- CI
+ * measurement disproved R55's hypothesis: aligning the command family
+ * changed nothing. The self-diagnostics R55 added did their job -- the
+ * ubuntu probe's captured stderr was `unshare: write failed
+ * /proc/self/uid_map: Operation not permitted`, a real `EPERM` from a real
+ * capability check, not a shell/exec-not-found error. A second hypothesis
+ * (that `ubuntu-latest`'s floating tag had moved to a different runner
+ * image between the pre-R53 pass and the post-R55 skip) was also checked
+ * and disproved: all three relevant CI jobs ran the identical runner image
+ * (`20260831.293.1`).
+ *
+ * That leaves the probe itself discredited as a gating mechanism on this
+ * runner: a probe with the same binary, same flags, same command family as
+ * the real invocation predicted "unusable" while -- per the pre-R53 job's
+ * own log -- *something* on that runner reported `(pass)` in 134ms. But
+ * that pre-R53 code path is the early-`return`-on-failed-probe shape
+ * quoted above: a passing early return produces no assertions and looks
+ * identical, in the log, to a passing real remount. Whether the real
+ * bind-mount remount has *ever* actually executed on ubuntu CI is
+ * therefore unestablished -- the 134ms duration is suggestive of real work
+ * (a bare failed probe call should be near-instant), but not conclusive.
+ *
+ * Ruling R56's resolution: stop trying to predict the real invocation's
+ * result with a separate probe call, since on this runner a probe cannot
+ * -- move the capability check *into* the test itself, gated only on
+ * platform (`process.platform !== "linux"`, the one distinction that is
+ * actually a legitimate, structural absence: no CLONE_NEWUSER/CLONE_NEWNS
+ * on macOS at all). On Linux the test always attempts the real `unshare`
+ * invocation; if it fails, the test fails loudly with the exit code,
+ * signal, and stderr inline in the failure message, naming the likely
+ * cause (a kernel/AppArmor policy restricting unprivileged user
+ * namespaces) rather than passing, silently no-op'ing, or producing a bare
+ * `expect(stdout).toContain(...)` mismatch with no explanation. A
+ * container that genuinely lacks the privilege now gets a diagnosable
+ * failure instead of an invisible skip -- fail-closed, matching this
+ * phase's own instinct for the product code it's testing.
  */
-function probeUnshareCapability(): { readonly available: boolean; readonly reason: string } {
-  let probe: Bun.ReadableSyncSubprocess;
-  try {
-    // Same command family as the real test's spawn below (`unshare ...
-    // bash -c <script>`) and the same stdio shape; `env` is process.env
-    // unmodified (the real test's HOME/XDG_STATE_HOME override doesn't
-    // exist yet at module load -- see the doc comment above). Only the
-    // script body differs (a no-op instead of the real bind-mount
-    // remount), so this probe should not fail for a reason the real
-    // invocation wouldn't -- see the doc comment above for why that's a
-    // hypothesis this probe now also diagnoses, not a settled fact.
-    probe = Bun.spawnSync(["unshare", "--user", "--mount", "--map-root-user", "bash", "-c", "true"], {
-      env: process.env,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-  } catch (error) {
-    // `Bun.spawnSync` throws (rather than returning a non-zero exit code)
-    // when the executable itself isn't found -- confirmed directly, `code:
-    // "ENOENT"` on the thrown error, distinct from every other spawn
-    // failure this function needs to tell apart from a working `unshare`.
-    if (error && typeof error === "object" && "code" in error && (error as { code: unknown }).code === "ENOENT") {
-      return {
-        available: false,
-        reason: "the `unshare` executable was not found on $PATH -- it is Linux-only (unprivileged user/mount namespaces via CLONE_NEWUSER/CLONE_NEWNS have no macOS equivalent), so this is expected on any non-Linux platform",
-      };
-    }
-    throw error;
-  }
-  if (probe.exitCode !== 0) {
-    const stderr = probe.stderr.toString().trim();
-    return {
-      available: false,
-      reason:
-        "`unshare --user --mount --map-root-user bash -c true` is present but exited non-zero -- " +
-        `present-but-unusable (e.g. a container without the needed namespace privilege), same as an ` +
-        `absent binary for this test's purposes (exitCode=${probe.exitCode}, ` +
-        `signalCode=${probe.signalCode ?? "none"}, stderr=${JSON.stringify(stderr)})`,
-    };
-  }
-  return { available: true, reason: "" };
-}
-
-const unshareCapability = probeUnshareCapability();
-
 describe("Fix round 3, Ruling R40 -- a failed permission-tightening attempt is fatal on the write path, not the read path", () => {
   const baseTitle =
     "firstSeen() still returns the record when the store is on a read-only mount and its directory mode can't be tightened (real bind-mount remount, not simulated)";
-  const title = unshareCapability.available ? baseTitle : `${baseTitle} -- SKIPPED: ${unshareCapability.reason}`;
+  const title =
+    process.platform === "linux"
+      ? baseTitle
+      : `${baseTitle} -- SKIPPED: unprivileged user/mount namespaces (\`unshare --user --mount\`, using CLONE_NEWUSER/CLONE_NEWNS) are Linux-only and have no macOS equivalent`;
 
-  test.skipIf(!unshareCapability.available)(title, async () => {
+  test.skipIf(process.platform !== "linux")(title, async () => {
     await withEnv(undefined, async () => {
       const home = process.env.HOME as string;
       const eventId = ulid() as EventId;
@@ -1188,12 +1152,47 @@ describe("Fix round 3, Ruling R40 -- a failed permission-tightening attempt is f
         `mount -o remount,ro,bind ${JSON.stringify(boardHashDir)}`,
         `bun run ${JSON.stringify(scriptPath)}`,
       ].join(" && ");
+      const spawnArgv = ["unshare", "--user", "--mount", "--map-root-user", "bash", "-c", script];
 
-      const result = Bun.spawnSync(["unshare", "--user", "--mount", "--map-root-user", "bash", "-c", script], {
-        env: { ...process.env, HOME: home, XDG_STATE_HOME: "" },
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+      // R56: no separate pre-flight probe -- this *is* the capability
+      // check, and it's also the real test. `Bun.spawnSync` can either
+      // throw (executable missing, e.g. `code: "ENOENT"` if `unshare`
+      // itself isn't installed) or return a non-zero exit (present but
+      // unable to create the namespace, e.g. a kernel/AppArmor policy
+      // denying the `/proc/self/uid_map` write CAP_SETUID requires). Both
+      // are surfaced as a loud, diagnosable test failure below rather than
+      // a silent pass or an opaque crash.
+      let result: Bun.ReadableSyncSubprocess;
+      try {
+        result = Bun.spawnSync(spawnArgv, {
+          env: { ...process.env, HOME: home, XDG_STATE_HOME: "" },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error ? (error as { code: unknown }).code : undefined;
+        throw new Error(
+          `\`unshare --user --mount --map-root-user bash -c <script>\` failed to spawn ` +
+            `(error code: ${String(code)}) -- on Linux this typically means the \`unshare\` ` +
+            `executable itself is not installed (it ships in util-linux); ` +
+            `original error: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      }
+      if (result.exitCode !== 0) {
+        const stdout = result.stdout.toString().trim();
+        const stderr = result.stderr.toString().trim();
+        throw new Error(
+          `\`unshare --user --mount --map-root-user bash -c <script>\` exited non-zero ` +
+            `(exitCode=${result.exitCode}, signalCode=${result.signalCode ?? "none"}) -- ` +
+            `R40's real bind-mount-remount path could not be exercised in this run. ` +
+            `A stderr write failure on /proc/self/uid_map (EPERM) typically means ` +
+            `unprivileged user namespaces are restricted on this host (on Ubuntu ` +
+            `23.10+, \`kernel.apparmor_restrict_unprivileged_userns=1\` produces exactly ` +
+            `that signature); stderr=${JSON.stringify(stderr)}, stdout=${JSON.stringify(stdout)}`,
+        );
+      }
+
       const stdout = result.stdout.toString();
       expect(stdout).toContain("RESULT:ok 1234");
     });

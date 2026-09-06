@@ -70,6 +70,29 @@
  * window keeps growing as long as the chain keeps getting renewed inside
  * it; only a gap wider than the window itself would lose history), and
  * strictly better than a fold that never discards at all.
+ *
+ * ## `claims.require_ready` is NOT read here, and that is deliberate
+ *
+ * `claims.require_ready` (default `true`, `config/schema.ts`) is not read
+ * and not enforced by this module, even though its sibling keys
+ * `claims.lease` and `claims.max_per_actor` both are. Readiness can't be
+ * evaluated without the dependency graph, which lives in `deps/` (M2.11,
+ * issue #34) — this task's `Depends on` is #31 (state) and #26 (config), and
+ * PLAN rule 2 permits importing only from a task's dependency list, so
+ * `claims/` may not import `deps/`. (`deps/` merged into the tree while
+ * this lane ran, which makes the prohibition easier to violate by accident,
+ * not harder — the import must still not happen.) The key isn't even read
+ * and discarded, because reading a policy key and then ignoring it is worse
+ * than not reading it: it looks enforced to a reviewer or to a grep for the
+ * key, while a not-ready ticket stays claimable regardless. Enforcement
+ * belongs in M3.5 (issue #46), whose `Depends on` — #42, #33, #34, #35
+ * (CLI shell, claims, deps, ordering) — makes it the first task where
+ * claims, deps, and ordering are all legally available; M2.17 (#40) is not
+ * the owner despite wiring claims to its neighbours, since its `Depends on`
+ * (#39, #33, #28) has no #34. When readiness is enforced, it is advisory
+ * input to deciding *which* ticket to attempt — never the arbiter of
+ * whether a claim succeeds. The CAS on the coordination ref remains the
+ * sole mutual-exclusion primitive, as above.
  */
 
 import { CanKanError, ErrorCodes, isCanKanError } from "../errors";

@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { closeSync, openSync, statSync, writeSync } from "node:fs";
 import { openIndex, rebuildIndex } from "../../src/index/db";
@@ -364,6 +365,43 @@ describe("queryTickets/queryBoardState -- INDEX_CORRUPT (fix round 1, S2): corru
           expect(isCanKanError(error)).toBe(true);
           expect(isCanKanError(error) && error.code).toBe(IndexErrorCodes.CORRUPT);
         }
+      } finally {
+        index.close();
+      }
+    });
+  });
+});
+
+describe("queryTickets/queryBoardState -- INDEX_QUERY_FAILED: a non-corruption SQLite error also never escapes raw", () => {
+  test("a genuine SQLITE_BUSY (a real exclusive lock held by another connection, not a synthetic error) maps to INDEX_QUERY_FAILED, not CORRUPT and not a raw SQLiteError", async () => {
+    await withEnv(undefined, () => {
+      const index = openIndex({ boardKey: BOARD_KEY });
+      try {
+        reindex({ index, state: sentinelState() });
+
+        // A second, real connection to the same file holding an
+        // EXCLUSIVE write lock -- `guardAgainstCorruption`'s fallback
+        // branch (fix round 1, S2 follow-through) exists for exactly
+        // this shape: a `bun:sqlite` failure that is neither
+        // corruption nor this module's own typed error.
+        const locker = new Database(index.path);
+        locker.exec("BEGIN EXCLUSIVE");
+        locker.exec("INSERT INTO cankan_meta (key, value) VALUES ('locker-row', 'x')");
+        try {
+          queryTickets(index);
+          throw new Error("expected queryTickets to throw while the db is locked");
+        } catch (error) {
+          expect(isCanKanError(error)).toBe(true);
+          expect(isCanKanError(error) && error.code).toBe(IndexErrorCodes.QUERY_FAILED);
+          expect(isCanKanError(error) && error.code).not.toBe(IndexErrorCodes.CORRUPT);
+        } finally {
+          locker.exec("COMMIT");
+          locker.close();
+        }
+
+        // And the index is perfectly usable again once the lock clears --
+        // this was never actually corrupt.
+        expect(queryTickets(index)).toHaveLength(1);
       } finally {
         index.close();
       }

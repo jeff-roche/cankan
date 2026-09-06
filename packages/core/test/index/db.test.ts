@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
   statSync,
   symlinkSync,
   truncateSync,
@@ -15,7 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { isCanKanError } from "../../src/errors";
-import { INDEX_SCHEMA_VERSION, indexPathFor, openIndex } from "../../src/index/db";
+import { INDEX_SCHEMA_VERSION, indexPathFor, openIndex, rebuildIndex } from "../../src/index/db";
 import { IndexErrorCodes } from "../../src/index/errors";
 import { reindex } from "../../src/index/reindex";
 // `@jeff-roche/cankan-test-utils` is not a declared dependency of
@@ -395,3 +396,84 @@ describe("openIndex -- degradation, each case builds a real db then corrupts it"
     });
   });
 });
+
+describe("rebuildIndex -- fix round 2 items 2/3", () => {
+  test("a DIRECTORY at <db>-wal, planted only after the handle is already open, makes the sidecar sweep throw ERR_FS_EISDIR raw, which rebuildIndex must map to a typed CanKanError, never let escape (item 2)", async () => {
+    await withEnv(undefined, () => {
+      const path = buildRealIndexFile(BOARD_KEY);
+      const index = openIndex({ boardKey: BOARD_KEY }); // healthy reopen -- the sidecar path is still clean here
+      // Planted only now, after `openIndex` has already succeeded: doing
+      // this *before* `openIndex` hits a different (also real, also fixed
+      // this round -- see `openIndex`'s own step-5 comment) failure inside
+      // `openIndex` itself, since a directory at `<db>-wal` makes SQLite
+      // refuse to open the otherwise-healthy main file at all
+      // (`SQLITE_CANTOPEN`). This test isolates `rebuildIndex`'s own sweep
+      // specifically, on an already-open, already-healthy handle.
+      mkdirSync(`${path}-wal`);
+
+      try {
+        let thrown: unknown;
+        try {
+          rebuildIndex(index);
+          throw new Error("expected rebuildIndex to throw");
+        } catch (error) {
+          thrown = error;
+        }
+        // The load-bearing assertion: a typed CanKanError, not a raw
+        // Node ErrnoException (`code === "ERR_FS_EISDIR"`) escaping this
+        // module's declared surface -- exactly the contract `openIndex`'s
+        // own doc comment states ("a mkdir/lstat/unlink failure ...
+        // INDEX_CACHE_PATH_UNAVAILABLE") but which was unenforced for this
+        // call site.
+        expect(isCanKanError(thrown)).toBe(true);
+        expect(isCanKanError(thrown) && thrown.code).toBe(IndexErrorCodes.CACHE_PATH_UNAVAILABLE);
+      } finally {
+        // `rebuildIndex` already closed `index.db` before it threw --
+        // nothing left to close on the original handle.
+        rmSync(`${path}-wal`, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("rebuildIndex restores the cache directory's ownership/mode before rebuilding, mirroring openIndex's own open sequence (item 3)", async () => {
+    await withEnv(undefined, () => {
+      const path = buildRealIndexFile(BOARD_KEY);
+      const cacheDir = join(path, "..");
+      const index = openIndex({ boardKey: BOARD_KEY }); // healthy reopen -- cacheDir is 0o700 at this point
+      // Simulates the passage of time item 3's own rationale is about:
+      // `rebuildIndex` can run seconds after the handle it is passed was
+      // originally opened, so the directory state at that original
+      // `openIndex` call proves nothing about the directory's state now.
+      chmodSync(cacheDir, 0o777);
+      expect(statSync(cacheDir).mode & 0o777).toBe(0o777); // fixture sanity
+
+      const rebuilt = rebuildIndex(index);
+      try {
+        expect(statSync(cacheDir).mode & 0o777).toBe(0o700);
+        expect(rebuilt.rebuilt).toBe(true);
+      } finally {
+        rebuilt.close();
+      }
+    });
+  });
+});
+
+/**
+ * Item 1 (fix round 2): the post-`mkdir` re-`lstat` in `ensurePrivateCacheDir`
+ * (`db.ts`, immediately after the `mkdirSync` call) is now wrapped in the
+ * same `CACHE_PATH_UNAVAILABLE` try/catch as the pre-`mkdir` `lstat` above
+ * it. **No test exercises the failure path directly.** The two synchronous,
+ * back-to-back `fs` calls (`mkdirSync` then `lstatSync`) leave no callback
+ * boundary in this single-threaded process for a test to interleave a
+ * directory removal or a permission change in between -- reaching the
+ * `catch` requires either a concurrent process racing the two syscalls (the
+ * same class of window this file's own doc comments already disclose as
+ * "untested -- isolating a single-syscall race window from outside this
+ * function isn't practical") or mocking `node:fs` itself, which would
+ * verify the mock rather than the real `lstatSync` failure. Per the fix
+ * round 2 brief's own instruction, this is stated explicitly rather than
+ * shipped as a test that cannot fail: the wrap is exercised by code
+ * inspection and by the identical, already-tested pattern one line above it
+ * (the pre-`mkdir` `lstat`'s own `ENOENT`/other-error branches), not by a
+ * dedicated test of its own.
+ */

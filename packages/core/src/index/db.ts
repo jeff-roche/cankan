@@ -301,9 +301,21 @@ function tightenCacheDirPermissions(dir: string): void {
  * directory is already there.
  *
  * Scoped to the `cankan` directory only, **never `$XDG_CACHE_HOME`
- * itself** -- matching `ensurePrivateDir`'s own stated remit; this module
- * does not create `$XDG_CACHE_HOME` and has no business tightening
- * permissions on whatever else lives under it.
+ * itself** -- matching `ensurePrivateDir`'s own stated remit. Fix round 2:
+ * the previous wording here claimed this module "does not create
+ * `$XDG_CACHE_HOME`," which is false -- `mkdirSync(dir, { recursive: true,
+ * mode: 0o700 })` above creates `$XDG_CACHE_HOME` as a side effect of one
+ * recursive syscall whenever it is absent, the same way
+ * `events/observations.ts`'s `ensurePrivateDir` creates its own
+ * XDG-conventional parents (that file's own comment on its `mkdir` call).
+ * What is actually true, mirroring that comment's honesty: the
+ * parent is created, but it is not separately `lstat`ed, owned-checked, or
+ * mode-tightened by this function -- only the `cankan` directory itself is.
+ * That is not a scope violation; it is the same harmless side effect
+ * `observations.ts` already accepts, since applying `mode: 0o700` to a
+ * parent as part of the one recursive `mkdir` call is no worse than not
+ * creating it at all, and this function has no separate remit over
+ * whatever else already lives under `$XDG_CACHE_HOME`.
  *
  * **One TOCTOU window is disclosed, not claimed closed, mirroring
  * `ensurePrivateDir`'s own honesty about its analogous window**: between
@@ -361,7 +373,20 @@ function ensurePrivateCacheDir(dir: string): void {
       cause,
     });
   }
-  const stat = lstatSync(dir);
+  let stat: Stats;
+  try {
+    stat = lstatSync(dir);
+  } catch (cause) {
+    // Fix round 2: this re-check `lstat` was unwrapped -- reachable if the
+    // directory is removed, or the parent loses `x`, in the window between
+    // the `mkdirSync` above and this line, letting a raw `ENOENT`/`EACCES`
+    // `ErrnoException` escape `openIndex` untyped. Wrapped the same as the
+    // pre-`mkdir` `lstat` above, for the same reason: every other syscall
+    // in this file routes into a `CanKanError`.
+    throw new CanKanError(IndexErrorCodes.CACHE_PATH_UNAVAILABLE, "could not inspect the index cache directory", {
+      cause,
+    });
+  }
   if (!stat.isDirectory()) {
     // A genuine TOCTOU window (disclosed, not claimed closed elsewhere in
     // this function's doc comment): between the pre-`mkdir` `lstat`
@@ -682,6 +707,17 @@ export function isIndexCorruptionError(error: unknown): boolean {
  * went with it, which an implicit, invisible rebuild would hide.
  */
 export function rebuildIndex(index: BoardIndex): BoardIndex {
+  // Fix round 2, ruling: `openIndex` already verified this directory when
+  // it produced the handle `index` was opened from, and the only window
+  // left is the one this file's `new Database(...)` comment already
+  // concedes (an unlink-then-recreate gap) -- just held open longer here,
+  // since `rebuildIndex` can run seconds after that original check. Calling
+  // `ensurePrivateCacheDir` again restores exact parity with `openIndex`'s
+  // own open sequence and trades a subtle argument about window duration
+  // for one extra `lstat` -- the right cost for a recovery path that may
+  // run long after the original check, not a correctness fix for a bug
+  // that was otherwise reachable.
+  ensurePrivateCacheDir(dirname(index.path));
   try {
     index.db.close();
   } catch {
@@ -689,9 +725,19 @@ export function rebuildIndex(index: BoardIndex): BoardIndex {
     // nothing more this function can do with the old handle, and
     // `removeIndexFileAndSidecars` below does not need it open.
   }
-  removeIndexFileAndSidecars(index.path);
   let db: Database;
   try {
+    // Fix round 2: `removeIndexFileAndSidecars` used to sit outside this
+    // try. `rmSync(force: true)` swallows `ENOENT` but still throws for a
+    // **directory** at `<db>-wal`/`-shm`/`-journal` (`ERR_FS_EISDIR`) and
+    // for `EACCES` -- which used to escape `rebuildIndex` raw, breaking
+    // `openIndex`'s own declared contract (this file's doc comment above,
+    // "a `mkdir`/`lstat`/`unlink` failure ... `INDEX_CACHE_PATH_UNAVAILABLE`").
+    // `openIndex`'s own discard-and-rebuild step (this file's doc comment,
+    // step 5) had the identical gap since the very first commit, not only
+    // this call site -- both are now wrapped the same way, see that step's
+    // own comment for the case that surfaced it.
+    removeIndexFileAndSidecars(index.path);
     db = new Database(index.path, { create: true });
     initializeSchema(db, index.boardKey);
   } catch (cause) {

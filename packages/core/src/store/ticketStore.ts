@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import type { Dirent } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { isContained } from "../board/index";
@@ -13,7 +14,7 @@ import {
   type ParsedTicket,
   type TicketIdLookupKey,
 } from "../ticket/index";
-import type { BoardRef, TicketId } from "../types";
+import type { BoardKind, BoardRef, TicketId } from "../types";
 import { StoreErrorCodes } from "./errors";
 
 /**
@@ -190,10 +191,23 @@ export interface OpenTicketStoreOptions {
   /**
    * Absolute, canonical paths of the repository's git directories, for ADR
    * 0002 step (c). Required, with an explicit empty array as the escape
-   * hatch for "no git directory" — the same shape `loadBoardConfig`/
-   * `loadConfig` established for "a field a caller can simply forget
-   * becomes a silently-skipped security check" (Ruling R3). Each entry
-   * must already be canonical (`fs.realpath`'d), not merely absolute — see
+   * hatch for the personal board's "no git directory" (see the paragraph
+   * below — `[]` is not legal for a repo-kind board) — the same shape
+   * `loadBoardConfig`/`loadConfig` established for "a field a caller can
+   * simply forget becomes a silently-skipped security check" (Ruling R3).
+   * Each entry must already be canonical (`fs.realpath`'d), not merely
+   * absolute — see `assertValidGitDirs`.
+   *
+   * **The empty array is only a legal escape hatch for `board.kind ===
+   * "personal"`** (fix round 2, Important — a security reviewer executed
+   * the gap: `gitDirs: []` against a `kind: "repo"` board disables step (c)
+   * entirely, including the by-name `.git` check, which lives only in
+   * `board/ref.ts` and a hand-built `BoardRef` skips). A repo board that
+   * genuinely has no git directory cannot exist — `resolveBoard()` only
+   * ever produces a `kind: "repo"` `BoardRef` for something `walkForBoard`
+   * found by walking up from inside a real repository — so an empty array
+   * for a repo board is never "correctly asserting there is no git
+   * directory," always a caller that forgot to wire one in. See
    * `assertValidGitDirs`.
    */
   readonly gitDirs: readonly string[];
@@ -213,26 +227,38 @@ export interface OpenTicketStoreOptions {
  * step (c) are enforced from exactly one place (`assertTicketsDirContained`,
  * 1B Ruling R9) rather than three separate copies. `list()`/`get()` are
  * read-only and do not run it.
+ *
+ * `guardWrite()` returns the `realpath`'d `ticketsDir` it just validated
+ * (fix round 2, Minor 1), and every write path is called with *that* value,
+ * never the original captured string. This is deliberate, not
+ * cosmetic: passing the raw `ticketsDir` through would leave the final
+ * path component re-traversable — a symlink swapped into place in the
+ * instant after the guard's `realpath` call but before the actual I/O
+ * would still be followed by `open`/`rename`/`unlink`/`mkdir`, quietly
+ * defeating the guard. Passing the already-resolved value down makes that
+ * specific re-point structurally impossible rather than merely checked,
+ * narrowing the residual TOCTOU window to an *ancestor* directory swap
+ * (see `assertTicketsDirContained`'s own comment for that window's shape).
  */
 export async function openTicketStore(options: OpenTicketStoreOptions): Promise<TicketStore> {
-  await assertValidGitDirs(options.gitDirs);
   const { board, gitDirs } = options;
+  await assertValidGitDirs(board.kind, gitDirs);
   const ticketsDir = board.ticketsDir;
-  const guardWrite = (): Promise<void> => assertTicketsDirContained(ticketsDir, board.root, gitDirs);
+  const guardWrite = (): Promise<string> => assertTicketsDirContained(ticketsDir, board.root, gitDirs);
   return {
     list: () => listTickets(ticketsDir),
     get: (lookup) => getTicket(ticketsDir, lookup),
     write: async (ticket) => {
-      await guardWrite();
-      return writeTicket(ticketsDir, ticket);
+      const real = await guardWrite();
+      return writeTicket(real, ticket);
     },
     remove: async (lookup) => {
-      await guardWrite();
-      return removeTicket(ticketsDir, lookup);
+      const real = await guardWrite();
+      return removeTicket(real, lookup);
     },
     archive: async (lookup) => {
-      await guardWrite();
-      return archiveTicket(ticketsDir, lookup);
+      const real = await guardWrite();
+      return archiveTicket(real, lookup);
     },
   };
 }
@@ -244,6 +270,25 @@ export async function openTicketStore(options: OpenTicketStoreOptions): Promise<
  * 1B's containment check with `undefined`, defeating the whole point of
  * making the field required rather than defaulting it. Checked eagerly so
  * the failure is loud and immediate, not a mystery inside 1B's later logic.
+ *
+ * **The empty array is refused for `kind: "repo"` boards** (fix round 2,
+ * Important). A security reviewer executed the gap this closes: `gitDirs:
+ * []` disables step (c) *entirely* for a repo board — not merely "no extra
+ * git-directory to exclude," but zero git-directory defence at all, since
+ * the by-name `.git` check lives only in `board/ref.ts` and a hand-built
+ * `BoardRef` (or, worse, the *legitimate* `resolveBoard()` path with a
+ * hostile checked-in `tickets_dir` — see R2/the ADR 0002 amendment) skips
+ * it. `[]` is only ever correct for `kind: "personal"`: the personal board
+ * is itself a git repo (CONCEPT.md §6c), but a caller opening it is never
+ * expected to also be holding a `GitAdapter` for it, so `[]` there really
+ * does mean "no exclusion, by design," not "forgot to wire one in." A repo
+ * board with no git directory cannot legitimately exist — `resolveBoard()`
+ * only ever produces `kind: "repo"` for something found by walking up from
+ * inside a real repository — so this is a forgotten wire-up, not a
+ * legitimate empty state, every time it happens for a repo board. This is
+ * Ruling R3's own rationale ("a field a caller can simply forget becomes a
+ * silently-skipped security check") applied to the forgettable *value* R3
+ * failed to anticipate.
  *
  * Each entry is further required to be **canonical** — `fs.realpath`'d,
  * not merely absolute (1B, work item 2b.1, tightened from "absolute" alone
@@ -257,14 +302,25 @@ export async function openTicketStore(options: OpenTicketStoreOptions): Promise<
  * exists to prevent, one layer down. Verified by `fs.realpath`-ing each
  * entry and requiring the result to equal the entry itself; a path that
  * does not exist, or that resolves to something else, is rejected the same
- * way a relative or empty entry already was. This makes the function
- * asynchronous (fix round 1's version was synchronous).
+ * way a relative or empty entry already was — the failure surfaces as
+ * `ErrorCodes.USAGE` either way (fail-closed either reading is correct;
+ * the message says "existing, canonical, and accessible" rather than
+ * implying non-existence specifically, since a permission error
+ * (`EACCES`) reaches this same branch and is not "the path doesn't
+ * exist," fix round 2 Minor 4). This makes the function asynchronous
+ * (fix round 1's version was synchronous).
  */
-async function assertValidGitDirs(gitDirs: readonly string[]): Promise<void> {
+async function assertValidGitDirs(kind: BoardKind, gitDirs: readonly string[]): Promise<void> {
   if (!Array.isArray(gitDirs)) {
     throw new CanKanError(
       ErrorCodes.USAGE,
-      "gitDirs must be an array — pass [] to assert there is no git directory",
+      "gitDirs must be an array — pass [] to assert there is no git directory (personal boards only)",
+    );
+  }
+  if (kind === "repo" && gitDirs.length === 0) {
+    throw new CanKanError(
+      ErrorCodes.USAGE,
+      "A repo-kind board must supply at least one git directory in gitDirs -- [] is only valid for the personal board, which has none to exclude by design",
     );
   }
   for (const dir of gitDirs) {
@@ -275,9 +331,11 @@ async function assertValidGitDirs(gitDirs: readonly string[]): Promise<void> {
     try {
       real = await realpath(dir);
     } catch (err) {
-      throw new CanKanError(ErrorCodes.USAGE, "Every gitDirs entry must be an existing, canonical path", {
-        cause: err,
-      });
+      throw new CanKanError(
+        ErrorCodes.USAGE,
+        "Every gitDirs entry must be an existing, canonical, and accessible path (fs.realpath failed)",
+        { cause: err },
+      );
     }
     if (real !== dir) {
       throw new CanKanError(ErrorCodes.USAGE, "Every gitDirs entry must already be canonical (fs.realpath'd)");
@@ -349,7 +407,11 @@ function isEnoent(err: unknown): boolean {
  * single guard `write()`, `remove()`, and `archive()` all funnel through
  * (see `openTicketStore`'s `guardWrite` closure) before touching the
  * filesystem, so the check lives in exactly one place instead of being
- * re-derived three times.
+ * re-derived three times. Returns the `realpath`'d `ticketsDir` (fix round
+ * 2, Minor 1) — the caller passes *that* value on to `writeTicket`/
+ * `removeTicket`/`archiveTicket`, never the original string, so the final
+ * path component this function just resolved cannot be swapped out from
+ * under the write that follows.
  *
  * `resolveBoard()`/`buildBoardRef` canonicalize and containment-check
  * `board.ticketsDir` once, at *resolve* time. Between then and this call,
@@ -366,17 +428,30 @@ function isEnoent(err: unknown): boolean {
  * canonical to canonical.
  *
  * **Stated honestly, not overclaimed: this narrows the TOCTOU window, it
- * does not close it.** The filesystem can still change between this
- * `realpath` call and the `rename`/`unlink`/`mkdir` call that runs after it
- * in the caller. What this closes is a `ticketsDir` that is *already*
- * unsafe at the moment this runs — the checked-in-symlink and hand-built-
- * `BoardRef` cases, neither of which requires winning a race at all.
+ * does not close it — and the window has real width, not just existence.**
+ * The filesystem can still change between this `realpath` call and the
+ * `rename`/`unlink`/`mkdir` call that runs after it in the caller. For
+ * `write()` that gap is small (an `open("wx")` immediately follows, on the
+ * now-fixed path returned above). For `remove()`/`archive()` it is
+ * materially larger: both call `getTicket()` next, which does a full,
+ * unbounded directory scan (`readdir`, then `stat`+`readFile`+parse *for
+ * every ticket-shaped entry*) before the `unlink`/`rename` that actually
+ * acts — measured by fix-round-2 security review, end to end
+ * (`archive()`): ~1.4ms at 1 ticket, ~4ms at 50, ~21ms at 500, linear in
+ * both ticket count and byte volume,
+ * both driven entirely by checked-in repository content. Passing the
+ * resolved path through (fix round 2, Minor 1) closes the specific
+ * *final-component* re-point this window would otherwise allow regardless
+ * of its width; what remains reachable inside the window is an *ancestor*
+ * directory swap, which requires winning a race, unlike the
+ * checked-in-symlink and hand-built-`BoardRef` cases this function closes
+ * outright with no race required at all.
  */
 async function assertTicketsDirContained(
   ticketsDir: string,
   boardRoot: string,
   gitDirs: readonly string[],
-): Promise<void> {
+): Promise<string> {
   let real: string;
   try {
     real = await realpath(ticketsDir);
@@ -387,11 +462,31 @@ async function assertTicketsDirContained(
   if (!isContained(boardRoot, real)) {
     throw unsafeTicketsDirError("resolves outside the board root");
   }
+  // Case-insensitive, unconditionally -- never gated on `process.platform`
+  // (fix round 2, Minor 3). `board/ref.ts`'s own
+  // `.git`-name check already adopts this convention, for a stated reason
+  // that applies just as much here: a checked-in `tickets_dir` must be
+  // judged the same way regardless of which platform later reads the repo
+  // (PLAN.md ships a win-x64 target), and macOS's default volume is
+  // case-insensitive. `gitCommonDir()` returns whatever casing `git`
+  // reports and `realpath` above returns whatever casing the filesystem
+  // hands back for `ticketsDir` -- on a case-insensitive volume those two
+  // could disagree in case while naming the same directory, and it was not
+  // possible to verify from this (Linux) host whether Darwin's `realpath`
+  // normalizes that away. Compared as-is *and* case-folded, refusing if
+  // either matches, rather than guessing: `isContained` itself is
+  // untouched (it is M2.4's, shared with board containment, and changing
+  // its semantics is out of scope here) -- the fold happens only in the
+  // two strings handed to it. Fail-closed: on an ordinary case-sensitive
+  // filesystem this can refuse a `ticketsDir` that merely *resembles* a
+  // git directory in a different case and is not actually the same one,
+  // which is vanishingly rare and safe to over-reject.
   for (const gitDir of gitDirs) {
-    if (isContained(gitDir, real)) {
+    if (isContained(gitDir, real) || isContained(gitDir.toLowerCase(), real.toLowerCase())) {
       throw unsafeTicketsDirError("resolves inside a git directory");
     }
   }
+  return real;
 }
 
 /**
@@ -541,6 +636,29 @@ async function atomicWriteFile(targetPath: string, content: string): Promise<voi
 // ---- list() ---------------------------------------------------------------
 
 /**
+ * `readdir(ticketsDir, { withFileTypes: true })`, wrapped (fix round 2,
+ * Minor 4 — pre-existing 1A gap, surfaced by security review): a directory
+ * that stats fine (`assertTicketsDirUsable` already ran) can still fail to
+ * `readdir` — `chmod 0o111` on `ticketsDir` reproduces this directly,
+ * `stat` succeeding (search permission is enough) while `readdir` fails
+ * `EACCES` (read permission is not) — and an un-wrapped platform error
+ * would escape as a raw, untyped `Error`, invisible to `isCanKanError`/
+ * M3.10's exit-code map, and would print the absolute path every error
+ * builder in this module otherwise withholds. Mirrors
+ * `assertTicketsDirUsable`'s own ENOENT/other split, one call site
+ * downstream, so both of this module's `readdir` call sites share it
+ * rather than each re-deriving the wrap.
+ */
+async function readTicketsDirEntries(ticketsDir: string): Promise<Dirent[]> {
+  try {
+    return await readdir(ticketsDir, { withFileTypes: true });
+  } catch (err) {
+    if (isEnoent(err)) throw ticketsDirMissingError();
+    throw ticketsDirUnavailableError(err);
+  }
+}
+
+/**
  * `Dirent.isFile()` from `readdir(dir, { withFileTypes: true })` is
  * `lstat`-based — confirmed by execution, not assumed — so it is `false`
  * for a symlink even when the symlink's target is a regular file. Skipping
@@ -565,7 +683,7 @@ async function atomicWriteFile(targetPath: string, content: string): Promise<voi
  */
 async function listTickets(ticketsDir: string): Promise<ListTicketsResult> {
   await assertTicketsDirUsable(ticketsDir);
-  const entries = await readdir(ticketsDir, { withFileTypes: true });
+  const entries = await readTicketsDirEntries(ticketsDir);
   const tickets: StoredTicket[] = [];
   const skipped: SkippedTicket[] = [];
 
@@ -641,7 +759,7 @@ async function getTicket(ticketsDir: string, lookup: string): Promise<StoredTick
  * real fixture file entirely.
  */
 async function findExistingPathsById(ticketsDir: string, id: string): Promise<string[]> {
-  const entries = await readdir(ticketsDir, { withFileTypes: true });
+  const entries = await readTicketsDirEntries(ticketsDir);
   const key = normalizeTicketIdForComparison(id);
   const matches: string[] = [];
   for (const entry of entries) {

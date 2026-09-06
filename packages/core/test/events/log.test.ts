@@ -7,6 +7,7 @@ import {
   append,
   appendCore,
   type AppendHooks,
+  type AppendOptions,
   type EventCandidate,
   read,
 } from "../../src/events/log";
@@ -1601,11 +1602,22 @@ describe("append — expectedParent (M2.10 slice 0)", () => {
 
     // A competing writer moves the tip out from under `staleTip`.
     await append(adapter, COORD_REF, claim("ck-competitor"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    const currentTip = await adapter.readRef(COORD_REF);
 
-    await expectCode(
-      append(adapter, COORD_REF, claim("ck-mine"), { now: SEPT_15_MS, casRetry: FAST_RETRY, expectedParent: staleTip }),
-      EventErrorCodes.EVENT_APPEND_STALE_PARENT,
-    );
+    try {
+      await append(adapter, COORD_REF, claim("ck-mine"), { now: SEPT_15_MS, casRetry: FAST_RETRY, expectedParent: staleTip });
+      throw new Error("expected append() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_APPEND_STALE_PARENT);
+      // Fix round 4, finding 4: the *values* inside `details`, not just the
+      // code — a regression that swapped which SHA goes into
+      // `expectedParent` versus `actualParent` would pass a code-only
+      // assertion.
+      expect(error.details?.ref).toBe(COORD_REF);
+      expect(error.details?.expectedParent).toBe(staleTip);
+      expect(error.details?.actualParent).toBe(currentTip);
+    }
 
     // The log holds exactly the competitor's event and the seed — not the
     // rejected `ck-mine` — proving the throw happened before any write.
@@ -1653,16 +1665,33 @@ describe("append — expectedParent (M2.10 slice 0)", () => {
     let sleeps = 0;
     const countingRetry = { backoffMs: () => 0, sleep: async () => { sleeps += 1; }, maxAttempts: 50 };
 
-    await expectCode(
-      appendCore(
+    try {
+      await appendCore(
         adapter,
         COORD_REF,
         claim("ck-mine"),
         { now: SEPT_15_MS, casRetry: countingRetry, expectedParent: correctTip },
         hooks,
-      ),
-      EventErrorCodes.EVENT_APPEND_STALE_PARENT,
-    );
+      );
+      throw new Error("expected appendCore() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_APPEND_STALE_PARENT);
+      // Fix round 4, finding 4: assert the `details` values at this — the
+      // *second* — throw site too, not only the code.
+      expect(error.details?.ref).toBe(COORD_REF);
+      expect(error.details?.expectedParent).toBe(correctTip);
+      // The interloper's commit is what actually rejected this attempt, so
+      // the best-effort re-read reports the interloper's tip, not
+      // `correctTip` and not `null`.
+      const interloperTip = await adapter.readRef(COORD_REF);
+      expect(error.details?.actualParent).toBe(interloperTip);
+      expect(error.details?.actualParent).not.toBe(correctTip);
+      // Fix round 4, finding 2: the read succeeded, so this must be `false`
+      // — a caller must be able to trust `actualParentUnread` to mean
+      // exactly "this read failed," not merely be present.
+      expect(error.details?.actualParentUnread).toBe(false);
+    }
 
     // Exactly 1, not merely "at most 1": proves the commit-rejection path
     // was genuinely exercised (a silently-hoisted or skipped check would
@@ -1757,5 +1786,107 @@ describe("append — expectedParent (M2.10 slice 0)", () => {
       append(adapter, COORD_REF, claim("ck-1"), { expectedParent: "not-a-sha" as unknown as RefSha }),
       EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
     );
+  });
+
+  test("a getter-based expectedParent that flips its return value after the first read cannot bypass the check (fix round 4, finding 1)", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    await append(adapter, COORD_REF, claim("ck-seed"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    const staleTip = await adapter.readRef(COORD_REF);
+    if (staleTip === null) {
+      throw new Error("expected the seeded ref to already exist");
+    }
+
+    // A competing writer moves the tip out from under `staleTip`.
+    await append(adapter, COORD_REF, claim("ck-competitor"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    let reads = 0;
+    const options = {
+      now: SEPT_15_MS,
+      casRetry: FAST_RETRY,
+      // Returns the real (now-stale) tip on its first invocation, and
+      // `undefined` — "no check requested" — on every one after that.
+      // Before this file snapshotted the option to a local and validated
+      // *that* local, `validateExpectedParent` consumed one read and the
+      // retry loop's own, separate, later read of `options.expectedParent`
+      // got the flipped `undefined`, bypassing the check entirely — the
+      // exact PoC a security reviewer landed against this seam.
+      get expectedParent() {
+        reads += 1;
+        return reads === 1 ? staleTip : undefined;
+      },
+    };
+
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-x"), options as unknown as AppendOptions),
+      EventErrorCodes.EVENT_APPEND_STALE_PARENT,
+    );
+
+    // Exactly one: `expectedParent` is read from `options` once, validated,
+    // and reused from that single snapshot everywhere else this call needs
+    // it — never independently re-read from the caller's object.
+    expect(reads).toBe(1);
+
+    const records = await read(adapter, COORD_REF, { now: SEPT_15_MS });
+    const tickets = records.map((r) => r.event.ticket as string).sort();
+    expect(tickets).toEqual(["ck-competitor", "ck-seed"]);
+  });
+
+  test("actualParentUnread distinguishes a failed re-read from a genuinely absent ref (fix round 4, finding 2)", async () => {
+    const repo = await tempRepo();
+    const realAdapter = await createGitAdapter(repo.dir);
+
+    await append(realAdapter, COORD_REF, claim("ck-seed"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+    const correctTip = await realAdapter.readRef(COORD_REF);
+    if (correctTip === null) {
+      throw new Error("expected the seeded ref to already exist");
+    }
+
+    let readRefCalls = 0;
+    const wrappedAdapter: GitAdapter = {
+      ...realAdapter,
+      readRef: async (ref: string) => {
+        readRefCalls += 1;
+        // The first call is this attempt's own fresh read at the top of
+        // the loop (must succeed, so the mismatch check passes and the
+        // attempt reaches `commitTreeToRef`); the second is the
+        // best-effort re-read inside the CAS-rejection branch this test
+        // targets — forced to fail to prove `actualParentUnread`
+        // distinguishes "the read failed" from a genuinely absent ref
+        // (`actualParent: null` with no read failure).
+        if (readRefCalls === 2) {
+          throw new Error("simulated unreadable ref");
+        }
+        return realAdapter.readRef(ref);
+      },
+    };
+
+    const hooks: AppendHooks = {
+      beforeCas: async () => {
+        // Force this attempt's `commitTreeToRef` to lose the race, driving
+        // execution into the CAS-rejection branch whose best-effort
+        // `readRef` is under test.
+        await append(realAdapter, COORD_REF, claim("ck-interloper"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+      },
+    };
+
+    try {
+      await appendCore(
+        wrappedAdapter,
+        COORD_REF,
+        claim("ck-mine"),
+        { now: SEPT_15_MS, casRetry: FAST_RETRY, expectedParent: correctTip },
+        hooks,
+      );
+      throw new Error("expected appendCore() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_APPEND_STALE_PARENT);
+      expect(error.details?.actualParent).toBeNull();
+      expect(error.details?.actualParentUnread).toBe(true);
+    }
+
+    expect(readRefCalls).toBe(2);
   });
 });

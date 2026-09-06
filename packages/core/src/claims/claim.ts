@@ -206,8 +206,74 @@ async function snapshotBoard(ctx: ClaimContext): Promise<BoardSnapshot> {
 // Ticket resolution — id/displayId only, ambiguity checked first
 // ============================================================================
 
+/**
+ * The same terminal-hostile code points `events/schema.ts`'s
+ * `refineActorIdShape`/`refineTicketIdShape` and `ticket/filename.ts`'s
+ * `isUnsafeFilenameChar` already treat as unsafe: ASCII control characters
+ * (including NUL/DEL) and the Unicode bidirectional-formatting/zero-width
+ * set (LRE/RLE/PDF/LRO/RLO, directional isolates, zero-width
+ * space/joiners/non-joiner, the BOM). Neither helper is exported from its
+ * module (both are file-private), and this dispatch's file list does not
+ * include either module, so the set is duplicated here rather than
+ * imported — see `resolveTicket`'s doc comment on `sanitizeTicketQueryForEcho`
+ * for why a set, not a rejection, is what this call site needs.
+ */
+const ECHO_UNSAFE_CODE_POINTS = new Set([
+  0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067,
+  0x2068, 0x2069, 0xfeff,
+]);
+
+function isAsciiControlOrDel(code: number): boolean {
+  return code <= 31 || code === 127;
+}
+
+/** Matches `ticketSchema`'s `.max(200)` bound (`events/schema.ts`) — the shape a ticket id off the shared coordination ref is already held to. */
+const ECHO_MAX_CHARS = 200;
+
+/**
+ * Fix round 4, finding 5 (ruling): `resolveTicket` echoes the caller's raw
+ * `ticket` query into both the thrown message and `details` for
+ * `CLAIM_TICKET_NOT_FOUND`/`CLAIM_TICKET_AMBIGUOUS` — a deliberate,
+ * disclosed deviation from every sibling validator in `events/log.ts`
+ * (`validateTicketFilter`, `validateSince`), which withhold the raw value
+ * on principle. Withholding it here too would make "ticket not found"
+ * unable to say *what* was not found — a genuinely worse error for this
+ * module's primary user-facing failure. The ruling: keep the echo, bound
+ * it, because "it is the user's own CLI argument" will not stay true
+ * (`claim --next`, M2.12, selects the id from board state; `--board all`,
+ * M6.10, addresses tickets as `<repo>:<id>` with the repo half from the
+ * registry) and this string is destined for a terminal and for `--json`,
+ * where this repo already treats terminal safety as real.
+ *
+ * Iterates by Unicode code point (`for...of`, not index/`.slice`, which
+ * would risk splitting a surrogate pair), strips first, then truncates —
+ * stripping only ever removes characters, so it cannot create a new
+ * surrogate-pair split for the truncation step to worry about. The
+ * *matching* logic (`normalizeTicketIdForComparison`, above) never sees
+ * this sanitized value — only the echo does; a hostile control character
+ * stripped for display must not change which ticket, if any, this
+ * function resolves.
+ */
+function sanitizeTicketQueryForEcho(ticketQuery: string): string {
+  let stripped = "";
+  for (const ch of ticketQuery) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (isAsciiControlOrDel(code) || ECHO_UNSAFE_CODE_POINTS.has(code)) continue;
+    stripped += ch;
+  }
+  let truncated = "";
+  let count = 0;
+  for (const ch of stripped) {
+    if (count >= ECHO_MAX_CHARS) break;
+    truncated += ch;
+    count += 1;
+  }
+  return truncated;
+}
+
 function resolveTicket(state: BoardState, ticketQuery: string): TicketState {
   const key = normalizeTicketIdForComparison(ticketQuery);
+  const safeTicketQuery = sanitizeTicketQueryForEcho(ticketQuery);
   // Ruling D1: an id excluded from `state.tickets` because more than one
   // on-disk file declares it must never be read as "not found" — that
   // would fail OPEN on the exact mutual-exclusion primitive this module
@@ -216,8 +282,8 @@ function resolveTicket(state: BoardState, ticketQuery: string): TicketState {
   if (state.duplicateTicketIds.some((d) => d.ticketId === key)) {
     throw new CanKanError(
       ClaimErrorCodes.TICKET_AMBIGUOUS,
-      `ticket "${ticketQuery}" is ambiguous: more than one on-disk ticket file declares this id`,
-      { details: { ticket: ticketQuery } },
+      `ticket "${safeTicketQuery}" is ambiguous: more than one on-disk ticket file declares this id`,
+      { details: { ticket: safeTicketQuery } },
     );
   }
   // Ruling (this module): resolve by `id` and `displayId` ONLY — never by
@@ -228,8 +294,8 @@ function resolveTicket(state: BoardState, ticketQuery: string): TicketState {
     return t.displayId !== undefined && normalizeTicketIdForComparison(t.displayId) === key;
   });
   if (match === undefined) {
-    throw new CanKanError(ClaimErrorCodes.TICKET_NOT_FOUND, `no ticket found matching "${ticketQuery}"`, {
-      details: { ticket: ticketQuery },
+    throw new CanKanError(ClaimErrorCodes.TICKET_NOT_FOUND, `no ticket found matching "${safeTicketQuery}"`, {
+      details: { ticket: safeTicketQuery },
     });
   }
   return match;

@@ -504,6 +504,53 @@ describe("claim — rejection paths", () => {
     });
   });
 
+  // Fix round 4, finding 5 (ruling): `resolveTicket` echoes the raw `ticket`
+  // query into both the thrown message and `details` — deliberately kept
+  // (unlike every sibling validator in `events/log.ts`, which withholds the
+  // raw value on principle), but bounded: control characters and Unicode
+  // bidi/zero-width overrides are stripped before either destination ever
+  // sees the value, the same standard `events/schema.ts`'s
+  // `refineActorIdShape`/`refineTicketIdShape` and `ticket/filename.ts`'s
+  // `isUnsafeFilenameChar` already hold ticket/actor ids to.
+  test("a control character and a bidi override in the ticket query are neutralized in both the message and details -> CLAIM_TICKET_NOT_FOUND", async () => {
+    await withTestBoard(async ({ board }) => {
+      // `\x07` (BEL, an ASCII control character) and `\u202e` (RIGHT-TO-LEFT
+      // OVERRIDE, a Unicode bidi-formatting code point — written as an
+      // escape, not the literal glyph, so this file's own text stays
+      // left-to-right) — neither ticket matches anything on this board, so
+      // this reaches `CLAIM_TICKET_NOT_FOUND` regardless of sanitization.
+      const hostileTicket = "ck-\x07nope\u202e";
+      const error = await expectCode(
+        claim({ board, ticket: hostileTicket, actor: actorId("actor-x8"), now: NOW }),
+        ClaimErrorCodes.TICKET_NOT_FOUND,
+      );
+      expect(error.details?.ticket).toBe("ck-nope");
+      expect(error.message).toContain("ck-nope");
+      expect(error.message).not.toContain("\x07");
+      expect(error.message).not.toContain("\u202e");
+      expect(error.details?.ticket as string).not.toContain("\x07");
+      expect(error.details?.ticket as string).not.toContain("\u202e");
+    });
+  });
+
+  // Fix round 4, finding 5 (ruling), the other half of "bound it": the
+  // echoed ticket is also truncated to `ticketSchema`'s `.max(200)` bound
+  // (`events/schema.ts`) before it reaches either the message or `details`.
+  test("an over-length ticket query is truncated to 200 characters in both the message and details -> CLAIM_TICKET_NOT_FOUND", async () => {
+    await withTestBoard(async ({ board }) => {
+      const overLongTicket = "x".repeat(300);
+      const error = await expectCode(
+        claim({ board, ticket: overLongTicket, actor: actorId("actor-x9"), now: NOW }),
+        ClaimErrorCodes.TICKET_NOT_FOUND,
+      );
+      const echoedTicket = error.details?.ticket as string;
+      expect(echoedTicket.length).toBe(200);
+      expect(echoedTicket).toBe("x".repeat(200));
+      expect(error.message).toContain("x".repeat(200));
+      expect(error.message).not.toContain("x".repeat(201));
+    });
+  });
+
   test("already held by another actor -> CLAIM_REJECTED / already-held", async () => {
     await withTestBoard(async ({ board }) => {
       await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-held7", "Held")]);

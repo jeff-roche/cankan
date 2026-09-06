@@ -260,55 +260,63 @@ test("a ticket renewed underneath the sweep is skipped, and the sweep still expi
 // ============================================================================
 
 describe("expireStale — the observation-store failure disposition (distinct from a per-ticket skip)", () => {
-  test("a discard failure hard-throws EVENT_OBSERVATION_STORE_UNAVAILABLE, tagged appended:true, with the expire already in the log", async () => {
-    await withTestBoard(async ({ board }) => {
-      await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-sweep-storefail", "Store failure")]);
-      const actor = actorId("actor-sweep-storefail");
-      const adapter = await createGitAdapter(board.root);
-      const boardKey = await boardKeyFor(adapter);
+  // Root bypasses a directory's write-permission bit entirely, so the
+  // EACCES this rig depends on never fires under uid 0 — the same guard
+  // `events/observations.test.ts` applies to its own `chmod`-based
+  // unwritable-store rigs (that file's own comment: "chmod does not
+  // restrict" a root run).
+  test.skipIf(process.getuid?.() === 0)(
+    "a discard failure hard-throws EVENT_OBSERVATION_STORE_UNAVAILABLE, tagged appended:true, with the expire already in the log",
+    async () => {
+      await withTestBoard(async ({ board }) => {
+        await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-sweep-storefail", "Store failure")]);
+        const actor = actorId("actor-sweep-storefail");
+        const adapter = await createGitAdapter(board.root);
+        const boardKey = await boardKeyFor(adapter);
 
-      const claimed = await claim({ board, ticket: "ck-sweep-storefail", actor, now: NOW });
-      const sweepNow = NOW + LEASE_TTL_MS + 1;
+        const claimed = await claim({ board, ticket: "ck-sweep-storefail", actor, now: NOW });
+        const sweepNow = NOW + LEASE_TTL_MS + 1;
 
-      // The observation store's boardHash directory already exists by the
-      // time `beforeAppend` fires (created by `claim()`'s own `observe()`
-      // call above, and re-touched by the sweep's own candidate-selection
-      // fold) -- locking it down here, right before the append, blocks only
-      // the DISCARD step that follows the append, not the fold that
-      // preceded it.
-      const dir = dirname(recordPath(boardKey, claimed.eventId));
-      const hooks: ExpireStaleHooks = {
-        beforeAppend: async () => {
-          await chmod(dir, 0o500);
-        },
-      };
+        // The observation store's boardHash directory already exists by the
+        // time `beforeAppend` fires (created by `claim()`'s own `observe()`
+        // call above, and re-touched by the sweep's own candidate-selection
+        // fold) -- locking it down here, right before the append, blocks
+        // only the DISCARD step that follows the append, not the fold that
+        // preceded it.
+        const dir = dirname(recordPath(boardKey, claimed.eventId));
+        const hooks: ExpireStaleHooks = {
+          beforeAppend: async () => {
+            await chmod(dir, 0o500);
+          },
+        };
 
-      try {
-        const sweeper = actorId("actor-sweeper-storefail");
-        const error = await expectCode(
-          expireStaleCore({ board, actor: sweeper, now: sweepNow }, hooks),
-          EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
-        );
-        expect(error.details?.appended).toBe(true);
-      } finally {
-        // Restore before `withEnv`'s own cleanup tries to remove the temp
-        // `$XDG_STATE_HOME` tree -- a directory left read-only would make
-        // that recursive removal fail too.
-        await chmod(dir, 0o700);
-      }
+        try {
+          const sweeper = actorId("actor-sweeper-storefail");
+          const error = await expectCode(
+            expireStaleCore({ board, actor: sweeper, now: sweepNow }, hooks),
+            EventErrorCodes.EVENT_OBSERVATION_STORE_UNAVAILABLE,
+          );
+          expect(error.details?.appended).toBe(true);
+        } finally {
+          // Restore before `withEnv`'s own cleanup tries to remove the temp
+          // `$XDG_STATE_HOME` tree -- a directory left read-only would make
+          // that recursive removal fail too.
+          await chmod(dir, 0o700);
+        }
 
-      // The terminator genuinely landed despite the cleanup failure -- an
-      // `expire` event is in the log.
-      const records = await read(adapter, board.coordinationRef, { now: sweepNow });
-      const expireRecord = records.find((r) => r.event.event === "expire" && r.event.ticket === "ck-sweep-storefail");
-      expect(expireRecord).toBeDefined();
+        // The terminator genuinely landed despite the cleanup failure -- an
+        // `expire` event is in the log.
+        const records = await read(adapter, board.coordinationRef, { now: sweepNow });
+        const expireRecord = records.find((r) => r.event.event === "expire" && r.event.ticket === "ck-sweep-storefail");
+        expect(expireRecord).toBeDefined();
 
-      // ...but the discard never completed -- the record leaked, exactly
-      // the failure ADR 0001 failure mode 7 requires this module to report
-      // loudly rather than shrug off.
-      expect(await firstSeen(boardKey, claimed.eventId)).not.toBeNull();
-    });
-  });
+        // ...but the discard never completed -- the record leaked, exactly
+        // the failure ADR 0001 failure mode 7 requires this module to
+        // report loudly rather than shrug off.
+        expect(await firstSeen(boardKey, claimed.eventId)).not.toBeNull();
+      });
+    },
+  );
 });
 
 // ============================================================================

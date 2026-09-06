@@ -1398,3 +1398,74 @@ describe("the fm10 ref gate — append/read/initRef all reject a ref outside ref
     expect(mainShaAfter).toBe(mainShaBefore);
   });
 });
+
+// ============================================================================
+// Fix round 3, Ruling R48 (High, orchestrator security review): a blocked
+// `events` prefix must fail closed, not silently read as an empty board
+// ============================================================================
+
+/** Raw plumbing with stdin, for planting a blob whose content doesn't matter — only its mode and path. */
+function rawGitStdin(cwd: string, args: string[], stdin: Buffer): string {
+  const result = Bun.spawnSync(["git", ...args], { cwd, stdin, stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} (cwd=${cwd}) failed:\n${result.stderr.toString()}`);
+  }
+  return result.stdout.toString();
+}
+
+/** Replaces the coordination ref's entire tree with one containing a single entry at `cacheinfo` (`"<mode>,<sha>,<path>"`) — real plumbing, real commit, on top of whatever the ref currently points to. */
+async function plantAtEventsPrefix(adapter: GitAdapter, repoDir: string, cacheinfo: string): Promise<void> {
+  rawGit(repoDir, ["read-tree", "--empty"]);
+  rawGit(repoDir, ["update-index", "--add", "--cacheinfo", cacheinfo]);
+  const treeSha = rawGit(repoDir, ["write-tree"]).trim();
+  const parent = await adapter.readRef(COORD_REF);
+  if (parent === null) throw new Error("expected an existing ref to plant onto");
+  const commitSha = rawGit(repoDir, ["commit-tree", "-p", parent, "-m", "plant", treeSha]).trim();
+  rawGit(repoDir, ["update-ref", COORD_REF, commitSha]);
+}
+
+describe("read — fix round 3, Ruling R48: a blocked events prefix fails closed, not open", () => {
+  test("a blob planted at the bare `events` path makes read() throw, not silently return []", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    const blobSha = rawGitStdin(repo.dir, ["hash-object", "-w", "--stdin"], Buffer.from("not a directory")).trim();
+    await plantAtEventsPrefix(adapter, repo.dir, `100644,${blobSha},events`);
+
+    // Before the fix: this silently returned `[]` — alice's real claim
+    // vanished from the result with no error at all.
+    await expectCode(read(adapter, COORD_REF, { now: SEPT_15_MS }), EventErrorCodes.EVENT_LOG_EVENTS_PREFIX_BLOCKED);
+  });
+
+  test("a symlink planted at the bare `events` path also fails closed (mode 120000 shares GIT_BLOB_AMBIGUOUS with a healthy directory)", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    const blobSha = rawGitStdin(repo.dir, ["hash-object", "-w", "--stdin"], Buffer.from("/etc/passwd")).trim();
+    await plantAtEventsPrefix(adapter, repo.dir, `120000,${blobSha},events`);
+
+    await expectCode(read(adapter, COORD_REF, { now: SEPT_15_MS }), EventErrorCodes.EVENT_LOG_EVENTS_PREFIX_BLOCKED);
+  });
+
+  test("a gitlink planted at the bare `events` path also fails closed (mode 160000 shares GIT_BLOB_AMBIGUOUS with a healthy directory)", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    const fakeSubmoduleSha = "a".repeat(40);
+    await plantAtEventsPrefix(adapter, repo.dir, `160000,${fakeSubmoduleSha},events`);
+
+    await expectCode(read(adapter, COORD_REF, { now: SEPT_15_MS }), EventErrorCodes.EVENT_LOG_EVENTS_PREFIX_BLOCKED);
+  });
+
+  test("control: a healthy events directory is unaffected — read() succeeds normally", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    const records = await read(adapter, COORD_REF, { now: SEPT_15_MS });
+    expect(records.map((r) => r.event.ticket as string)).toEqual(["ck-1"]);
+  });
+});

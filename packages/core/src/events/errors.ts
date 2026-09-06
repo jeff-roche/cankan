@@ -176,6 +176,28 @@ export const EventErrorCodes = {
    */
   EVENT_LOG_DUPLICATE_ID_CONFLICT: "EVENT_LOG_DUPLICATE_ID_CONFLICT",
   /**
+   * `read()` found the top-level `events` path does not resolve to a usable
+   * directory — a blob, symlink, or gitlink is planted there instead of the
+   * tree every `events/<yyyy-mm>.jsonl` month file lives under (fix round 3,
+   * Ruling R48, High — orchestrator security review). Without this check,
+   * `readBlobFromRef(ref, "events/<month>.jsonl")` for *every* month in the
+   * aggregation window returns `null` — "no file for this month" —
+   * indistinguishable from a genuinely empty board, since `ls-tree` simply
+   * finds no entry under a prefix that isn't a directory. `read()` would
+   * silently return `[]`, every live claim vanishing from its result — ADR
+   * failure mode 8(b) named literally: "a genuine read failure being
+   * misread as 'not found' … a silently-granted double-claim." Confirmed by
+   * direct probe that a blob, a symlink (mode `120000`), and a gitlink
+   * (mode `160000`) all reproduce this fail-open identically. `details`
+   * carries the ref, the already-resolved `commit`, the blocked path, and a
+   * `remediation` naming the manual tree-rebuild steps (the same pattern
+   * `EVENT_RECOVERY_QUARANTINE_BLOCKED` already establishes for the
+   * analogous `quarantine/` prefix) — this module cannot safely replace the
+   * entry itself, since doing so would discard whatever is nested under it
+   * with no audit trail.
+   */
+  EVENT_LOG_EVENTS_PREFIX_BLOCKED: "EVENT_LOG_EVENTS_PREFIX_BLOCKED",
+  /**
    * `initRef()`'s single re-read after a lost `parent: null` race still
    * found the ref absent. Not part of the two-process contention this phase
    * targets (a rejection there means "someone else's write already

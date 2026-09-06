@@ -17,9 +17,9 @@
  */
 
 import { monotonicFactory } from "ulid";
-import { CanKanError } from "../errors";
+import { CanKanError, isCanKanError } from "../errors";
 import type { CasRetryOptions, GitAdapter } from "../git/index";
-import { validateCoordinationRef, withCasRetry } from "../git/index";
+import { GitErrorCodes, validateCoordinationRef, withCasRetry } from "../git/index";
 import { EventErrorCodes } from "./errors";
 import { canonicalizeTicketId, isValidEventId, parseEvent } from "./schema";
 import type { Event, EventId, EventValidationIssue } from "./schema";
@@ -363,6 +363,85 @@ function trailingMonthKeysOldestFirst(nowMs: number, trailingMonths: number): st
 
 function monthPath(month: string): string {
   return `events/${month}.jsonl`;
+}
+
+/** The top-level directory every `monthPath` lives under — see `assertEventsPrefixUsable`'s doc comment. */
+const EVENTS_PREFIX = "events";
+
+/**
+ * Fix round 3 (Ruling R48, High, orchestrator security review): probes the
+ * `events` prefix itself before `read()` trusts *any* per-month read.
+ *
+ * **The gap this closes.** `readBlobFromRef(ref, "events/<month>.jsonl")`
+ * returns `null` — "no file for this month, not an error" — when a blob,
+ * symlink, or gitlink is planted at the bare `events` path instead of a
+ * real directory: `ls-tree` simply finds no entry under a prefix that
+ * isn't a directory. Every month in the aggregation window silently reads
+ * as absent, `read()` returns `[]`, and every live claim vanishes from its
+ * result with no error at all — ADR failure mode 8(b) named literally: "a
+ * genuine read failure being misread as 'not found' … a silently-granted
+ * double-claim." Confirmed by direct probe (real `update-index
+ * --cacheinfo`) that a blob, a symlink (mode `120000`), and a gitlink
+ * (mode `160000`) all reproduce this identically.
+ *
+ * **Discriminating the three planted shapes from the one healthy shape.**
+ * A real blob makes `readBlobFromRef` return its content directly (a
+ * non-null string, no throw) — blocked. A directory, a symlink, or a
+ * gitlink at the exact path all make `readBlobFromRef` throw
+ * `GIT_BLOB_AMBIGUOUS` (the adapter's own `mode === "100644"` check does
+ * not distinguish *which* non-blob shape it found) — but only a directory
+ * (`details.mode === "040000"`) is healthy; a symlink or gitlink at this
+ * exact path is a hostile plant with the identical error code and must not
+ * be treated the same as the healthy case. `recovery.ts`'s
+ * `isTreeEntryBlocked` implements the identical discrimination for its own
+ * `quarantine/` prefix — copied here, not imported, for the same
+ * "different file, same ownership boundary" reason this file's own header
+ * already documents for `ref.ts`'s copies of its helpers (this function
+ * predates any shared home for the logic, and `recovery.ts` already
+ * imports real bounds from this file per Ruling R42 — the reverse
+ * direction, this file depending on `recovery.ts`, would invert that
+ * dependency for no benefit).
+ *
+ * **This module cannot repair the blocked path itself** — replacing the
+ * entry would discard whatever is nested under it with no audit trail,
+ * the same reasoning `recovery.ts`'s own blocked-quarantine-path handling
+ * already applies. Throws rather than reports, unlike `recovery.ts`'s
+ * `diagnose()` (this is `read()`'s own fail-closed obligation, not a
+ * non-aborting diagnostic).
+ */
+async function isEventsPrefixBlocked(adapter: GitAdapter, validatedRef: string): Promise<boolean> {
+  let existing: string | null;
+  try {
+    existing = await adapter.readBlobFromRef(validatedRef, EVENTS_PREFIX);
+  } catch (cause) {
+    if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
+      const mode = cause.details?.mode;
+      // Only a genuine directory (`040000`) is healthy — a symlink
+      // (`120000`), a gitlink (`160000`), or any other shape sharing this
+      // same error code is fail-closed as blocked, not positively confirmed
+      // healthy.
+      return !(typeof mode === "string" && mode === "040000");
+    }
+    throw cause;
+  }
+  return existing !== null; // A real blob (non-null content, no throw) is blocked.
+}
+
+async function assertEventsPrefixUsable(adapter: GitAdapter, validatedRef: string, head: string): Promise<void> {
+  if (await isEventsPrefixBlocked(adapter, validatedRef)) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_LOG_EVENTS_PREFIX_BLOCKED,
+      `the top-level "${EVENTS_PREFIX}" path does not resolve to a usable directory (a file, symlink, or gitlink is planted there instead); refusing to read any month file underneath it`,
+      {
+        details: {
+          ref: validatedRef,
+          commit: head,
+          path: EVENTS_PREFIX,
+          remediation: `inspect the tree (e.g. \`git ls-tree ${validatedRef}\`) and rebuild it (git read-tree / git rm --cached ${EVENTS_PREFIX} / commit-tree / update-ref) to remove the entry planted at "${EVENTS_PREFIX}"`,
+        },
+      },
+    );
+  }
 }
 
 // ============================================================================
@@ -1202,6 +1281,11 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
   if (head === null) {
     return [];
   }
+
+  // Fix round 3 (Ruling R48, High): probe the `events` prefix once, before
+  // trusting any per-month read below — see `assertEventsPrefixUsable`'s
+  // doc comment for the fail-open this closes.
+  await assertEventsPrefixUsable(adapter, validatedRef, head);
 
   const months = trailingMonthKeysOldestFirst(now, trailingMonths);
 

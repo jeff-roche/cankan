@@ -255,6 +255,16 @@ function monthPath(month: string): string {
 }
 
 /**
+ * Fix round 3 (Ruling R48, orchestrator security review, High): the
+ * top-level directory every `monthPath` lives under. `computeDiagnosticReport`
+ * probes this exact path before trusting *any* per-month read — see that
+ * function's own doc comment and {@link isTreeEntryBlocked} for why a
+ * blocked `events` prefix is otherwise invisible to both `read()` and
+ * `diagnose()`.
+ */
+const EVENTS_PREFIX = "events";
+
+/**
  * The quarantine audit directory for one month — `quarantine/<yyyy-mm>/`.
  * **Deliberately a different top-level directory than `events/`**, which is
  * what makes requirement 9 ("`read()` does not treat the quarantine file as
@@ -723,7 +733,8 @@ export type DiagnosticFailureReason =
   | "non-blob-month-path"
   | "blob-too-large"
   | "aggregate-too-large"
-  | "diagnostic-truncated";
+  | "diagnostic-truncated"
+  | "events-prefix-blocked";
 
 /**
  * One failing line (or, for the month-level reasons, one failing month)
@@ -770,7 +781,7 @@ export interface DiagnosticFailure {
   readonly lineSha256?: string;
   readonly linePreview?: string;
   readonly possiblyLossy?: boolean;
-  /** Only for `"duplicate-id-conflict"` — the id both occurrences share, and where the *first* (surviving) occurrence was found. */
+  /** Only for `"duplicate-id-conflict"` — the id both occurrences share, and where the *other* (earlier-encountered, in walk order — not "surviving": fix round 3, Ruling R47, neither occurrence is preferred or removed automatically) occurrence was found. */
   readonly eventId?: EventId;
   readonly firstMonth?: string;
   readonly firstLine?: number;
@@ -848,6 +859,7 @@ interface PendingSpan {
   readonly startLine: number;
   endLine: number;
   readonly message: string;
+  readonly remediation?: string;
   readonly issues?: readonly EventValidationIssue[];
   readonly eventId?: EventId;
   readonly firstMonth?: string;
@@ -873,6 +885,47 @@ async function computeDiagnosticReport(
   trailingMonths: number,
 ): Promise<DiagnosticReport> {
   const months = trailingMonthKeysOldestFirst(now, trailingMonths);
+
+  // Fix round 3 (Ruling R48, High, orchestrator security review): probe the
+  // `events` prefix itself before trusting *any* per-month read below.
+  // `read()`'s (and, before this fix, this function's own) per-month
+  // `readBlobFromRef(ref, monthPath(month))` returns `null` — "no file for
+  // this month" — indistinguishable from a genuinely empty board, when a
+  // blob/symlink/gitlink is planted at the bare `events` path: `ls-tree`
+  // simply finds no entry under a prefix that isn't a directory. Every
+  // month silently reads as absent, `read()` returns `[]` (every live claim
+  // vanishes from its result, fail-*open*, ADR fm8(b) named literally), and
+  // this function previously reported zero failures — a diagnostic tool
+  // whose whole job is to find what `read()` cannot see, silently agreeing
+  // with the fail-open instead. One check, once per run, closes it: if
+  // `events` is blocked, no per-month read below could ever be trusted
+  // either, so this returns immediately with a single run-level failure
+  // rather than scanning months that would all misreport as empty.
+  // `month` is `DiagnosticFailure`'s one required-non-null coordinate with
+  // no genuine single month to name here — the newest month in this run's
+  // own window is used, nominally (there is nothing more specific to
+  // report; the real coordinate is the `events` path itself, named in the
+  // message and `remediation`).
+  if (await isTreeEntryBlocked(adapter, validatedRef, EVENTS_PREFIX)) {
+    const nominalMonth = months[months.length - 1] ?? "";
+    return {
+      ref: validatedRef,
+      commit: head,
+      monthsScanned: [],
+      failures: [
+        {
+          ref: validatedRef,
+          commit: head,
+          month: nominalMonth,
+          line: null,
+          reason: "events-prefix-blocked",
+          message: `the top-level "${EVENTS_PREFIX}" path does not resolve to a usable directory (a file, symlink, or gitlink is planted there instead); no event log month file underneath it can be read, and read() would otherwise silently treat the whole board as empty rather than fail closed`,
+          remediation: `inspect the tree (e.g. \`git ls-tree ${validatedRef}\`) and rebuild it (git read-tree / git rm --cached ${EVENTS_PREFIX} / commit-tree / update-ref) to remove the entry planted at "${EVENTS_PREFIX}"`,
+        },
+      ],
+    };
+  }
+
   const failures: DiagnosticFailure[] = [];
   const monthsScanned: string[] = [];
   // Keyed by event id, to the raw line it was first validly seen as, and
@@ -909,6 +962,7 @@ async function computeDiagnosticReport(
       lineSha256: span.lineSha256,
       linePreview: span.linePreview,
       possiblyLossy: span.possiblyLossy,
+      ...(span.remediation !== undefined ? { remediation: span.remediation } : {}),
       ...(span.issues !== undefined ? { issues: span.issues } : {}),
       ...(span.eventId !== undefined ? { eventId: span.eventId } : {}),
       ...(span.firstMonth !== undefined ? { firstMonth: span.firstMonth } : {}),
@@ -942,7 +996,7 @@ async function computeDiagnosticReport(
     reason: DiagnosticFailureReason,
     rawLine: string,
     message: string,
-    extra?: { issues?: readonly EventValidationIssue[]; eventId?: EventId; firstMonth?: string; firstLine?: number },
+    extra?: { remediation?: string; issues?: readonly EventValidationIssue[]; eventId?: EventId; firstMonth?: string; firstLine?: number },
   ): "ok" | "cap" | "budget" {
     if (pending !== null && pending.month === month && pending.reason === reason && pending.endLine === line - 1 && pending.rawLine === rawLine) {
       pending.endLine = line;
@@ -960,6 +1014,7 @@ async function computeDiagnosticReport(
       startLine: line,
       endLine: line,
       message,
+      remediation: extra?.remediation,
       issues: extra?.issues,
       eventId: extra?.eventId,
       firstMonth: extra?.firstMonth,
@@ -973,8 +1028,19 @@ async function computeDiagnosticReport(
     // cost to *embed* — capped at `MAX_QUARANTINE_RAW_BYTES_PER_RECORD`,
     // since `buildQuarantineRecord` will truncate to that cap regardless of
     // how much larger `lineBytes` itself is.
-    const cappedForBudget = Math.min(lineBytes, MAX_QUARANTINE_RAW_BYTES_PER_RECORD);
-    estimatedQuarantineBytes += cappedForBudget * QUARANTINE_ESCAPE_EXPANSION_FACTOR + QUARANTINE_RECORD_OVERHEAD_BYTES;
+    //
+    // Fix round 3 (Ruling R47): a `"duplicate-id-conflict"` span is never
+    // embedded in a quarantine record any more (removed from
+    // `FIXABLE_REASONS` — see that constant's doc comment), so charging it
+    // against this run's quarantine-write budget would only make an
+    // unrelated fixable line further in the same run truncate sooner than
+    // necessary, for a span that will never actually cost anything to
+    // write. Only a reason `buildQuarantineRecord` can actually be called
+    // for contributes.
+    if (FIXABLE_REASONS.has(reason)) {
+      const cappedForBudget = Math.min(lineBytes, MAX_QUARANTINE_RAW_BYTES_PER_RECORD);
+      estimatedQuarantineBytes += cappedForBudget * QUARANTINE_ESCAPE_EXPANSION_FACTOR + QUARANTINE_RECORD_OVERHEAD_BYTES;
+    }
     return estimatedQuarantineBytes > MAX_QUARANTINE_RUN_BUDGET_BYTES ? "budget" : "ok";
   }
 
@@ -1131,7 +1197,14 @@ async function computeDiagnosticReport(
         if (previous.rawLine === rawLine) {
           continue; // Byte-identical duplicate — folded, exactly as `read()` folds it.
         }
+        // Fix round 3 (Ruling R47, Critical NEW-1): **never** automatically
+        // remove either occurrence — see `FIXABLE_REASONS`'s doc comment
+        // for why "the earlier one wins" is not a safe default this tool
+        // can apply itself. `remediation` names both occurrences with
+        // enough coordinates for an operator to inspect and remove the
+        // forged one by hand.
         const status = recordLineFailure(month, line, "duplicate-id-conflict", rawLine, `duplicate event id with differing content: ${event.id}`, {
+          remediation: `two occurrences of event id ${event.id} carry differing content — this tool cannot safely determine which is genuine, so recovery never removes either automatically. Both lines remain in the log: inspect them by hand (\`git show ${validatedRef}:${monthPath(previous.month)}\` — line ${previous.line} — and \`git show ${validatedRef}:${monthPath(month)}\` — line ${line}), determine which is the forgery, then manually rebuild the ref's tree (git read-tree / git rm --cached / commit-tree / update-ref) to remove it. read() will keep refusing with EVENT_LOG_DUPLICATE_ID_CONFLICT until one of the two lines is gone.`,
           eventId: event.id,
           firstMonth: previous.month,
           firstLine: previous.line,
@@ -1140,7 +1213,7 @@ async function computeDiagnosticReport(
           pushTruncatedMarker(month, line, status === "cap" ? "count" : "budget");
           break monthsLoop;
         }
-        continue; // The first occurrence stays authoritative; only this later, differing one is flagged.
+        continue; // Neither occurrence is touched by this walk — both remain, unresolved, for an operator to inspect (Ruling R47).
       }
 
       seen.set(event.id, { rawLine, month, line });
@@ -1166,8 +1239,38 @@ async function computeDiagnosticReport(
  *
  * **Fix round 1, Critical 3 (Ruling R42): `"line-too-large"` is fixable** —
  * a single oversized line is exactly as removable as a schema-invalid one.
+ *
+ * **Fix round 3, Ruling R47 (Critical, orchestrator security review):
+ * `"duplicate-id-conflict"` is deliberately NOT in this set — it was fixable
+ * through fix round 2, and that was itself the defect.** The pre-fix code
+ * removed the *later* occurrence in **oldest-month-first walk order** and
+ * kept the *earlier* one, reasoning (wrongly) that "earlier in the
+ * append-only chain" meant "the honest original." It does not: which month
+ * a line lands in is chosen by the peer that writes it, not by this module,
+ * so an attacker forges a conflicting line into a month *before* the
+ * victim's real one — well within the default `trailingMonths: 2` window —
+ * and this walk finds the *forgery* first. Demonstrated end to end
+ * (`recovery.test.ts`, Ruling R47's test): alice's real claim at
+ * `2026-09:0`, mallory's differing `release` forged into `2026-08:0` under
+ * the same id; against the pre-fix code, `recover()` reported
+ * `outcome: "recovered"`, quarantined *alice's* claim, and kept mallory's
+ * forgery — `ck-1` then read as released, and the very operator action
+ * meant to restore readability manufactured the double-claim the whole
+ * design exists to prevent. ADR 0001:738-742 requires a duplicate with
+ * differing content be **rejected, not silently picked**; ADR 0001:811-826
+ * establishes there is no attacker-independent key to pick a survivor by
+ * among mutually-distrusting peers — so an automatic pick is not available,
+ * and quarantining *both* occurrences would still be an automatic pick (of
+ * "neither survives"), destroying a live claim without operator judgment
+ * either way. **Declining to act is the only choice this tool can make
+ * safely**: every `"duplicate-id-conflict"` failure is now always
+ * `unresolved`, carrying a `remediation` naming both occurrences' exact
+ * `(month, line)` coordinates so an operator — who can see both lines and
+ * judge which is genuine, which this tool cannot — can remove the forged
+ * one by hand. See `recover`'s own "What an attacker gains" section for
+ * the corrected security argument.
  */
-const FIXABLE_REASONS: ReadonlySet<DiagnosticFailureReason> = new Set(["invalid-json", "schema-invalid", "duplicate-id-conflict", "line-too-large"]);
+const FIXABLE_REASONS: ReadonlySet<DiagnosticFailureReason> = new Set(["invalid-json", "schema-invalid", "line-too-large"]);
 
 /**
  * One line removed from a month file by a `recover()` call, as written into
@@ -1415,30 +1518,70 @@ export interface RecoveryHooks {
  * introduce this same D/F conflict one level deeper, at a path that *is*
  * still deterministic (unlike the per-call file's own randomized name) and
  * therefore still pre-plantable.
+ *
+ * **Fix round 3 (Ruling R48's mode-check, applied here too — orchestrator
+ * security review): `GIT_BLOB_AMBIGUOUS` alone is not proof of a healthy
+ * directory.** The version of this function through fix round 2 treated
+ * *any* `GIT_BLOB_AMBIGUOUS` as "a real directory, fine" — true for a
+ * directory (mode `040000`), but the identical error code is also what
+ * `readBlobFromRef` raises for a **symlink** (`120000`) or a **gitlink**
+ * (`160000`) planted at the exact path, since both fail the adapter's own
+ * `mode === "100644"` check the same way a directory does. Confirmed by
+ * direct probe (real `update-index --cacheinfo 120000,...`/`160000,...`):
+ * both throw `GIT_BLOB_AMBIGUOUS` with `details.mode` set to `"120000"`/
+ * `"160000"` respectively — this function now reads that field via
+ * {@link isTreeEntryBlocked} and treats anything other than `"040000"` as
+ * blocked, closing the same class of gap Ruling R48 found in `read()`'s own
+ * `events`-prefix blind spot.
  */
 async function assertQuarantineDirectoryUsable(adapter: GitAdapter, validatedRef: string, dirPath: string): Promise<void> {
-  let existing: string | null;
-  try {
-    existing = await adapter.readBlobFromRef(validatedRef, dirPath);
-  } catch (cause) {
-    if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
-      return; // A real directory — the normal, healthy state.
-    }
-    throw cause;
-  }
-  if (existing !== null) {
+  if (await isTreeEntryBlocked(adapter, validatedRef, dirPath)) {
     throw new CanKanError(
       EventErrorCodes.EVENT_RECOVERY_QUARANTINE_BLOCKED,
-      `the "${dirPath}" path resolves to a file, not a directory, so recovery cannot write any audit record under it`,
+      `the "${dirPath}" path does not resolve to a usable directory (a file, symlink, or gitlink is planted there instead), so recovery cannot write any audit record under it`,
       {
         details: {
           ref: validatedRef,
           path: dirPath,
-          remediation: `remove the blob planted at "${dirPath}" (rebuild the ref's tree: git read-tree / git rm --cached ${dirPath} / commit-tree / update-ref) before retrying recovery`,
+          remediation: `remove the entry planted at "${dirPath}" (rebuild the ref's tree: git read-tree / git rm --cached ${dirPath} / commit-tree / update-ref) before retrying recovery`,
         },
       },
     );
   }
+}
+
+/**
+ * Fix round 3 (Ruling R48): the shared, non-throwing discriminator behind
+ * both {@link assertQuarantineDirectoryUsable} and
+ * {@link computeDiagnosticReport}'s own `events`-prefix probe — one
+ * implementation, two call sites deciding differently what to do with the
+ * answer (throw immediately vs. report and continue diagnosing).
+ *
+ * Returns `true` when `path` is **blocked** — a real blob (a non-null
+ * string return, no throw), or a non-blob entry whose mode is not `040000`
+ * (a symlink `120000` or a gitlink `160000`, confirmed by direct probe to
+ * both throw `GIT_BLOB_AMBIGUOUS` with that mode in `details`, exactly like
+ * a directory does — the adapter's own `mode === "100644"` check does not
+ * distinguish *which* non-blob shape it found). Returns `false` when
+ * `path` is safely usable as a directory prefix — absent (`null`, nothing
+ * planted, fine — a future write under it is unconstrained), or a genuine
+ * directory (`GIT_BLOB_AMBIGUOUS` with `details.mode === "040000"`). Any
+ * *other* error (a real git-level failure unrelated to this path's shape)
+ * still propagates — this function only ever resolves the "is this
+ * specific path usable as a directory" question, nothing else.
+ */
+async function isTreeEntryBlocked(adapter: GitAdapter, validatedRef: string, path: string): Promise<boolean> {
+  let existing: string | null;
+  try {
+    existing = await adapter.readBlobFromRef(validatedRef, path);
+  } catch (cause) {
+    if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
+      const mode = cause.details?.mode;
+      return !(typeof mode === "string" && mode === "040000");
+    }
+    throw cause;
+  }
+  return existing !== null;
 }
 
 /**
@@ -1504,35 +1647,59 @@ async function assertQuarantineDirectoryUsable(adapter: GitAdapter, validatedRef
  *
  * ## What an attacker gains from provoking a recovery run
  *
+ * **Corrected in fix round 3 (Ruling R47, orchestrator security review) —
+ * the version of this section through fix round 2 made a claim that was
+ * false, and the false claim was itself exploitable.** It said an attacker
+ * "cannot evict a rival's already-appended, valid claim by replaying a
+ * conflicting duplicate under the same id *after* it," with "after"
+ * carrying the entire weight of the argument — resting on the unstated
+ * assumption that recovery's oldest-*month*-first walk order tracks real
+ * chronological order. It does not: a peer chooses which month file its own
+ * line lands in, so an attacker forges the conflicting duplicate into an
+ * *earlier* month (well within the default `trailingMonths: 2` window) and
+ * this walk finds the forgery first, not the victim's real claim.
+ * Demonstrated end to end, reproduced against the pre-fix code
+ * (`recovery.test.ts`): alice's real claim at `2026-09:0`; mallory pushes a
+ * differing `release` under the same id into `2026-08:0`; `recover()`
+ * reported `outcome: "recovered"`, quarantined *alice's* line, kept
+ * mallory's forgery — the operator's own recovery run manufactured the
+ * double-claim this whole design exists to prevent, and the audit record
+ * attributed it to ordinary corruption cleanup.
+ *
  * An attacker with push access can already make the board unreadable with
  * one push (that is the vulnerability this file exists to remedy, not one it
  * introduces) and can push a line specifically shaped to *look* worth
- * quarantining. What they cannot do is use a recovery run to delete a
- * legitimate competing claim:
+ * quarantining. What they cannot do, as of this fix, is use a recovery run
+ * to delete a legitimate competing claim:
  *
  * - Recovery only ever removes a line that **independently, deterministically
  *   fails the identical check `read()` itself already applies** — schema
- *   validation, JSON well-formedness, an oversized byte length, or
- *   byte-differing content under an already-used id. A legitimate
- *   `claim`/`release`/any other event is, by definition, schema-valid,
- *   within `read()`'s size bounds, and under a freshly-minted id, so it is
- *   never a member of `FIXABLE_REASONS`'s domain — this function has no
- *   code path that removes such a line, for any reason.
- * - For the one reason that involves *two* lines
- *   (`duplicate-id-conflict`), the **first** occurrence in append-only chain
- *   order is always the one that survives — see `computeDiagnosticReport`'s
- *   dedupe. An attacker cannot use this to evict a rival's already-appended,
- *   valid claim by replaying a conflicting duplicate under the same id
- *   *after* it: their own later line is the one flagged and removed, not the
- *   rival's earlier one. (Forging a *collision* against an unused id well
- *   before the rival even claims it is not a duplicate-id scenario at all —
- *   it is two independent, both-valid events under different ids, and
- *   neither is touched.)
- * - Every removed line/span is preserved in this call's own
- *   `quarantine/<month>/<sortableId>.jsonl` file, regardless of which of the
- *   above reasons applied — see
- *   `QuarantineRecord`'s doc comment for exactly what fidelity that
- *   preservation can and cannot promise (Ruling R44). Recovery is
+ *   validation, JSON well-formedness, or an oversized byte length. A
+ *   legitimate `claim`/`release`/any other event is, by definition,
+ *   schema-valid and within `read()`'s size bounds, so it is never a member
+ *   of `FIXABLE_REASONS`'s domain — this function has no code path that
+ *   removes such a line, for any reason.
+ * - `"duplicate-id-conflict"` — the one reason that involves *two* lines,
+ *   and therefore the one an attacker could otherwise weaponize against a
+ *   rival's line by construction — is **never in `FIXABLE_REASONS`
+ *   (Ruling R47)**. Recovery does not remove, quarantine, or otherwise act
+ *   on *either* occurrence of a duplicate-id conflict, regardless of month
+ *   placement, walk order, or which one an attacker shapes to "look"
+ *   forged. Both lines remain exactly where they were pushed, `read()`
+ *   keeps refusing with `EVENT_LOG_DUPLICATE_ID_CONFLICT`, and the failure
+ *   is reported `unresolved` with a `remediation` naming both occurrences'
+ *   coordinates — an operator, who can actually see both lines and judge
+ *   which is genuine, resolves it by hand. This is ADR 0001:738-742's own
+ *   requirement ("rejected, not silently picked") and ADR 0001:811-826's
+ *   own admission (no attacker-independent survivor key exists among
+ *   mutually-distrusting peers) applied literally: since no automatic pick
+ *   is available, and quarantining *both* occurrences would still be an
+ *   automatic pick — of "neither survives" — declining to act at all is the
+ *   only choice that cannot destroy a live claim.
+ * - Every removed line/span (from the two *remaining* fixable reasons only)
+ *   is preserved in this call's own `quarantine/<month>/<sortableId>.jsonl`
+ *   file — see `QuarantineRecord`'s doc comment for exactly what fidelity
+ *   that preservation can and cannot promise (Ruling R44). Recovery is
  *   reversible by hand (an operator can inspect the quarantine record and
  *   re-append a wrongly-removed line) — it is never a silent, destructive
  *   deletion an attacker could exploit as one, and a blocked audit path
@@ -1542,7 +1709,9 @@ async function assertQuarantineDirectoryUsable(adapter: GitAdapter, validatedRef
  * The net effect: forcing an operator to run recovery costs the operator an
  * action, but it hands the attacker no capability beyond the one they already
  * had by pushing the poison line in the first place — they get their own
- * poison quarantined, on the record, and nothing else.
+ * poison quarantined (if it independently fails a real check) or left in
+ * place pending manual review (if it is a duplicate-id forgery), and
+ * nothing else.
  */
 export async function recover(adapter: GitAdapter, ref: string, options: RecoveryOptions | null = {}): Promise<RecoveryResult> {
   return recoverCore(adapter, ref, options ?? {}, {});

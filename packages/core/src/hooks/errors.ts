@@ -34,4 +34,5 @@ export const HooksErrorCodes = {
    * comment for what does).
    */
   HOOK_COMMAND_NOT_FOUND: "HOOK_COMMAND_NOT_FOUND",
+  HOOK_REPO_UNTRUSTED: "HOOK_REPO_UNTRUSTED",
 } as const;

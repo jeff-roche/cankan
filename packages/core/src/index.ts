@@ -47,4 +47,5 @@ export * as order from "./order/index";
 export * as state from "./state/index";
 export * as store from "./store/index";
 export * as ticket from "./ticket/index";
+export * as trust from "./trust/index";
 export * from "./types";

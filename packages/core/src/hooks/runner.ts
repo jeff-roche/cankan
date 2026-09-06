@@ -13,27 +13,31 @@
  * `runHooks` calls but never constructs. M2.17 (round 6) supplies the
  * event-log-backed adapter.
  *
- * **Trust (issue #86, deliberate and owner-decided -- see the task brief
- * §3):** repo-layer hooks are shell commands that ship inside a
- * repo-controlled, checked-in config file, and this module runs them
- * unconditionally, on every layer, with no trust gate. That is not an
- * oversight -- PLAN.md M2.16 and the project owner require exactly this
- * until #86 lands a gate. The seam for that gate is `spawnHook` below, the
- * single chokepoint every hook passes through before a process is spawned;
- * see its doc comment.
+ * **Trust (issue #86):** repo-layer hooks are checked-in shell commands.
+ * `runHooks` therefore asks `trust/` for explicit, fingerprint-bound user
+ * approval before it reaches the spawn path. An untrusted repo hook produces
+ * a typed non-executing outcome; local and global hooks remain user-owned.
  */
 
 import type { Subprocess } from "bun";
 import type { ConfigResult, LoadedLayer } from "../config/index";
 import { CanKanError, ErrorCodes } from "../errors";
 import { HooksErrorCodes } from "./errors";
+import { hasRepoExecutableTrust } from "../trust/index";
 
 // ---------------------------------------------------------------------------
 // Events (CONCEPT.md §8) and layers (Controller Ruling 3).
 // ---------------------------------------------------------------------------
 
 /** The six events CONCEPT.md §8 names, verbatim and in that order. */
-export const HOOK_EVENTS = ["claim", "release", "expire", "move", "close", "create"] as const;
+export const HOOK_EVENTS = [
+  "claim",
+  "release",
+  "expire",
+  "move",
+  "close",
+  "create",
+] as const;
 
 /** One of the six events a hook can fire on. */
 export type HookEvent = (typeof HOOK_EVENTS)[number];
@@ -56,7 +60,11 @@ export type HookEvent = (typeof HOOK_EVENTS)[number];
  * "most specific layer first" -- but worth naming so it doesn't read as
  * arbitrary next to that fix.
  */
-export const HOOK_LAYER_ORDER = ["repo", "repo-local", "global"] as const satisfies readonly LoadedLayer["layer"][];
+export const HOOK_LAYER_ORDER = [
+  "repo",
+  "repo-local",
+  "global",
+] as const satisfies readonly LoadedLayer["layer"][];
 
 /** One of the three file layers a hook command can come from. */
 export type HookLayer = (typeof HOOK_LAYER_ORDER)[number];
@@ -130,7 +138,10 @@ export interface ResolvedHook {
  * z.string())` (`config/schema.ts:221`), so a present value is a string --
  * this still narrows rather than casting blindly, per the task brief.
  */
-function readHookCommand(data: Readonly<Record<string, unknown>>, event: HookEvent): string | undefined {
+function readHookCommand(
+  data: Readonly<Record<string, unknown>>,
+  event: HookEvent,
+): string | undefined {
   const hooks = data.hooks;
   if (hooks === null || typeof hooks !== "object" || Array.isArray(hooks)) {
     return undefined;
@@ -155,7 +166,10 @@ function readHookCommand(data: Readonly<Record<string, unknown>>, event: HookEve
  * preserves provenance (`layer`, `file`) all the way to the spawn
  * chokepoint -- see `spawnHook` below.
  */
-export function resolveHooksForEvent(cfg: ConfigResult, event: HookEvent): readonly ResolvedHook[] {
+export function resolveHooksForEvent(
+  cfg: ConfigResult,
+  event: HookEvent,
+): readonly ResolvedHook[] {
   const resolved: ResolvedHook[] = [];
   for (const layerName of HOOK_LAYER_ORDER) {
     const loaded = cfg.layers.find((l) => l.layer === layerName);
@@ -250,9 +264,8 @@ export type HookSink = (record: HookEventRecord) => void | Promise<void>;
  * a reviewer confirms provenance survives to the spawn chokepoint by
  * reading this one interface, not by tracing data flow across functions.
  */
-export interface HookSpawnRequest {
-  /** Which config layer this command came from. #86 will need this to
-   *  decide whether a repo-controlled command may run at all. */
+interface HookSpawnRequest {
+  /** Which config layer this command came from. */
   layer: HookLayer;
   /** Absolute path of the config file this command came from. #86 will
    *  need this to name the file a gate refuses. */
@@ -352,7 +365,10 @@ function sleep(ms: number): Promise<void> {
  * listening. Deliberately not a change to `sleep` itself: `waitForGroupEmpty`
  * must keep using real, un-unref'd timers to stay scheduled while polling.
  */
-function cancellableSleep(ms: number): { promise: Promise<void>; cancel: () => void } {
+function cancellableSleep(ms: number): {
+  promise: Promise<void>;
+  cancel: () => void;
+} {
   let timer: ReturnType<typeof setTimeout>;
   const promise = new Promise<void>((resolve) => {
     timer = setTimeout(resolve, ms);
@@ -369,7 +385,10 @@ function cancellableSleep(ms: number): { promise: Promise<void>; cancel: () => v
  * than event-driven; `GROUP_POLL_INTERVAL_MS` trades a small worst-case
  * detection delay for not depending on anything more elaborate.
  */
-async function waitForGroupEmpty(pid: number, boundMs: number): Promise<boolean> {
+async function waitForGroupEmpty(
+  pid: number,
+  boundMs: number,
+): Promise<boolean> {
   const deadline = performance.now() + boundMs;
   while (isGroupAlive(pid)) {
     if (performance.now() >= deadline) {
@@ -412,7 +431,10 @@ async function waitForGroupEmpty(pid: number, boundMs: number): Promise<boolean>
  * `killGroupSafely`'s note on the pid-reuse window this widens (in timing,
  * not in call count) as an accepted cost of killing a group correctly.
  */
-async function runGroupToCompletion(proc: HookSubprocess, timeoutMs: number): Promise<boolean> {
+async function runGroupToCompletion(
+  proc: HookSubprocess,
+  timeoutMs: number,
+): Promise<boolean> {
   const pid = proc.pid;
   const deadline = performance.now() + timeoutMs;
 
@@ -431,7 +453,9 @@ async function runGroupToCompletion(proc: HookSubprocess, timeoutMs: number): Pr
   // after the hook had already finished (measured: a default-timeout hook
   // returning in ~3ms kept the process alive for +30002ms).
   let deadlineHitBeforeExit = false;
-  const deadlineSleep = cancellableSleep(Math.max(0, deadline - performance.now()));
+  const deadlineSleep = cancellableSleep(
+    Math.max(0, deadline - performance.now()),
+  );
   await Promise.race([
     proc.exited,
     deadlineSleep.promise.then(() => {
@@ -468,7 +492,10 @@ async function runGroupToCompletion(proc: HookSubprocess, timeoutMs: number): Pr
   return timedOut;
 }
 
-function concatUint8Arrays(parts: readonly Uint8Array[], totalLength: number): Uint8Array {
+function concatUint8Arrays(
+  parts: readonly Uint8Array[],
+  totalLength: number,
+): Uint8Array {
   const out = new Uint8Array(totalLength);
   let offset = 0;
   for (const part of parts) {
@@ -533,28 +560,18 @@ async function readCapped(
  * spawned" (task brief §3, obligation 1). Every hook, from every layer,
  * passes through here -- this is the only `Bun.spawn` call in this module.
  *
- * **Issue #86 (deliberate, owner-decided gap -- do not fill it in here):**
- * there is no trust check in this function. Repo-layer hooks are
- * attacker-controlled shell commands (`git clone <hostile-repo> && cankan
- * close ck-1` runs whatever `.cankan/config.yml` says), and this function
- * runs `request.command` regardless of `request.layer`. PLAN.md M2.16 and
- * the project owner require exactly that until #86 lands a gate. A future
- * gate belongs at the top of this function, before the `Bun.spawn` call
- * below -- it will need `request.layer` (repo-controlled vs. the user's
- * own config), the board identity (`request.cwd`), and `request.command`,
- * all three of which this function's parameter type already carries. Do
- * not add a gate, flag, prompt, or partial trust model here or anywhere
- * else in this file.
+ * This helper is deliberately private: only `runHooks`, which checks the
+ * fingerprint-bound repository trust record, can reach the process spawn.
  *
  * **`request.env` is used exactly as given -- this function does not call
  * `sanitizeEnvValue`.** That NUL-stripping/length-capping defense (fix
  * round 2, finding 6) lives at `runHooks`'s boundary, since `runHooks` is
  * where attacker-influenced ticket content (`$TITLE` above all) enters.
- * `spawnHook` is exported for direct, low-level use (white-box tests, and
- * any future caller that bypasses `runHooks`); such a caller is
- * responsible for sanitizing its own `env` first.
+ * `runHooks` sanitizes its inputs before reaching this internal function.
  */
-export async function spawnHook(request: HookSpawnRequest): Promise<HookExecutionResult> {
+async function spawnHook(
+  request: HookSpawnRequest,
+): Promise<HookExecutionResult> {
   const startedAt = performance.now();
 
   let proc: HookSubprocess;
@@ -615,7 +632,10 @@ export async function spawnHook(request: HookSpawnRequest): Promise<HookExecutio
   const stderrPromise = readCapped(proc.stderr, OUTPUT_CAP_BYTES);
 
   const timedOut = await runGroupToCompletion(proc, request.timeoutMs);
-  const [stdoutResult, stderrResult] = await Promise.all([stdoutPromise, stderrPromise]);
+  const [stdoutResult, stderrResult] = await Promise.all([
+    stdoutPromise,
+    stderrPromise,
+  ]);
 
   const exitCode = proc.exitCode;
   const signal = proc.signalCode as string | null;
@@ -627,7 +647,9 @@ export async function spawnHook(request: HookSpawnRequest): Promise<HookExecutio
     // POSIX.1-2017 §2.8.2: 127 is the shell's own "command not found" exit
     // status -- see `HooksErrorCodes.HOOK_COMMAND_NOT_FOUND`'s doc comment
     // for the one documented ambiguity this carries.
-    ...(exitCode === 127 ? { errorCode: HooksErrorCodes.HOOK_COMMAND_NOT_FOUND } : {}),
+    ...(exitCode === 127
+      ? { errorCode: HooksErrorCodes.HOOK_COMMAND_NOT_FOUND }
+      : {}),
     durationMs: Math.round(performance.now() - startedAt),
     stdout: stdoutResult.text,
     stdoutTruncated: stdoutResult.truncated,
@@ -666,6 +688,8 @@ export interface RunHooksOptions {
   /** Milliseconds before a hook (and its process group) is killed.
    *  Defaults to `DEFAULT_HOOK_TIMEOUT_MS` (Controller Ruling 4). */
   timeoutMs?: number;
+  /** Environment used to locate the user's XDG trust state. */
+  trustEnv?: Readonly<Record<string, string | undefined>>;
 }
 
 /**
@@ -721,7 +745,9 @@ function sanitizeEnvValue(value: string): string {
  * only for a programmer error: `event` outside the six named in
  * `HOOK_EVENTS`.
  */
-export async function runHooks(options: RunHooksOptions): Promise<HookOutcome[]> {
+export async function runHooks(
+  options: RunHooksOptions,
+): Promise<HookOutcome[]> {
   if (!(HOOK_EVENTS as readonly string[]).includes(options.event)) {
     throw new CanKanError(
       ErrorCodes.USAGE,
@@ -758,7 +784,39 @@ export async function runHooks(options: RunHooksOptions): Promise<HookOutcome[]>
   };
 
   const outcomes: HookOutcome[] = [];
+  const repoHookTrusted = await hasRepoExecutableTrust(
+    options.repoRoot,
+    options.cfg,
+    options.trustEnv,
+  );
   for (const hook of resolved) {
+    if (hook.layer === "repo" && !repoHookTrusted) {
+      const outcome: HookOutcome = {
+        layer: hook.layer,
+        file: hook.file,
+        command: hook.command,
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorCode: HooksErrorCodes.HOOK_REPO_UNTRUSTED,
+        durationMs: 0,
+        stdout: "",
+        stdoutTruncated: false,
+        stderr: "",
+        stderrTruncated: false,
+      };
+      outcomes.push(outcome);
+      if (options.sink)
+        await options.sink({
+          event: options.event,
+          ticket,
+          actor,
+          from,
+          to,
+          ...outcome,
+        });
+      continue;
+    }
     const execution = await spawnHook({
       layer: hook.layer,
       file: hook.file,

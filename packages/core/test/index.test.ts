@@ -13,7 +13,7 @@ import type { Equal, Expect, IsAssignable } from "./typeLevel";
  */
 
 /**
- * The thirteen module folders, from PLAN.md M2.1, each read off the public
+ * The core module folders, each read off the public
  * entry statically — a dynamic `core[folder]` lookup is a biome warning, and
  * warnings fail the lint gate.
  */
@@ -31,6 +31,7 @@ const MODULE_NAMESPACES = {
   index: core.index,
   hooks: core.hooks,
   actor: core.actor,
+  trust: core.trust,
 };
 
 type ModuleFolder = keyof typeof MODULE_NAMESPACES;
@@ -49,7 +50,7 @@ type FlatValueExport = "CanKanError" | "ErrorCodes" | "isCanKanError";
 type EntryNamespace = Exclude<keyof typeof core, FlatValueExport>;
 
 export type EntryTypeAssertions = [
-  // The entry exposes exactly the thirteen folders as namespaces: no folder
+  // The entry exposes exactly the declared folders as namespaces: no folder
   // missing, and no extra namespace beyond the list.
   Expect<Equal<EntryNamespace, ModuleFolder>>,
   // `errors.ts` and `types.ts` are re-exported flat, so their types are
@@ -104,10 +105,10 @@ export const crossedBrand: ActorId = ticketId;
 export const allKind: BoardKind = "all";
 
 describe("the public entry", () => {
-  test("exposes all thirteen module folders as namespaces", () => {
+  test("exposes all module folders as namespaces", () => {
     const folders = Object.entries(MODULE_NAMESPACES);
 
-    expect(folders).toHaveLength(13);
+    expect(folders).toHaveLength(14);
     for (const [name, namespace] of folders) {
       expect(namespace, `core.${name}`).toBeTypeOf("object");
       expect(namespace, `core.${name}`).not.toBeNull();

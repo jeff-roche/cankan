@@ -211,4 +211,55 @@ describe("blockedBy", () => {
     const outstanding = blockedBy(state, "ck-1" as TicketId);
     expect(outstanding.map((d) => d.rawId)).toEqual(["ck-open"]);
   });
+
+  test("I1 path B (security review): a hostile alias cannot hijack another ticket's own id", () => {
+    const victim = makeStoredTicket("ck-victim", "In Progress"); // open — genuinely blocks ck-1
+    const closedElsewhere = makeStoredTicket("ck-closed", "Done");
+    const closeEvent = fixtureEvent({ event: "close", ticket: "ck-closed" }, "2026-01", 0);
+    // A well-formed hostile alias: `from` names the victim's own real id,
+    // `to` names an unrelated already-closed ticket. Before the I1 fix,
+    // `buildIdentifierIndex`'s flat `index.set()` let this overwrite the
+    // victim's own id entry outright, so `blockedBy` resolved the dep to
+    // the attacker's chosen (closed) ticket instead of the real (open) one
+    // — verified directly, security review.
+    const hostileAlias = fixtureEvent(
+      { event: "alias", ticket: "ck-x", from: "ck-victim", to: "ck-closed" },
+      "2026-01",
+      1,
+    );
+    const ticket = makeStoredTicket("ck-1", "To Do", { cankan: { deps: [{ type: "blocks", id: "ck-victim" }] } });
+
+    const state = foldState([ticket, victim, closedElsewhere], [closeEvent, hostileAlias], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
+
+    const outstanding = blockedBy(state, "ck-1" as TicketId);
+    expect(outstanding).toHaveLength(1);
+    // Must still resolve to the real, open victim ticket — never to the
+    // attacker-chosen closed one, and never `undefined` either (the
+    // victim's own `id` tier is authoritative over the `eventAliases`
+    // tier, not merely "first come" — this is not a race, it is a rule).
+    expect(outstanding[0]?.resolvedTicket?.id as string | undefined).toBe("ck-victim");
+  });
+
+  test("I1: two tickets claiming the same alias at the same tier resolve to neither, even though both are closed", () => {
+    // If a naive implementation picked either ticket arbitrarily on a
+    // same-tier collision, this dep would incorrectly resolve as satisfied
+    // (both candidates are genuinely closed) — proving the collision truly
+    // resolves to nothing, not merely "happens to still be outstanding."
+    const a = makeStoredTicket("ck-a", "Done", { cankan: { aliases: ["DUP"] } });
+    const b = makeStoredTicket("ck-b", "Done", { cankan: { aliases: ["DUP"] } });
+    const closeA = fixtureEvent({ event: "close", ticket: "ck-a" }, "2026-01", 0);
+    const closeB = fixtureEvent({ event: "close", ticket: "ck-b" }, "2026-01", 1);
+    const ticket = makeStoredTicket("ck-1", "To Do", { cankan: { deps: [{ type: "blocks", id: "DUP" }] } });
+
+    const state = foldState([ticket, a, b], [closeA, closeB], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+
+    const outstanding = blockedBy(state, "ck-1" as TicketId);
+    expect(outstanding).toHaveLength(1);
+    expect(outstanding[0]?.rawId).toBe("DUP");
+    expect(outstanding[0]?.resolvedTicket).toBeUndefined();
+  });
 });

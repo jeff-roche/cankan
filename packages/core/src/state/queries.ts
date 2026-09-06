@@ -66,12 +66,25 @@ export interface BlockingDependency {
   /**
    * The ticket this id resolved to, if any. `undefined` means this board's
    * fold could not resolve it — either it names no ticket, its own id,
-   * `display_id`, or any known alias found in this checkout, or it is a
-   * cross-board `<repo>:<id>` reference (CONCEPT.md §6c), which a
-   * single-board fold has no data to resolve. **An unresolved id is still
-   * reported as outstanding** (see `blockedBy`'s own doc) — silently
+   * `display_id`, or any known alias found in this checkout, it is a
+   * cross-board `<repo>:<id>` reference (CONCEPT.md §6c) which a
+   * single-board fold has no data to resolve, or two tickets' identifiers
+   * collided at the same resolution tier (`buildIdentifierIndex`'s own
+   * doc) and neither is treated as the resolution. **An unresolved id is
+   * still reported as outstanding** (see `blockedBy`'s own doc) — silently
    * dropping it would make a blocked ticket look ready, the wrong direction
    * to fail.
+   *
+   * **Not a mutual-exclusion input.** This can resolve through
+   * `TicketState.eventAliases` — a provenance any contributor with push
+   * access to the coordination ref can write (see that field's own doc).
+   * Two peers whose local ticket files differ (a display id renamed
+   * locally, say) can legitimately compute a different `blockedBy` result
+   * for the same ticket at the same moment. That is fine for *readiness* (a
+   * UI hint, not a lock) but must never be read as agreement between peers
+   * the way a claim is — the event log's claim/lease events, not this
+   * query, arbitrate who holds a ticket regardless of what `blockedBy`
+   * says about it.
    */
   readonly resolvedTicket: TicketState | undefined;
 }
@@ -90,25 +103,68 @@ function looksCrossBoard(id: string): boolean {
 /**
  * Builds the same kind of identifier index `store/ticketStore.ts`'s
  * `identifiersFor` builds (id + `display_id` + aliases) — extended with the
- * alias *events* `TicketState.aliases` already folds in, per that file's
- * own comment naming M2.8 as the place that gap gets closed. The brief's
- * own wording — "Ids in `deps` may be display ids or cross-board refs" —
- * names `display_id` explicitly, so a dep naming a Jira/GitHub display id
- * (CONCEPT.md's own `PROJ-45` worked example) resolves here too, not only a
- * ticket's own id or alias.
+ * alias *events* `TicketState.eventAliases` already folds in, per that
+ * file's own comment naming M2.8 as the place that gap gets closed. The
+ * brief's own wording — "Ids in `deps` may be display ids or cross-board
+ * refs" — names `display_id` explicitly, so a dep naming a Jira/GitHub
+ * display id (CONCEPT.md's own `PROJ-45` worked example) resolves here too,
+ * not only a ticket's own id or alias.
+ *
+ * **Tiered, not flat — Ruling I1 (security review).** A flat `index.set()`
+ * over id + `display_id` + `frontmatterAliases` + `eventAliases` lets a
+ * later entry silently overwrite an earlier one: a well-formed hostile
+ * `alias {from: <victim's real id>, to: <any closed ticket>}` would
+ * overwrite the victim's own id entry with the attacker's chosen target,
+ * and `blockedBy` would then report the victim as satisfied without ever
+ * touching it (verified directly, security review). This function instead
+ * resolves one tier at a time, most-authoritative first — `id`, then
+ * `displayId`, then `frontmatterAliases` (repo-controlled: only a local
+ * write, typically `adopt`/`renumber`, can add one), then `eventAliases`
+ * (pushable by anyone with push access to the coordination ref) — and a key
+ * already claimed by an earlier tier is never touched again by a later one.
+ * Within one tier, two different tickets claiming the same key is a
+ * collision, not a coin flip: that key is left **unset** (never resolves to
+ * either ticket) rather than picking one, so `blockedBy` reports it as
+ * unresolved — the same fail-safe "still outstanding" direction as any
+ * other unresolved id.
  */
 function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLookupKey, TicketState> {
-  const index = new Map<TicketIdLookupKey, TicketState>();
-  for (const ticket of tickets) {
-    index.set(normalizeTicketIdForComparison(ticket.id), ticket);
-    if (ticket.displayId !== undefined) {
-      index.set(normalizeTicketIdForComparison(ticket.displayId), ticket);
+  const CONFLICT = Symbol("conflict");
+  const index = new Map<TicketIdLookupKey, TicketState | typeof CONFLICT>();
+
+  function addTier(keysFor: (ticket: TicketState) => readonly string[]): void {
+    const claimedThisTier = new Map<TicketIdLookupKey, TicketState | typeof CONFLICT>();
+    for (const ticket of tickets) {
+      for (const rawKey of keysFor(ticket)) {
+        const key = normalizeTicketIdForComparison(rawKey);
+        if (index.has(key)) {
+          continue; // an earlier, more-authoritative tier already claimed this key
+        }
+        const existing = claimedThisTier.get(key);
+        if (existing === undefined) {
+          claimedThisTier.set(key, ticket);
+        } else if (existing !== ticket) {
+          claimedThisTier.set(key, CONFLICT); // two different tickets, same tier, same key
+        }
+      }
     }
-    for (const alias of ticket.aliases) {
-      index.set(normalizeTicketIdForComparison(alias), ticket);
+    for (const [key, entry] of claimedThisTier) {
+      index.set(key, entry);
     }
   }
-  return index;
+
+  addTier((t) => [t.id]);
+  addTier((t) => (t.displayId !== undefined ? [t.displayId] : []));
+  addTier((t) => t.frontmatterAliases);
+  addTier((t) => t.eventAliases);
+
+  const resolved = new Map<TicketIdLookupKey, TicketState>();
+  for (const [key, entry] of index) {
+    if (entry !== CONFLICT) {
+      resolved.set(key, entry);
+    }
+  }
+  return resolved;
 }
 
 /**
@@ -126,6 +182,20 @@ function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLook
  * means "done," and `closed` is the one lifecycle signal available without
  * one. An unresolved id (see `BlockingDependency.resolvedTicket`) is always
  * treated as still outstanding.
+ *
+ * **`closed` is event-only evidence, writable by anyone with push access to
+ * the coordination ref, and — because no `reopen` event kind exists yet
+ * (see `fold.ts`'s own `close`/`reopen` note) — irreversible.** Any
+ * contributor appending one `close` event naming the blocker flips this
+ * function's readiness verdict for every ticket that names it as a `blocks`
+ * dep, permanently, regardless of what the blocker's own ticket file says.
+ * This is not solvable at this layer without a `reopen` kind or a
+ * corroborating signal this fold does not have — flagged here rather than
+ * silently trusted (security review, Ruling I1 path A).
+ *
+ * **Not a mutual-exclusion input** — see `BlockingDependency.resolvedTicket`'s
+ * own doc: two peers can legitimately compute a different result here for
+ * the same ticket, and neither result decides who holds a claim.
  *
  * Cycle safety: this only ever reads `ticketId`'s own `deps` array — a flat
  * list of other ids, not a graph this function walks — so a cycle

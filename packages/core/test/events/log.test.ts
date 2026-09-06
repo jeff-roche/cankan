@@ -754,11 +754,44 @@ describe("read — fix round 1, S1: trailingMonths must be a bounded integer", (
     await expectCode(read(adapter, COORD_REF, { now: SEPT_15_MS, trailingMonths: 1.5 }), EventErrorCodes.EVENT_LOG_INVALID_WINDOW);
   });
 
-  test("the default (no trailingMonths given) and the maximum accepted value both still work", async () => {
-    const { adapter } = await seededRepoAndAdapter();
-    await expect(read(adapter, COORD_REF, { now: SEPT_15_MS })).resolves.toHaveLength(1);
-    await expect(read(adapter, COORD_REF, { now: SEPT_15_MS, trailingMonths: 120 })).resolves.toHaveLength(1);
-  });
+  test(
+    "the default (no trailingMonths given) and the maximum accepted value both still work",
+    async () => {
+      const { adapter } = await seededRepoAndAdapter();
+      await expect(read(adapter, COORD_REF, { now: SEPT_15_MS })).resolves.toHaveLength(1);
+      // R52 (orchestrator, macOS CI timeout): this call's cost is *inherent*,
+      // not a bug -- measured directly (instrumented `Bun.spawn`, task
+      // report) at `trailingMonths: 120`, `read()`'s own loop does exactly
+      // one `readBlobFromRef` per month in the window (no re-read, no
+      // chain re-walk, no work proportional to anything but the window
+      // size); the actual git-process count is one layer down, in M2.6's
+      // adapter (`git/adapter.ts`, frozen for this phase -- R19), which
+      // re-validates the ref (`check-ref-format` + `symbolic-ref`) and
+      // re-resolves it (`show-ref` + `rev-parse`) on every call rather than
+      // once per `read()`: 5 sequential `git` spawns per absent month,
+      // 6 per present one (the extra `cat-file`), plus 10 fixed spawns
+      // up front (ref validation, `readRef`, the `events`-prefix probe) --
+      // 16 spawns measured at `trailingMonths: 1`, 611 at `trailingMonths:
+      // 120`, matching that model exactly (10 + 119*5 + 1*6 = 611).
+      // Locally (Linux) those 611 spawns cost ~300ms end to end. The macOS
+      // CI failure this fixes was a timeout, not a measured duration: bun's
+      // default 5000ms test timeout fired and reported ~5010ms, which is
+      // the kill time, not the true cost -- the real macOS duration for
+      // this whole test body (tempRepo/createGitAdapter setup, one
+      // `append`, the default-window `read`, and the 611-spawn
+      // `trailingMonths: 120` `read`) is only known to be *at least* 5s.
+      // Per-spawn cost on that runner would only need to run ~10-15ms
+      // (vs. this machine's sub-millisecond) to land the 120-month read
+      // alone in the several-second range, which is well within known
+      // macOS CI process-spawn overhead. 15s is chosen for genuine headroom
+      // over that "several seconds" expectation, not over the 5010ms kill
+      // time specifically -- a genuine regression (an accidental re-read or
+      // chain re-walk multiplying the spawn count) would push this well
+      // past 15s, not just barely over it.
+      await expect(read(adapter, COORD_REF, { now: SEPT_15_MS, trailingMonths: 120 })).resolves.toHaveLength(1);
+    },
+    15_000,
+  );
 });
 
 // ============================================================================

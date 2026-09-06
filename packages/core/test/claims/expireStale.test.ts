@@ -10,7 +10,7 @@ import { expireStaleCore, type ExpireStaleHooks } from "../../src/claims/claim";
 import { ErrorCodes, type CanKanError, isCanKanError } from "../../src/errors";
 import { parseDurationMs } from "../../src/claims/duration";
 import { hermeticEnv } from "../config/testHelpers";
-import { boardKeyFor, firstSeen, read } from "../../src/events/index";
+import { append, boardKeyFor, firstSeen, read, type EventCandidate } from "../../src/events/index";
 import { EventErrorCodes } from "../../src/events/errors";
 import { recordPath } from "../../src/events/observations";
 import { createGitAdapter } from "../../src/git/index";
@@ -255,6 +255,76 @@ test("a ticket renewed underneath the sweep is skipped, and the sweep still expi
 });
 
 // ============================================================================
+// The other per-ticket skip: this ticket's own CAS cycle exhausts its
+// attempts against contention from an unrelated ticket's writes, and the
+// sweep still finishes the rest of the batch. Security-review regression --
+// this disposition (`sweepOneTicket`'s `GIT_CAS_CONTENTION_EXCEEDED` catch,
+// `claim.ts`'s own header ruling: "your CAS lost the race" is a per-ticket
+// skip, never a reason to abort tickets not yet swept) previously rested on
+// nothing: neutralizing that catch left the rest of the suite green.
+// ============================================================================
+
+test("a ticket whose own CAS cycle exhausts its attempts is skipped as cas-exhausted, and the sweep still expires the other candidate", async () => {
+  await withTestBoard(async ({ board }) => {
+    await writeFixtureTickets(board.ticketsDir, [
+      fixtureTicket("ck-sweep-cas-a", "Contended"),
+      fixtureTicket("ck-sweep-cas-b", "Sweeps fine"),
+    ]);
+    const holderA = actorId("actor-sweep-cas-a-holder");
+    const holderB = actorId("actor-sweep-cas-b-holder");
+    const adapter = await createGitAdapter(board.root);
+
+    await claim({ board, ticket: "ck-sweep-cas-a", actor: holderA, now: NOW });
+    await claim({ board, ticket: "ck-sweep-cas-b", actor: holderB, now: NOW });
+
+    const sweepNow = NOW + LEASE_TTL_MS + 1;
+    // A competitor appends an unrelated event before EVERY attempt on
+    // "ck-sweep-cas-a" -- its `expectedParent` is stale by the time it tries
+    // to append, every single time, so its own CAS cycle exhausts
+    // `maxAttempts` against contention that has nothing to do with its own
+    // lease decision. A low `maxAttempts` keeps this in milliseconds rather
+    // than exhausting 50 real backoffs.
+    let bumps = 0;
+    const hooks: ExpireStaleHooks = {
+      beforeAppend: async (ticket) => {
+        if (ticket === "ck-sweep-cas-a") {
+          bumps += 1;
+          await append(
+            adapter,
+            board.coordinationRef,
+            {
+              event: "comment",
+              ts: new Date(sweepNow).toISOString(),
+              actor: "noise",
+              ticket: "ck-sweep-cas-b",
+              text: `n${bumps}`,
+            } as unknown as EventCandidate,
+            { now: sweepNow },
+          );
+        }
+      },
+    };
+
+    const sweeper = actorId("actor-sweeper-cas-exhausted");
+    const result = await expireStaleCore(
+      { board, actor: sweeper, now: sweepNow, casRetry: { maxAttempts: 3, backoffMs: () => 0 } },
+      hooks,
+    );
+
+    expect(result.dryRun).toBe(false);
+    expect(result.tickets.length).toBe(2);
+
+    const contendedResult = result.tickets.find((t) => t.ticket === "ck-sweep-cas-a");
+    const sweptResult = result.tickets.find((t) => t.ticket === "ck-sweep-cas-b");
+    // The point is that the sweep CONTINUED, not merely that one ticket was
+    // skipped -- both outcomes are hard assertions.
+    expect(contendedResult?.outcome).toBe("skipped");
+    expect(contendedResult?.reason).toBe("cas-exhausted");
+    expect(sweptResult?.outcome).toBe("expired");
+  });
+});
+
+// ============================================================================
 // The other disposition: an observation-store failure hard-aborts, and the
 // terminating append has already landed by the time it is reported.
 // ============================================================================
@@ -307,8 +377,12 @@ describe("expireStale — the observation-store failure disposition (distinct fr
         // The terminator genuinely landed despite the cleanup failure -- an
         // `expire` event is in the log.
         const records = await read(adapter, board.coordinationRef, { now: sweepNow });
-        const expireRecord = records.find((r) => r.event.event === "expire" && r.event.ticket === "ck-sweep-storefail");
-        expect(expireRecord).toBeDefined();
+        // `.length === 1`, not merely "one is defined" -- the latter also
+        // passes if a retry double-appended a second `expire` for this
+        // ticket, which is exactly the double-append this assertion exists
+        // to catch ("no path retries an append that already landed").
+        const expireRecords = records.filter((r) => r.event.event === "expire" && r.event.ticket === "ck-sweep-storefail");
+        expect(expireRecords.length).toBe(1);
 
         // ...but the discard never completed -- the record leaked, exactly
         // the failure ADR 0001 failure mode 7 requires this module to

@@ -93,6 +93,25 @@
  * input to deciding *which* ticket to attempt — never the arbiter of
  * whether a claim succeeds. The CAS on the coordination ref remains the
  * sole mutual-exclusion primitive, as above.
+ *
+ * ## `max_per_actor` is a quota, not a security control
+ *
+ * `claims.max_per_actor` reads like an enforced limit, but it is keyed on
+ * `event.actor` — a free-text field, not an authenticated identity. Anyone
+ * with push access to the coordination ref can append `claim` events naming
+ * any victim actor on `max_per_actor` tickets of their own choosing, and
+ * `claimedBy` (`state/`) has no way to tell those apart from the victim's own
+ * claims: the victim's next genuine `claim()` call sees its own quota already
+ * exhausted and is rejected `CLAIM_REJECTED`/`max-per-actor`, regardless of
+ * whether the victim ever ran the command that named it. This self-heals
+ * after one lease TTL — `claimedBy` counts only live leases, so an attacker
+ * who stops re-pushing loses the lockout as those forged claims expire — but
+ * an attacker willing to keep re-pushing keeps it up indefinitely. There is
+ * no fix available inside this module: `actor` is not this module's identity
+ * layer, and treating it as one here would be exactly the mistake this note
+ * exists to prevent a reader from making. The point of this paragraph is
+ * only that the code must not be read as a security control when it is a
+ * quota on a forgeable identity.
  */
 
 import { CanKanError, ErrorCodes, isCanKanError } from "../errors";

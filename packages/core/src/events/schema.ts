@@ -827,8 +827,15 @@ function projectIssues(issues: z.ZodError["issues"]): EventValidationIssue[] {
  * needs to canonicalize again before using `ticket` (or `alias`'s
  * `from`/`to`) as a key.
  */
-export function parseEvent(line: string, options: ParseEventOptions = {}): ParseEventResult {
-  const now = options.now ?? Date.now();
+export function parseEvent(line: string, options: ParseEventOptions | null = {}): ParseEventResult {
+  // Fix round 3 (Ruling R31/R32, orchestrator security review): a default
+  // parameter does not apply to an explicit `null` — confirmed by probe,
+  // `parseEvent('{"event":"comment"}', null)` previously threw a raw
+  // `TypeError` on `options.now` rather than surfacing through this
+  // module's own `ParseEventResult` contract (this function's whole
+  // purpose is "never throws" — see this function's own doc comment).
+  const opts = options ?? {};
+  const now = opts.now ?? Date.now();
 
   let raw: unknown;
   try {

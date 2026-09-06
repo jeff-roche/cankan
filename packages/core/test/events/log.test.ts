@@ -1469,3 +1469,67 @@ describe("read — fix round 3, Ruling R48: a blocked events prefix fails closed
     expect(records.map((r) => r.event.ticket as string)).toEqual(["ck-1"]);
   });
 });
+
+// ============================================================================
+// Fix round 3 (Ruling R31/R32, orchestrator security review): an explicit
+// `null` options argument must not throw a raw TypeError, and every
+// caller-supplied option interpolated into an error message must be
+// type-gated first
+// ============================================================================
+
+describe("append/read — fix round 3: an explicit null options argument is normalized, not a raw TypeError", () => {
+  test("append(adapter, ref, candidate, null) behaves like append(adapter, ref, candidate) — no raw TypeError", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // Before the fix: `options.now` on a `null` options argument threw a
+    // raw `TypeError` (a default parameter does not apply to an explicit
+    // `null`).
+    const appended = await append(adapter, COORD_REF, claim("ck-1"), null);
+    expect(appended.event.ticket as string).toBe("ck-1");
+  });
+
+  test("read(adapter, ref, null) behaves like read(adapter, ref) — no raw TypeError", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await append(adapter, COORD_REF, claim("ck-1"), { now: SEPT_15_MS, casRetry: FAST_RETRY });
+
+    const records = await read(adapter, COORD_REF, null);
+    expect(records.map((r) => r.event.ticket as string)).toEqual(["ck-1"]);
+  });
+});
+
+describe("append — fix round 3, Ruling R31/R32: every caller-supplied option interpolated into an error message is type-gated first", () => {
+  test("a non-number now surfaces as a CanKanError, not a raw TypeError from a template literal", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    // Before the fix: `${now}` on an object with no prototype (no
+    // `toString`/`valueOf`) threw a raw `TypeError` ("No default value")
+    // while *constructing* the error meant to report the problem.
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { now: Object.create(null) as number }),
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+    );
+  });
+
+  test("a non-number casRetry.maxAttempts surfaces as a CanKanError, not a raw TypeError", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { casRetry: { maxAttempts: Object.create(null) as number } }),
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+    );
+  });
+
+  test("a ulidFactory returning an unserializable value (BigInt) is rejected as EVENT_APPEND_REJECTED, not a raw TypeError from JSON.stringify", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    // Before the fix: `JSON.stringify` itself threw ("Do not know how to
+    // serialize a BigInt") before `parseEvent` ever ran, escaping this
+    // function's own `isCanKanError`-shaped error contract entirely.
+    await expectCode(
+      append(adapter, COORD_REF, claim("ck-1"), { ulidFactory: () => 1n as unknown as string }),
+      EventErrorCodes.EVENT_APPEND_REJECTED,
+    );
+  });
+});

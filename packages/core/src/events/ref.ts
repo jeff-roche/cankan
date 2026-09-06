@@ -249,8 +249,14 @@ export interface InitRefHooks {
  * is this phase's bar, and a single re-read after one rejection already
  * clears it.
  */
-export async function initRef(adapter: GitAdapter, ref: string, options: InitRefOptions = {}): Promise<void> {
-  return initRefCore(adapter, ref, options, {});
+export async function initRef(adapter: GitAdapter, ref: string, options: InitRefOptions | null = {}): Promise<void> {
+  // Fix round 3 (Ruling R31/R32, orchestrator security review): a default
+  // parameter does not apply to an explicit `null` — confirmed by probe,
+  // `initRef(adapter, ref, null)` previously threw a raw `TypeError` on
+  // `options.now` rather than surfacing through this module's own
+  // validated error path. Same pattern applied throughout `log.ts` and
+  // `recovery.ts` (fix round 2/3).
+  return initRefCore(adapter, ref, options ?? {}, {});
 }
 
 /** See `InitRefHooks`'s doc comment: the module-internal export a test drives directly. `initRef` is the public surface; it calls this with no hooks. */

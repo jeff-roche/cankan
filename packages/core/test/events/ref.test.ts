@@ -382,3 +382,21 @@ describe("initRef — fix round 3, L2: a ref that vanishes between readRef and t
     expect(await adapter.readRef(COORD_REF)).not.toBeNull();
   });
 });
+
+// ============================================================================
+// Fix round 3 (Ruling R31/R32, orchestrator security review): an explicit
+// `null` options argument must not throw a raw TypeError
+// ============================================================================
+
+describe("initRef — fix round 3: an explicit null options argument is normalized, not a raw TypeError", () => {
+  test("initRef(adapter, ref, null) behaves exactly like initRef(adapter, ref) — creates the ref, no raw TypeError", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // Before the fix: `options.now` on a `null` options argument threw a
+    // raw `TypeError` (a default parameter does not apply to an explicit
+    // `null`).
+    await initRef(adapter, COORD_REF, null);
+    expect(await adapter.readRef(COORD_REF)).not.toBeNull();
+  });
+});

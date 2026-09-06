@@ -667,6 +667,94 @@ describe("recover — fix round 3, Ruling R47: a duplicate-id conflict is always
   });
 });
 
+describe("diagnose/recover — fix round 3 follow-up, Ruling R47 fallout: an unbounded pile of unfixable duplicate-id-conflict spans cannot starve a fixable line out of the same run", () => {
+  test("5,001 lines sharing one event id (5,000 distinct-content duplicates, defeating coalescing) placed before one repairable invalid-json line no longer hide it, and recovery makes real progress", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    // A single shared event id, repeated with a DIFFERING field each time
+    // (`actor`) so coalescing — which requires byte-identical lines — never
+    // collapses these into one span. The first occurrence is recorded, not
+    // a conflict; the remaining 5,000 are all "duplicate-id-conflict,"
+    // permanently unfixable per Ruling R47 — exactly enough to fully
+    // consume the OLD code's single shared `MAX_DIAGNOSTIC_FAILURES`
+    // budget, without exceeding this follow-up's own INDEPENDENT unfixable
+    // budget (also 5,000).
+    const sharedId = ulid();
+    const augLines: string[] = [];
+    for (let i = 0; i < 5001; i++) {
+      augLines.push(
+        JSON.stringify({ ts: "2026-08-04T10:12:00Z", id: sharedId, actor: `actor-${i}`, ticket: "ck-1", event: "release" }),
+      );
+    }
+    await seedRef(adapter, [
+      // Placed in the OLDER month so this walk (oldest-month-first)
+      // encounters all 5,000 unfixable duplicate spans before it ever
+      // reaches the genuinely repairable line below.
+      { path: "events/2026-08.jsonl", content: `${augLines.join("\n")}\n` },
+      { path: "events/2026-09.jsonl", content: "not valid json\n" },
+    ]);
+
+    // Before this follow-up: a single shared `failures.length` cap meant
+    // these 5,000 distinct-content unfixable spans alone exhausted
+    // `MAX_DIAGNOSTIC_FAILURES` (5,000) before the walk ever reached
+    // September — the repairable `invalid-json` line was never even
+    // scanned, `recover()` reported `unrepairable`/`quarantined: []`
+    // forever, and three consecutive runs made zero progress.
+    const report = await diagnose(adapter, COORD_REF, { now: NOW, trailingMonths: 2 });
+    const reasonCounts = new Map<string, number>();
+    for (const f of report.failures) {
+      reasonCounts.set(f.reason, (reasonCounts.get(f.reason) ?? 0) + (f.reason === "diagnostic-truncated" ? 1 : (f.count ?? 1)));
+    }
+    expect(reasonCounts.get("duplicate-id-conflict")).toBe(5000); // exactly at (not over) its own, independent cap
+    expect(reasonCounts.get("diagnostic-truncated")).toBeUndefined(); // no cap was actually exceeded this run
+    expect(reasonCounts.get("invalid-json")).toBe(1); // the fixable line IS still found — this is the fix
+
+    const firstRun = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    expect(firstRun.outcome).toBe("recovered");
+    expect(firstRun.quarantined).toHaveLength(1);
+    expect(firstRun.newTip).not.toBe(firstRun.previousTip);
+
+    const septRaw = await adapter.readBlobFromRef(COORD_REF, "events/2026-09.jsonl");
+    expect(septRaw).toBe(""); // the one bad line was actually removed
+
+    // Subsequent runs correctly stay unrepairable — the 5,000 duplicate-id
+    // lines are never auto-resolved, per Ruling R47 — but that is now the
+    // TRUE state of the board, not an artifact of the fixable line having
+    // been invisible to the scan.
+    const secondRun = await recover(adapter, COORD_REF, { now: NOW, casRetry: FAST_RETRY });
+    expect(secondRun.outcome).toBe("unrepairable");
+    expect(secondRun.quarantined).toEqual([]);
+    expect(secondRun.newTip).toBe(secondRun.previousTip);
+  }, 30_000);
+
+  test("the truncation message stops promising progress from re-running when this run found zero fixable spans", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+
+    const sharedId = ulid();
+    const augLines: string[] = [];
+    for (let i = 0; i < 5002; i++) {
+      augLines.push(
+        JSON.stringify({ ts: "2026-08-04T10:12:00Z", id: sharedId, actor: `actor-${i}`, ticket: "ck-1", event: "release" }),
+      );
+    }
+    // No fixable content anywhere in the window — this run's own truncation
+    // marker is the ONLY thing reported once the unfixable cap is hit.
+    await seedRef(adapter, [{ path: "events/2026-08.jsonl", content: `${augLines.join("\n")}\n` }]);
+
+    const report = await diagnose(adapter, COORD_REF, { now: NOW, trailingMonths: 2 });
+    const truncated = report.failures.find((f) => f.reason === "diagnostic-truncated");
+    expect(truncated).toBeDefined();
+    // Before this follow-up: this message unconditionally said "re-run
+    // recovery (possibly more than once) to make further progress" — false
+    // in this exact case, since every capped failure is unfixable and
+    // re-running will encounter the identical pile again, forever.
+    expect(truncated?.message).not.toContain("re-run recovery");
+    expect(truncated?.message).toContain("cannot make progress past this point on its own");
+  });
+});
+
 // ============================================================================
 // A structural, non-line-level corruption (a non-blob month path) is
 // diagnosed but not silently absorbed by recovery

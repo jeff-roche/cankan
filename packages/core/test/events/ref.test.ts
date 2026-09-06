@@ -392,6 +392,49 @@ describe("initRef — fix round 3 follow-up, Ruling R48: checkRefUsability close
   });
 });
 
+describe("initRef — fix round 3 follow-up #2: a genuine, non-GIT_REF_NOT_FOUND error probing the `events` prefix is reported directly, never silently absorbed", () => {
+  test("a 100644 entry at `events` pointing at a MISSING object makes initRef() fail closed too, matching read()/diagnose()", async () => {
+    const repo = await tempRepo();
+    const adapter = await createGitAdapter(repo.dir);
+    await initRef(adapter, COORD_REF, { now: NOW });
+
+    // `git mktree --missing` allows building a tree that references an
+    // object never actually written to the store — a `100644` mode (not
+    // ambiguous at all: it IS the expected blob mode) whose content simply
+    // can't be read. `ls-tree` succeeds; the underlying blob read fails
+    // with `GIT_COMMAND_FAILED` — a different failure shape than
+    // `GIT_BLOB_AMBIGUOUS`, and not `GIT_REF_NOT_FOUND` either.
+    const missingSha = "b".repeat(40);
+    const treeSha = rawGit(repo.dir, ["mktree", "--missing"], `100644 blob ${missingSha}\tevents\n`).trim();
+    const parent = await adapter.readRef(COORD_REF);
+    if (parent === null) throw new Error("expected an existing ref");
+    const commitSha = rawGit(repo.dir, ["commit-tree", "-p", parent, "-m", "plant missing object", treeSha]).trim();
+    rawGit(repo.dir, ["update-ref", COORD_REF, commitSha]);
+
+    // read() already fails closed for this exact shape — pinned here, on
+    // this exact repo, rather than merely claimed: both functions call the
+    // adapter's own `readBlobFromRef`, which fails identically regardless
+    // of which module calls it.
+    await expectCode(read(adapter, COORD_REF, { now: NOW }), GitErrorCodes.GIT_COMMAND_FAILED);
+
+    // Before this follow-up: checkRefUsability's own probe hit the
+    // identical GIT_COMMAND_FAILED, then silently fell through to a SECOND
+    // probe at a deeper, nested path that "doesn't exist" under a non-tree
+    // `events` entry — succeeding with `null` and reporting `initRef()`
+    // usable on the exact board `read()`, just above, already refuses.
+    try {
+      await initRef(adapter, COORD_REF, { now: NOW });
+      throw new Error("expected initRef() to reject");
+    } catch (error) {
+      if (!isCanKanError(error)) throw error;
+      expect(error.code).toBe(EventErrorCodes.EVENT_REF_UNUSABLE);
+      expect(isCanKanError(error.cause)).toBe(true);
+      if (!isCanKanError(error.cause)) throw new Error("unreachable");
+      expect(error.cause.code).toBe(GitErrorCodes.GIT_COMMAND_FAILED);
+    }
+  });
+});
+
 // ============================================================================
 // Fix round 1, S4/Ruling R20 — end-to-end fm10 coverage, exercised on initRef
 // too. Fix round 2, Ruling R24: this is an end-to-end assertion, not a guard

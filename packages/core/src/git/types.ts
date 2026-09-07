@@ -171,6 +171,9 @@ export interface GitAdapter {
    */
   readonly root: string;
 
+  /** Reads this repository's configured `user.name`; returns null when unset. */
+  gitUserName(): Promise<string | null>;
+
   /**
    * `git show-ref --exists` to discriminate "absent" from "present but
    * unreadable/broken" (fix-round-1 F5), then `git rev-parse --verify

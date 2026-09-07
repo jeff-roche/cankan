@@ -37,6 +37,25 @@ import { withEnv } from "../../test-utils/src/withEnv";
 const COORD_REF = "refs/cankan/coordination";
 const STAGING_REF = "refs/cankan/coordination-remote";
 
+test("git adapter reads the repository user.name and returns null when unset", async () => {
+  const repo = await makeTempRepo();
+  try {
+    const adapter = await createGitAdapter(repo.dir);
+    expect(await adapter.gitUserName()).toBe("CanKan Test");
+
+    const unset = await makeTempRepo();
+    try {
+      Bun.spawnSync(["git", "config", "--local", "user.name", ""], { cwd: unset.dir });
+      const unsetAdapter = await createGitAdapter(unset.dir);
+      expect(await unsetAdapter.gitUserName()).toBeNull();
+    } finally {
+      await unset.cleanup();
+    }
+  } finally {
+    await repo.cleanup();
+  }
+});
+
 /** Raw plumbing for test setup/assertions only — never the adapter under test. */
 function git(cwd: string, args: string[]): string {
   const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });

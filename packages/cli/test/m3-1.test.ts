@@ -11,14 +11,25 @@ test("M3.1 resolves a repo context and git actor fallback", async () => {
   try {
     await mkdir(join(repo.dir, ".cankan"));
     await withEnv(undefined, async () => {
-      const context = await buildContext({ cwd: repo.dir, json: true });
+      const previousActor = process.env.CANKAN_ACTOR;
+      const previousIdentity = process.env.CANKAN_IDENTITY__NAME;
+      delete process.env.CANKAN_ACTOR;
+      delete process.env.CANKAN_IDENTITY__NAME;
       try {
-        expect(context.board.root).toBe(repo.dir);
-        expect(context.actor.id).toBe("CanKan Test");
-        expect(context.actor.source).toBe("git");
-        expect(contextSummary(context).output).toEqual({ mode: "json", quiet: false, verbose: false });
+        const context = await buildContext({ cwd: repo.dir, json: true });
+        try {
+          expect(context.board.root).toBe(repo.dir);
+          expect(context.actor.id).toBe("CanKan Test");
+          expect(context.actor.source).toBe("git");
+          expect(contextSummary(context).output).toEqual({ mode: "json", quiet: false, verbose: false });
+        } finally {
+          context.core.dispose();
+        }
       } finally {
-        context.core.dispose();
+        if (previousActor === undefined) delete process.env.CANKAN_ACTOR;
+        else process.env.CANKAN_ACTOR = previousActor;
+        if (previousIdentity === undefined) delete process.env.CANKAN_IDENTITY__NAME;
+        else process.env.CANKAN_IDENTITY__NAME = previousIdentity;
       }
     });
   } finally {

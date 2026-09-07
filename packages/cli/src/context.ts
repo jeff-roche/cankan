@@ -42,17 +42,22 @@ export async function buildContext(argv: GlobalArgs, outputOptions: OutputOption
   const adapter = await core.git.createGitAdapter(board.root);
   const boardKey = await core.events.boardKeyFor(adapter);
   const index = core.index.openIndex({ boardKey });
-  const invalidator = core.index.createIndexInvalidator(index);
-  const store = await core.store.openTicketStore({ board, gitDirs: [await adapter.gitCommonDir()], onWrite: invalidator });
-  const actor = await core.actor.resolveActor({ config, flag: argv.actor, gitUserName: () => adapter.gitUserName() });
-  return {
-    config,
-    board,
-    actor,
-    core: { adapter, store, index, dispose: () => index.close() },
-    output: createOutput({ json: argv.json, plain: argv.plain, quiet: argv.q, verbose: argv.v, ...outputOptions }),
-    yes: argv.yes ?? false,
-  };
+  try {
+    const invalidator = core.index.createIndexInvalidator(index);
+    const store = await core.store.openTicketStore({ board, gitDirs: [await adapter.gitCommonDir()], onWrite: invalidator });
+    const actor = await core.actor.resolveActor({ config, flag: argv.actor, gitUserName: () => adapter.gitUserName() });
+    return {
+      config,
+      board,
+      actor,
+      core: { adapter, store, index, dispose: () => index.close() },
+      output: createOutput({ json: argv.json, plain: argv.plain, quiet: argv.q, verbose: argv.v, ...outputOptions }),
+      yes: argv.yes ?? false,
+    };
+  } catch (error) {
+    index.close();
+    throw error;
+  }
 }
 
 export function contextSummary(context: Context): Record<string, unknown> {

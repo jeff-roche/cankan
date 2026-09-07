@@ -1,8 +1,9 @@
+export { TicketErrorCodes } from "./errors";
 export {
   buildTicketFilename,
+  type ParsedTicketFilename,
   parseTicketFilename,
   slugifyTitle,
-  type ParsedTicketFilename,
 } from "./filename";
 export {
   type ParsedTicket,
@@ -17,9 +18,15 @@ export {
   normalizeTicketIdForComparison,
   type TicketIdLookupKey,
 } from "./id";
+export type {
+  CloseParams,
+  CreateParams,
+  MoveParams,
+  TicketEventResult,
+} from "./operations";
+export { close, create, move } from "./operations";
 export {
   type CankanBlock,
   type TicketFrontmatter,
   ticketFrontmatterSchema,
 } from "./schema";
-export { TicketErrorCodes } from "./errors";

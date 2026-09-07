@@ -126,6 +126,8 @@ import { claimedBy, observeAndFold } from "../state/index";
 import type { TicketStore } from "../store/index";
 import { normalizeTicketIdForComparison, openTicketStore } from "../store/index";
 import { loadBoardConfig } from "../board/index";
+import type { ConfigResult } from "../config/index";
+import { dispatchHooks } from "../hooks/dispatch";
 import { parseDurationMs } from "./duration";
 import { ClaimErrorCodes } from "./errors";
 
@@ -152,6 +154,7 @@ interface ClaimContext {
   readonly leaseTtlMs: number;
   readonly maxPerActor: number;
   readonly trailingMonths: number;
+  readonly config: ConfigResult;
 }
 
 interface ResolveClaimContextParams {
@@ -194,6 +197,7 @@ async function resolveClaimContext(params: ResolveClaimContextParams): Promise<C
     leaseTtlMs,
     maxPerActor: config.value.claims.max_per_actor,
     trailingMonths,
+    config,
   };
 }
 
@@ -771,6 +775,7 @@ async function claimAttempt(
       return { done: false };
     }
     await runDiscardWalk(ctx, expireDisplacedRun);
+    await dispatchHooks(ctx, "expire", ticketState.id, params.actor);
     return { done: false };
   }
 
@@ -796,6 +801,7 @@ async function claimAttempt(
   // this reader (`firstSeenMs` would stay `undefined` forever).
   await observe(ctx.boardKey, appended.event.id, { now: ctx.now });
   await runDiscardWalk(ctx, takeoverDisplacedRun);
+  await dispatchHooks(ctx, "claim", ticketState.id, params.actor);
 
   return {
     done: true,
@@ -1067,6 +1073,7 @@ async function releaseAttempt(
   // Discard AFTER the terminating append succeeded, never before (this
   // file's header, and `runDiscardWalk`'s own doc comment).
   await runDiscardWalk(ctx, run);
+  await dispatchHooks(ctx, "release", ticketState.id, params.actor);
 
   return { done: true, value: { ticketId: ticketState.id, eventId: appended.event.id, attempts: attemptNumber } };
 }
@@ -1190,6 +1197,7 @@ async function expireStaleAttempt(
   // remaining ticket's records leak silently and no lease ever expires
   // again for this reader).
   await runDiscardWalk(ctx, run);
+  await dispatchHooks(ctx, "expire", ticketState.id, actor);
 
   return { done: true, value: { kind: "expired", eventId: appended.event.id } };
 }

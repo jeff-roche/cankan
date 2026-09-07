@@ -21,6 +21,9 @@ describe("core.ticket — the M2.2 public surface", () => {
       "serializeTicketFile",
       "setCankanBlock",
       "setScalarField",
+      "create",
+      "move",
+      "close",
       "generateTicketId",
       "keepOnDiskIdCasing",
       "normalizeTicketIdForComparison",
@@ -31,7 +34,10 @@ describe("core.ticket — the M2.2 public surface", () => {
   });
 
   test("every value export is a function, except the two data constants", () => {
-    const dataConstants = new Set(["ticketFrontmatterSchema", "TicketErrorCodes"]);
+    const dataConstants = new Set([
+      "ticketFrontmatterSchema",
+      "TicketErrorCodes",
+    ]);
     for (const [name, value] of Object.entries(core.ticket)) {
       if (dataConstants.has(name)) {
         expect(value, name).toBeTypeOf("object");

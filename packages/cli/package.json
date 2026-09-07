@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@jeff-roche/cankan-core": "workspace:*"
+    "@jeff-roche/cankan-core": "workspace:*",
+    "citty": "^0.2.2"
   },
   "publishConfig": {
     "access": "public"

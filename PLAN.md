@@ -320,7 +320,7 @@ All M3 tasks live in `packages/cli`. **M3.1 owns the command registry and the co
 ### M3.1 CLI shell, registry, context, output
 - **Creates:** `src/main.ts` (citty root), `src/registry.ts` (`defineCommand` wrapper that records a machine-readable spec: name, args, flags, description — consumed later by M4.2 and M5.3), `src/context.ts` (`buildContext(argv) → {config, board, actor, core, output}` calling M2.3/M2.4/M2.18 and opening the store/log/index for the board), `src/output.ts` (`--json`, `--plain`, tables, colors), global flags.
 - **Wires:** config → board → actor → core handle into one object. This is the plumbing every command assumes; it exists here and nowhere else.
-- **Depends on:** M2.3, M2.4, M2.18, M2.9
+- **Depends on:** M2.3, M2.4, M2.5, M2.6, M2.7, M2.9, M2.14, M2.15, M2.18
 - **Done when:** `cankan --help` lists global flags; a `noop` command prints the resolved context under `--json`.
 
 ### M3.2 `init`
@@ -372,7 +372,7 @@ All M3 tasks live in `packages/cli`. **M3.1 owns the command registry and the co
 ### M3.11 [wire] CLI end-to-end
 - **Creates:** `packages/cli/test/e2e.test.ts`.
 - **Wires:** runs the built binary: `init --no-wizard` → `create` ×3 with deps → `ready` → `claim --next` → `move` → `close` → `board --json` in a temp repo with a second worktree claiming concurrently. First proof the CLI is usable by an agent.
-- **Depends on:** M3.2–M3.10
+- **Depends on:** M3.2, M3.3, M3.4, M3.5, M3.6, M3.7, M3.8, M3.9, M3.10
 - **Done when:** passes in CI; also runs from the secondary worktree.
 
 ---

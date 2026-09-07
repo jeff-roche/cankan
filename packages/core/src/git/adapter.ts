@@ -710,6 +710,17 @@ export async function createGitAdapter(cwd: string, options: GitAdapterOptions =
 
   return {
     root,
+    gitUserName: async () => {
+      const result = await runGitRaw(root, ["config", "--get", "user.name"]);
+      if (result.exitCode === 0) {
+        const name = result.stdout.trim();
+        return name.length === 0 ? null : name;
+      }
+      if (result.exitCode === 1 && result.stdout.trim().length === 0) return null;
+      throw new CanKanError(GitErrorCodes.GIT_COMMAND_FAILED, "git config user.name failed", {
+        cause: new Error(result.stderr.trim()),
+      });
+    },
     readRef: async (ref) => readRefCore(root, await ensureValidRef(root, ref)),
     updateRefCAS: async (ref, newSha, oldSha) =>
       updateRefCASCore(root, await ensureValidRef(root, ref), newSha, oldSha),

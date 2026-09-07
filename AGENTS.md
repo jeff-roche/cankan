@@ -12,6 +12,7 @@
 
 - This is a Bun workspace under `packages/*`: `core` owns domain logic, `cli` depends on `core`, `mcp` depends on `cli`, `backers` depends on `core`, and `test-utils` provides shared test helpers.
 - Package source entrypoints are each package's `src/index.ts`; tests live beside the package in `test/`, primarily under `packages/core/test`.
+- GitHub Issues are the work-tracking source of truth from MB.3 onward; use the task IDs and dependencies defined by `PLAN.md` when locating work.
 - `PLAN.md` is the ownership and dependency source of truth: do not consume an artifact from a task unless its creating task is listed in `Depends on`.
 
 ## Core boundaries

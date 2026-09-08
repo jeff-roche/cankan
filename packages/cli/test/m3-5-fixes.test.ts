@@ -323,6 +323,51 @@ test("M3.5 mine lists claims and assignments", async () => {
   }
 });
 
+test("M3.5 claim --next forwards a lease override to the claim event", async () => {
+  const repo = await makeTempRepo();
+  try {
+    await withEnv(undefined, async () => {
+      await mkdir(join(repo.dir, "backlog", "tasks"), { recursive: true });
+      await writeFixtureTickets(join(repo.dir, "backlog", "tasks"), [
+        { id: "ck-a", title: "A", status: "To Do", body: "A" },
+        { id: "ck-b", title: "B", status: "To Do", body: "B" },
+      ]);
+      const context = await makeContext(repo.dir);
+      try {
+        // Overridden lease (1h) vs the repo's default (2h). Both claims occur
+        // within milliseconds, so comparing the two `leaseUntil` timestamps
+        // cancels the clock skew and isolates the override's ~1h delta.
+        const overridden = await claimNext(
+          context.core,
+          context.board,
+          context.actor.id,
+          context.config,
+          { lease: "1h" },
+        );
+        const baseline = await claimNext(
+          context.core,
+          context.board,
+          context.actor.id,
+          context.config,
+          {},
+        );
+        if (overridden === undefined || baseline === undefined) {
+          throw new Error("expected both claim-next calls to succeed");
+        }
+        const deltaMs =
+          new Date(baseline.leaseUntil).getTime() -
+          new Date(overridden.leaseUntil).getTime();
+        const hourMs = 60 * 60 * 1000;
+        expect(Math.abs(deltaMs - hourMs)).toBeLessThan(hourMs / 2);
+      } finally {
+        context.core.dispose();
+      }
+    });
+  } finally {
+    await repo.cleanup();
+  }
+});
+
 test("M3.5 actors --active groups by event parent, falling back to actor-derived parent", async () => {
   const repo = await makeTempRepo();
   try {

@@ -342,6 +342,8 @@ export async function runExpireSweep(
 export interface ClaimNextOptions extends FilterOverrides {
   readonly queue?: string;
   readonly order?: string;
+  /** A duration string overriding the claim event's `lease_until` display field — the same `ClaimParams.lease` the direct `core.claims.claim` path accepts. */
+  readonly lease?: string;
   /** The human an agent inherits from, written to the claim event's `parent` — the same `ClaimParams.parent` the direct `core.claims.claim` path accepts. */
   readonly parent?: string;
   readonly flatDependencies?: Readonly<Record<string, readonly string[]>>;
@@ -380,6 +382,7 @@ export async function claimNext(
         board,
         ticket: candidate.ticket.id,
         actor: actor as core.ActorId,
+        ...(options.lease !== undefined ? { lease: options.lease } : {}),
         ...(options.parent !== undefined
           ? { parent: options.parent as core.ActorId }
           : {}),
@@ -739,6 +742,7 @@ export const coordClaimCommand = defineCommand({
           {
             ...(parsed.queue !== undefined ? { queue: parsed.queue } : {}),
             ...(parsed.order !== undefined ? { order: parsed.order } : {}),
+            ...(parsed.lease !== undefined ? { lease: parsed.lease } : {}),
             ...(parsed.label !== undefined ? { label: parsed.label } : {}),
             ...(parsed.milestone !== undefined
               ? { milestone: parsed.milestone }

@@ -23,6 +23,8 @@ export {
 } from "./commands/config";
 export type { ConfigTarget, SetConfigValueOptions } from "./commands/config";
 export {
+  activeActors,
+  claimExplicit,
   claimNext,
   coordActorsCommand,
   coordAssignCommand,
@@ -34,6 +36,8 @@ export {
   coordReadyCommand,
   coordReleaseCommand,
   coordRenewCommand,
+  mine,
+  parseLimitOption,
   releaseAll,
   renewAll,
   resolveAssignActors,
@@ -41,8 +45,11 @@ export {
   serializeAssignees,
 } from "./commands/coord";
 export type {
+  ActiveActorGroup,
+  ClaimExplicitOptions,
   ClaimNextOptions,
   CoordListOptions,
+  MineResult,
   ReadyResult,
   ReadyTicket,
 } from "./commands/coord";

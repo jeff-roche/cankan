@@ -20,6 +20,25 @@ interface Snapshot {
   readonly state: core.state.BoardState;
   /** `normalized id -> parsed frontmatter`, from the same store.list() the fold consumed. */
   readonly frontmatter: ReadonlyMap<string, core.ticket.ParsedTicket>;
+  /** The raw event records that produced `state`, from the same `events.read()` call. */
+  readonly events: readonly core.events.EventRecord[];
+}
+
+/**
+ * Mirrors `claims/claim.ts`'s own `computeTrailingMonths` formula so the CLI's
+ * board snapshot folds from the same trailing window core claims folds from:
+ * `clamp(max(2, ceil(leaseTtlMs / 30 days) + 1), 1, 120)`. Extracted to a
+ * named helper rather than inlined because the two layers must not drift —
+ * a lease taken out near a month boundary must still be visible after the
+ * boundary rolls over (core claims' documented contract to `events.read`),
+ * and `events.read`'s default of 2 is a floor, not a value tuned to a lease.
+ */
+function computeTrailingMonths(leaseTtlMs: number): number {
+  const windowMonthMs = 30 * 24 * 60 * 60 * 1000;
+  return Math.min(
+    120,
+    Math.max(1, Math.max(2, Math.ceil(leaseTtlMs / windowMonthMs) + 1)),
+  );
 }
 
 async function snapshotBoard(
@@ -34,7 +53,7 @@ async function snapshotBoard(
     board.coordinationRef,
     {
       now,
-      trailingMonths: 2,
+      trailingMonths: computeTrailingMonths(leaseTtlMs),
     },
   );
   const { tickets } = await coreHandle.store.list();
@@ -50,7 +69,7 @@ async function snapshotBoard(
       stored.ticket,
     );
   }
-  return { state, frontmatter };
+  return { state, frontmatter, events };
 }
 
 // ============================================================================
@@ -178,6 +197,15 @@ function orderableFor(
     ...(parsed?.priority !== undefined ? { priority: parsed.priority } : {}),
     ...(parsed?.milestone !== undefined ? { milestone: parsed.milestone } : {}),
     ...(parsed?.labels !== undefined ? { labels: parsed.labels } : {}),
+    // `OrderableTicket.backer` drives `backer` sort/filter/queue terms. The
+    // ticket schema has no top-level `backer` field — `cankan.origin` (the
+    // backer type this ticket was synced from, e.g. "github") is the source
+    // it descends from — so that frontmatter value is lifted in as `backer`
+    // here. Only when the block records it; a native ticket has no origin
+    // and thus no backer.
+    ...(parsed?.cankan?.origin !== undefined
+      ? { backer: parsed.cankan.origin }
+      : {}),
     ...(parsed?.ordinal !== undefined ? { ordinal: parsed.ordinal } : {}),
     ...(parsed?.due_date !== undefined ? { due_date: parsed.due_date } : {}),
     ...(parsed?.created_date !== undefined
@@ -314,6 +342,8 @@ export async function runExpireSweep(
 export interface ClaimNextOptions extends FilterOverrides {
   readonly queue?: string;
   readonly order?: string;
+  /** The human an agent inherits from, written to the claim event's `parent` — the same `ClaimParams.parent` the direct `core.claims.claim` path accepts. */
+  readonly parent?: string;
   readonly flatDependencies?: Readonly<Record<string, readonly string[]>>;
 }
 
@@ -350,6 +380,9 @@ export async function claimNext(
         board,
         ticket: candidate.ticket.id,
         actor: actor as core.ActorId,
+        ...(options.parent !== undefined
+          ? { parent: options.parent as core.ActorId }
+          : {}),
       });
     } catch (error) {
       if (
@@ -378,13 +411,23 @@ export async function renewAll(
     core.state.claimedBy(snapshot.state).get(actor as core.ActorId) ?? [];
   const results: core.claims.RenewResult[] = [];
   for (const ticket of mine) {
-    results.push(
-      await core.claims.renew({
-        board,
-        ticket: ticket.id,
-        actor: actor as core.ActorId,
-      }),
-    );
+    try {
+      results.push(
+        await core.claims.renew({
+          board,
+          ticket: ticket.id,
+          actor: actor as core.ActorId,
+        }),
+      );
+    } catch (error) {
+      // A stale/forfeited claim (claimed or released out from underneath the
+      // sweep's initial fold) surfaces per-ticket as a `CLAIM_REJECTED`
+      // (`reason: not-held`/`not-holder`/`lease-expired`). That is a race, not
+      // an operational failure — skip it and keep renewing the rest. Every
+      // other error (an observation-store failure, a git failure) propagates.
+      if (isLostClaimRace(error)) continue;
+      throw error;
+    }
   }
   return results;
 }
@@ -401,15 +444,167 @@ export async function releaseAll(
     core.state.claimedBy(snapshot.state).get(actor as core.ActorId) ?? [];
   const results: core.claims.ReleaseResult[] = [];
   for (const ticket of mine) {
-    results.push(
-      await core.claims.release({
-        board,
-        ticket: ticket.id,
-        actor: actor as core.ActorId,
-      }),
-    );
+    try {
+      results.push(
+        await core.claims.release({
+          board,
+          ticket: ticket.id,
+          actor: actor as core.ActorId,
+        }),
+      );
+    } catch (error) {
+      // Same per-ticket race tolerance as `renewAll` — a `CLAIM_REJECTED`
+      // outcome for one ticket must not abort the remaining releases.
+      if (isLostClaimRace(error)) continue;
+      throw error;
+    }
   }
   return results;
+}
+
+/** A `CLAIM_REJECTED` outcome is a per-ticket race (claimed/released out from underneath an all-tickets sweep), never an operational failure — see `renewAll`/`releaseAll`. */
+function isLostClaimRace(error: unknown): boolean {
+  return (
+    core.isCanKanError(error) && error.code === core.ErrorCodes.CLAIM_REJECTED
+  );
+}
+
+// ============================================================================
+// Explicit claim — `claim <id>` enforces `claims.require_ready` (fix: eager
+// policy enforcement; the CAS in `core.claims.claim` alone never reads it).
+// ============================================================================
+
+/** Mirrors `claims/claim.ts`'s file-private `resolveTicket` (id/displayId only, ambiguity checked first) so `claim <id>` resolves the requested ticket against the same board state it will gate on, before handing it to `core.claims.claim`. Duplicated (not importable from `claims/`) with identical normalization and failure codes. */
+function resolveTicketInState(
+  state: core.state.BoardState,
+  ticketQuery: string,
+): core.state.TicketState {
+  const key = core.ticket.normalizeTicketIdForComparison(ticketQuery);
+  if (state.duplicateTicketIds.some((d) => d.ticketId === key)) {
+    throw new core.CanKanError(
+      core.claims.ClaimErrorCodes.TICKET_AMBIGUOUS,
+      `ticket "${ticketQuery}" is ambiguous: more than one on-disk ticket file declares this id`,
+      { details: { ticket: ticketQuery } },
+    );
+  }
+  const matches = state.tickets.filter((t) => {
+    if (core.ticket.normalizeTicketIdForComparison(t.id) === key) return true;
+    return (
+      t.displayId !== undefined &&
+      core.ticket.normalizeTicketIdForComparison(t.displayId) === key
+    );
+  });
+  if (matches.length > 1) {
+    throw new core.CanKanError(
+      core.claims.ClaimErrorCodes.TICKET_AMBIGUOUS,
+      `ticket "${ticketQuery}" is ambiguous: more than one ticket matches this id or display id`,
+      { details: { ticket: ticketQuery, matches: matches.length } },
+    );
+  }
+  const match = matches[0];
+  if (match === undefined) {
+    throw new core.CanKanError(
+      core.claims.ClaimErrorCodes.TICKET_NOT_FOUND,
+      `no ticket found matching "${ticketQuery}"`,
+      { details: { ticket: ticketQuery } },
+    );
+  }
+  return match;
+}
+
+export interface ClaimExplicitOptions {
+  readonly force?: boolean;
+  readonly lease?: string;
+  readonly parent?: string;
+  /** Normalized frontmatter `dependencies` overrides (used by tests). */
+  readonly flatDependencies?: Readonly<Record<string, readonly string[]>>;
+}
+
+/**
+ * `claim <id>`: enforce `config.value.claims.require_ready` before calling
+ * `core.claims.claim`. When the policy is true (the default) and this is **not
+ * a `--force` takeover**, a fresh snapshot's `core.deps.isReady` verdict gates
+ * the claim — a non-ready ticket (claimed, closed, or carrying an open
+ * blocker) is rejected with `core.ErrorCodes.CLAIM_REJECTED` /
+ * `details.reason: "not-ready"`, *before* the CAS-based `claim` ever runs.
+ *
+ * `--force` skips the readiness gate (and the `require_ready: false` path
+ * skips it too): a takeover exists precisely to displace a *live* claim, which
+ * `isReady` always reports as the `"claimed"` blocker — gating a force over
+ * `isReady` would make every takeover reject itself. Closure stays enforced
+ * by `core.claims.claim`'s own `closed` check regardless.
+ */
+export async function claimExplicit(
+  coreHandle: CoreHandle,
+  board: core.BoardRef,
+  actor: string,
+  config: core.config.ConfigResult,
+  ticketId: string,
+  options: ClaimExplicitOptions = {},
+): Promise<core.claims.ClaimResult> {
+  const baseParams = {
+    force: options.force,
+    lease: options.lease,
+    parent: options.parent as core.ActorId | undefined,
+  };
+
+  const requireReady =
+    config.value.claims.require_ready && baseParams.force !== true;
+
+  if (!requireReady) {
+    return core.claims.claim({
+      board,
+      ticket: ticketId,
+      actor: actor as core.ActorId,
+      ...(baseParams.force ? { force: true } : {}),
+      ...(baseParams.lease !== undefined ? { lease: baseParams.lease } : {}),
+      ...(baseParams.parent !== undefined ? { parent: baseParams.parent } : {}),
+    });
+  }
+
+  const snapshot = await snapshotBoard(coreHandle, board, config);
+  const target = resolveTicketInState(snapshot.state, ticketId);
+  const isReadyOptions = readinessOptions(
+    config,
+    snapshot.frontmatter,
+    options.flatDependencies ?? {},
+  );
+  const verdict = core.deps.isReady(snapshot.state, target.id, isReadyOptions);
+  if (!verdict.ready) {
+    throw new core.CanKanError(
+      core.ErrorCodes.CLAIM_REJECTED,
+      `claim rejected (not-ready) for ticket "${target.id}"`,
+      { details: { reason: "not-ready", ticket: target.id } },
+    );
+  }
+
+  return core.claims.claim({
+    board,
+    ticket: target.id,
+    actor: actor as core.ActorId,
+    ...(baseParams.force ? { force: true } : {}),
+    ...(baseParams.lease !== undefined ? { lease: baseParams.lease } : {}),
+    ...(baseParams.parent !== undefined ? { parent: baseParams.parent } : {}),
+  });
+}
+
+/**
+ * Validates and parses the `--limit` flag: a finite, non-negative integer, or
+ * undefined when absent. Anything else is caller misuse (`core.ErrorCodes.USAGE`) —
+ * a fractional, negative, `NaN`, or `Infinity` limit would silently mis-slice
+ * the ready listing. `Number.isInteger` already rejects every non-finite value.
+ */
+export function parseLimitOption(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new core.CanKanError(
+      core.ErrorCodes.USAGE,
+      `--limit must be a finite non-negative integer, got "${raw}"`,
+      { details: { limit: raw } },
+    );
+  }
+  return value;
 }
 
 // ============================================================================
@@ -452,6 +647,7 @@ interface CoordArgs extends GlobalArgs {
   readonly lease?: string;
   readonly all?: boolean;
   readonly actor?: string;
+  readonly target?: string;
   readonly dryRun?: boolean;
   readonly active?: boolean;
 }
@@ -485,19 +681,24 @@ export const coordReadyCommand = defineCommand({
   async run({ args }) {
     const parsed = args as CoordArgs;
     await withCoordContext(parsed, async (context) => {
+      const limit = parseLimitOption(parsed.limit);
       context.output.write(
-        await coordReady(context.core, context.board, context.actor.id, context.config, {
-          ...(parsed.limit !== undefined
-            ? { limit: Number(parsed.limit) }
-            : {}),
-          ...(parsed.label !== undefined ? { label: parsed.label } : {}),
-          ...(parsed.milestone !== undefined
-            ? { milestone: parsed.milestone }
-            : {}),
-          ...(parsed.backer !== undefined ? { backer: parsed.backer } : {}),
-          ...(parsed.order !== undefined ? { order: parsed.order } : {}),
-          ...(parsed.queue !== undefined ? { queue: parsed.queue } : {}),
-        }),
+        await coordReady(
+          context.core,
+          context.board,
+          context.actor.id,
+          context.config,
+          {
+            ...(limit !== undefined ? { limit } : {}),
+            ...(parsed.label !== undefined ? { label: parsed.label } : {}),
+            ...(parsed.milestone !== undefined
+              ? { milestone: parsed.milestone }
+              : {}),
+            ...(parsed.backer !== undefined ? { backer: parsed.backer } : {}),
+            ...(parsed.order !== undefined ? { order: parsed.order } : {}),
+            ...(parsed.queue !== undefined ? { queue: parsed.queue } : {}),
+          },
+        ),
       );
     });
   },
@@ -517,10 +718,18 @@ export const coordClaimCommand = defineCommand({
     lease: { type: "string", description: "Lease duration override" },
     queue: { type: "string", description: "Named queue" },
     order: { type: "string", description: "Sort keys" },
+    label: { type: "string", description: "Restrict --next to a label" },
+    milestone: {
+      type: "string",
+      description: "Restrict --next to a milestone",
+    },
+    backer: { type: "string", description: "Restrict --next to a backer" },
   },
   async run({ args }) {
     const parsed = args as CoordArgs;
     await withCoordContext(parsed, async (context) => {
+      const parent =
+        context.actor.parent === null ? undefined : context.actor.parent;
       if (parsed.next) {
         const result = await claimNext(
           context.core,
@@ -530,6 +739,12 @@ export const coordClaimCommand = defineCommand({
           {
             ...(parsed.queue !== undefined ? { queue: parsed.queue } : {}),
             ...(parsed.order !== undefined ? { order: parsed.order } : {}),
+            ...(parsed.label !== undefined ? { label: parsed.label } : {}),
+            ...(parsed.milestone !== undefined
+              ? { milestone: parsed.milestone }
+              : {}),
+            ...(parsed.backer !== undefined ? { backer: parsed.backer } : {}),
+            ...(parent !== undefined ? { parent } : {}),
           },
         );
         context.output.write(result === undefined ? { claimed: null } : result);
@@ -542,13 +757,18 @@ export const coordClaimCommand = defineCommand({
         );
       }
       context.output.write(
-        await core.claims.claim({
-          board: context.board,
-          ticket: parsed.id,
-          actor: context.actor.id,
-          ...(parsed.force ? { force: true } : {}),
-          ...(parsed.lease !== undefined ? { lease: parsed.lease } : {}),
-        }),
+        await claimExplicit(
+          context.core,
+          context.board,
+          context.actor.id,
+          context.config,
+          parsed.id,
+          {
+            ...(parsed.force ? { force: true } : {}),
+            ...(parsed.lease !== undefined ? { lease: parsed.lease } : {}),
+            ...(parent !== undefined ? { parent } : {}),
+          },
+        ),
       );
     });
   },
@@ -639,15 +859,19 @@ export const coordAssignCommand = defineCommand({
   args: {
     ...globalArgs,
     id: { type: "positional", description: "Ticket id" },
-    actor: { type: "positional", description: "Actor to assign" },
+    // Named `target`, never `actor`, so this positional does not shadow the
+    // global `--actor` flag (which `GlobalArgs` already declares): a bare
+    // second word on `cankan assign <id> <target>` must not collide with
+    // "--actor" in citty's flag registration.
+    target: { type: "positional", description: "Actor to assign" },
   },
   async run({ args }) {
     const parsed = args as CoordArgs;
     await withCoordContext(parsed, async (context) => {
-      if (parsed.id === undefined || parsed.actor === undefined) {
+      if (parsed.id === undefined || parsed.target === undefined) {
         throw new core.CanKanError(
           core.ErrorCodes.USAGE,
-          "assign requires an id and an actor",
+          "assign requires an id and a target actor",
         );
       }
       const stored = await context.core.store.get(parsed.id);
@@ -657,7 +881,7 @@ export const coordAssignCommand = defineCommand({
           `no ticket found matching "${parsed.id}"`,
         );
       }
-      const [assignee] = resolveAssignActors([parsed.actor]);
+      const [assignee] = resolveAssignActors([parsed.target]);
       const updated = core.ticket.setSequenceField(stored.ticket, "assignee", [
         assignee,
       ]);
@@ -667,29 +891,47 @@ export const coordAssignCommand = defineCommand({
   },
 });
 
+export interface MineResult {
+  readonly claims: readonly string[];
+  readonly assignments: readonly string[];
+}
+
+/** `mine`: this actor's live claims plus any tickets whose frontmatter `assignee` names them. */
+export async function mine(
+  coreHandle: CoreHandle,
+  board: core.BoardRef,
+  actor: string,
+  config: core.config.ConfigResult,
+): Promise<MineResult> {
+  const { state, frontmatter } = await snapshotBoard(coreHandle, board, config);
+  const claims = core.state.claimedBy(state).get(actor as core.ActorId) ?? [];
+  const assignments: string[] = [];
+  for (const parsedTicket of frontmatter.values()) {
+    const assignees = parsedTicket.frontmatter.assignee ?? [];
+    if (assignees.some((a) => a === actor)) {
+      assignments.push(parsedTicket.frontmatter.id);
+    }
+  }
+  return {
+    claims: claims.map((t) => t.id).sort(),
+    assignments: assignments.sort(),
+  };
+}
+
 export const coordMineCommand = defineCommand({
   meta: { name: "mine", description: "My claims and assignments" },
   args: { ...globalArgs },
   async run({ args }) {
     const parsed = args as CoordArgs;
     await withCoordContext(parsed, async (context) => {
-      const { state, frontmatter } = await snapshotBoard(
-        context.core,
-        context.board,
-        context.config,
+      context.output.write(
+        await mine(
+          context.core,
+          context.board,
+          context.actor.id,
+          context.config,
+        ),
       );
-      const claims = core.state.claimedBy(state).get(context.actor.id) ?? [];
-      const assignments: string[] = [];
-      for (const parsedTicket of frontmatter.values()) {
-        const assignees = parsedTicket.frontmatter.assignee ?? [];
-        if (assignees.some((a) => a === context.actor.id)) {
-          assignments.push(parsedTicket.frontmatter.id);
-        }
-      }
-      context.output.write({
-        claims: claims.map((t) => t.id).sort(),
-        assignments: assignments.sort(),
-      });
     });
   },
 });
@@ -711,24 +953,13 @@ export const coordActorsCommand = defineCommand({
         context.board,
         context.config,
       );
-      const byActor = core.state.claimedBy(state);
       if (parsed.active) {
-        // Group by parent human: an actor's context/`parent` segment is its
-        // event parent when present; bare names group under themselves.
-        const byParent = new Map<string, string[]>();
-        for (const [actor, tickets] of byActor) {
-          const parent = parentFor(actor);
-          const bucket = byParent.get(parent) ?? [];
-          bucket.push(...tickets.map((t) => t.id));
-          byParent.set(parent, bucket);
-        }
         context.output.write(
-          [...byParent.entries()]
-            .map(([parent, tickets]) => ({ parent, tickets: tickets.sort() }))
-            .sort((a, b) => a.parent.localeCompare(b.parent)),
+          await activeActors(context.core, context.board, context.config),
         );
         return;
       }
+      const byActor = core.state.claimedBy(state);
       context.output.write(
         [...byActor.entries()]
           .map(([actor, tickets]) => ({
@@ -741,7 +972,64 @@ export const coordActorsCommand = defineCommand({
   },
 });
 
-/** Derives a parent-human grouping key: the `tool:name/context` name segment when present, else the raw actor. */
+export interface ActiveActorGroup {
+  readonly parent: string;
+  readonly tickets: readonly string[];
+}
+
+/** `actors --active`: groups this snapshot's live claims by parent human, sorted by parent. */
+export async function activeActors(
+  coreHandle: CoreHandle,
+  board: core.BoardRef,
+  config: core.config.ConfigResult,
+): Promise<readonly ActiveActorGroup[]> {
+  const { state, events } = await snapshotBoard(coreHandle, board, config);
+  return groupActiveByParent(core.state.claimedBy(state), events);
+}
+
+/**
+ * Groups live claims by parent human, sorted by parent. A ticket's current
+ * lease anchor event may carry an explicit `parent` (the human the claiming
+ * agent inherited from — CONCEPT.md §5); when the anchor event is visible in
+ * this snapshot's read window and records one, that value is authoritative.
+ * When it is absent (a bare-human actor, an older lease whose anchor aged out
+ * of the window, or an event with no `parent` field), fall back to deriving
+ * the parent from the actor's own `tool:name` shape — `leaseParentOf`/
+ * `parentFor` below.
+ */
+function groupActiveByParent(
+  byActor: ReadonlyMap<core.ActorId, readonly core.state.TicketState[]>,
+  events: readonly core.events.EventRecord[],
+): readonly ActiveActorGroup[] {
+  const byParent = new Map<string, string[]>();
+  for (const [actor, tickets] of byActor) {
+    const parent = leaseParentOf(tickets, events) ?? parentFor(actor);
+    const bucket = byParent.get(parent) ?? [];
+    bucket.push(...tickets.map((t) => t.id));
+    byParent.set(parent, bucket);
+  }
+  return [...byParent.entries()]
+    .map(([parent, tickets]) => ({ parent, tickets: tickets.sort() }))
+    .sort((a, b) => a.parent.localeCompare(b.parent));
+}
+
+/** The current lease anchor event's recorded `parent`, if any of `tickets`' live leases has an anchor visible in `events` that carries one. Returns the first (and normally only) such parent — every ticket in one actor's `claimedBy` bucket shares that actor, and multi-ticket actors hold a single parent per CONCEPT.md §5. */
+function leaseParentOf(
+  tickets: readonly core.state.TicketState[],
+  events: readonly core.events.EventRecord[],
+): string | undefined {
+  for (const ticket of tickets) {
+    const anchorId = ticket.lease?.eventId;
+    if (anchorId === undefined) continue;
+    const record = events.find((r) => r.event.id === anchorId);
+    if (record?.event.parent !== undefined) {
+      return record.event.parent;
+    }
+  }
+  return undefined;
+}
+
+/** Derives a parent-human grouping key: the `tool:name` segment when a tool is present, else the bare name. Fallback for when no event `parent` is available (see the `actors --active` handler). */
 function parentFor(actor: string): string {
   const parsed = core.actor.parseActor(actor);
   return parsed.tool !== null ? `${parsed.tool}:${parsed.name}` : parsed.name;

@@ -22,8 +22,10 @@
       "name": "@jeff-roche/cankan-cli",
       "version": "0.0.0",
       "dependencies": {
+        "@clack/prompts": "^1.7.0",
         "@jeff-roche/cankan-core": "workspace:*",
         "citty": "^0.2.2",
+        "yaml": "^2.9.0",
       },
     },
     "packages/core": {

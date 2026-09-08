@@ -11,7 +11,9 @@
   },
   "dependencies": {
     "@jeff-roche/cankan-core": "workspace:*",
-    "citty": "^0.2.2"
+    "@clack/prompts": "^1.7.0",
+    "citty": "^0.2.2",
+    "yaml": "^2.9.0"
   },
   "publishConfig": {
     "access": "public"

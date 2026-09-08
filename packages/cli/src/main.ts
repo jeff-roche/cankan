@@ -1,17 +1,9 @@
 import { createMain } from "citty";
-import { buildContext, contextSummary, type GlobalArgs } from "./context";
+import { buildContext, contextSummary, globalArgs, type GlobalArgs } from "./context";
+import { initCommand } from "./commands/init";
 import { defineCommand } from "./registry";
 
-export const globalArgs = {
-  json: { type: "boolean", description: "Emit machine-readable JSON" },
-  plain: { type: "boolean", description: "Disable colors and decoration" },
-  actor: { type: "string", description: "Actor identity" },
-  cwd: { type: "string", description: "Working directory" },
-  board: { type: "string", description: "Board selector" },
-  yes: { type: "boolean", description: "Skip confirmations" },
-  q: { type: "boolean", alias: "q", description: "Quiet output" },
-  v: { type: "boolean", alias: "v", description: "Verbose output" },
-} as const;
+export { globalArgs } from "./context";
 
 export const noopCommand = defineCommand({
   meta: { name: "noop", description: "Print the resolved CanKan context" },
@@ -29,7 +21,7 @@ export const noopCommand = defineCommand({
 export const rootCommand = defineCommand({
   meta: { name: "cankan", description: "Coordinate work across boards" },
   args: globalArgs,
-  subCommands: { noop: noopCommand },
+  subCommands: { init: initCommand, noop: noopCommand },
   default: "noop",
 });
 

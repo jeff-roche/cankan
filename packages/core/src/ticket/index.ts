@@ -11,6 +11,7 @@ export {
   serializeTicketFile,
   setCankanBlock,
   setScalarField,
+  setSequenceField,
 } from "./frontmatter";
 export {
   generateTicketId,

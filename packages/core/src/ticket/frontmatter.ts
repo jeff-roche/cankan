@@ -4,6 +4,7 @@ import {
   type Scalar,
   isMap,
   isScalar,
+  isSeq,
   parseDocument,
   stringify,
   visit,
@@ -504,6 +505,68 @@ export function setScalarField(
   }
 
   return reparseWithFrontmatter(ticket, split, newFrontmatterText);
+}
+
+/**
+ * Sets one top-level flow-sequence frontmatter field (e.g. `assignee`) to an
+ * inline `[v1, v2]` list via the same targeted-splice machinery as
+ * `setScalarField` — Backlog.md's own style for `assignee`/`labels`/
+ * `dependencies` (CONCEPT.md's ticket example writes `assignee: [alice]` as
+ * an unpadded flow sequence). Nothing outside the field's own value range
+ * changes. Values that are not a bare YAML plain scalar are JSON-escaped so
+ * the resulting sequence still parses as exactly those strings.
+ *
+ * Exists because `setScalarField` deliberately refuses a sequence-valued
+ * field (the `assignee` field in `ticket/schema.ts` is `z.array(z.string())`)
+ * — M3.5's `assign` command is the first writer of it and needs an array
+ * result, not a quoted scalar.
+ */
+export function setSequenceField(
+  ticket: ParsedTicket,
+  key: string,
+  values: readonly string[],
+): ParsedTicket {
+  if (UNSAFE_KEY_RE.test(key)) {
+    throw new CanKanError(
+      ErrorCodes.USAGE,
+      "Field name is not a valid single-line YAML key",
+      { details: { reason: "not a valid single-line YAML key" } },
+    );
+  }
+
+  const split = requireSplit(ticket);
+  const { map } = findTopLevelPair(split.frontmatterText);
+  const pair = map?.items.find((item) => isScalar(item.key) && item.key.value === key);
+
+  if (pair?.value && !isSeq(pair.value)) {
+    throw new CanKanError(
+      ErrorCodes.USAGE,
+      "Field is not a sequence; setSequenceField only sets sequence fields",
+      { details: { reason: "field is not a sequence" } },
+    );
+  }
+
+  const flow = `[${values.map(flowScalarText).join(", ")}]`;
+  const newline = detectNewline(split);
+
+  let newFrontmatterText: string;
+  if (pair?.value && isRangedNode(pair.value)) {
+    const [start, end] = pair.value.range;
+    newFrontmatterText =
+      split.frontmatterText.slice(0, start) + flow + split.frontmatterText.slice(end);
+  } else {
+    newFrontmatterText = `${split.frontmatterText}${key}: ${flow}${newline}`;
+  }
+
+  return reparseWithFrontmatter(ticket, split, newFrontmatterText);
+}
+
+/** A bare YAML flow scalar (letters, digits, `_`, `-`, `.`, `@`, `/`, `:` for actor `tool:name` forms) needs no quoting in a flow sequence. */
+const FLOW_SCALAR_RE = /^[A-Za-z0-9_.:@/-]+$/;
+
+/** Renders one list item as a YAML flow scalar, JSON-quoting when the bare form is unsafe. */
+function flowScalarText(value: string): string {
+  return FLOW_SCALAR_RE.test(value) ? value : JSON.stringify(value);
 }
 
 function indentBlock(text: string, newline: string): string {

@@ -22,3 +22,27 @@ export {
   setConfigValue,
 } from "./commands/config";
 export type { ConfigTarget, SetConfigValueOptions } from "./commands/config";
+export {
+  claimNext,
+  coordActorsCommand,
+  coordAssignCommand,
+  coordClaimCommand,
+  coordCommand,
+  coordExpireCommand,
+  coordMineCommand,
+  coordReady,
+  coordReadyCommand,
+  coordReleaseCommand,
+  coordRenewCommand,
+  releaseAll,
+  renewAll,
+  resolveAssignActors,
+  runExpireSweep,
+  serializeAssignees,
+} from "./commands/coord";
+export type {
+  ClaimNextOptions,
+  CoordListOptions,
+  ReadyResult,
+  ReadyTicket,
+} from "./commands/coord";

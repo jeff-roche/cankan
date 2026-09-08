@@ -1,5 +1,11 @@
 import { createMain } from "citty";
-import { buildContext, contextSummary, globalArgs, type GlobalArgs } from "./context";
+import {
+  buildContext,
+  contextSummary,
+  globalArgs,
+  type GlobalArgs,
+} from "./context";
+import { configCommand } from "./commands/config";
 import { initCommand } from "./commands/init";
 import { defineCommand } from "./registry";
 
@@ -21,7 +27,7 @@ export const noopCommand = defineCommand({
 export const rootCommand = defineCommand({
   meta: { name: "cankan", description: "Coordinate work across boards" },
   args: globalArgs,
-  subCommands: { init: initCommand, noop: noopCommand },
+  subCommands: { config: configCommand, init: initCommand, noop: noopCommand },
   default: "noop",
 });
 

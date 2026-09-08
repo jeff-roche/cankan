@@ -9,7 +9,15 @@ import { releaseCore, type ReleaseHooks } from "../../src/claims/claim";
 import { ErrorCodes, type CanKanError, isCanKanError } from "../../src/errors";
 import { parseDurationMs } from "../../src/claims/duration";
 import { hermeticEnv } from "../config/testHelpers";
-import { append, boardKeyFor, firstSeen, observe, read, type EventCandidate, type EventId } from "../../src/events/index";
+import {
+  append,
+  boardKeyFor,
+  firstSeen,
+  observe,
+  read,
+  type EventCandidate,
+  type EventId,
+} from "../../src/events/index";
 import { createGitAdapter } from "../../src/git/index";
 import type { ActorId, BoardRef } from "../../src/types";
 
@@ -21,7 +29,9 @@ const NOW = Date.parse("2026-09-15T10:00:00Z");
 const LEASE_TTL_MS = parseDurationMs("2h"); // the board's default `claims.lease`
 
 const repos: TempRepo[] = [];
-async function tempRepo(options: Parameters<typeof makeTempRepo>[0] = {}): Promise<TempRepo> {
+async function tempRepo(
+  options: Parameters<typeof makeTempRepo>[0] = {},
+): Promise<TempRepo> {
   const repo = await makeTempRepo(options);
   repos.push(repo);
   return repo;
@@ -34,7 +44,10 @@ afterEach(async () => {
   }
 });
 
-async function expectCode(promise: Promise<unknown>, code: string): Promise<CanKanError> {
+async function expectCode(
+  promise: Promise<unknown>,
+  code: string,
+): Promise<CanKanError> {
   try {
     await promise;
   } catch (error) {
@@ -44,7 +57,9 @@ async function expectCode(promise: Promise<unknown>, code: string): Promise<CanK
     expect(error.code).toBe(code);
     return error;
   }
-  throw new Error(`expected rejection with code ${code}, but the promise resolved`);
+  throw new Error(
+    `expected rejection with code ${code}, but the promise resolved`,
+  );
 }
 
 async function withTestBoard(
@@ -53,7 +68,12 @@ async function withTestBoard(
 ): Promise<void> {
   await withEnv(undefined, async () => {
     const repo = await tempRepo(repoOptions);
-    const board = await buildBoardRef({ kind: "repo", name: "test-board", root: repo.dir, env: hermeticEnv() });
+    const board = await buildBoardRef({
+      kind: "repo",
+      name: "test-board",
+      root: repo.dir,
+      env: hermeticEnv(),
+    });
     await mkdir(board.ticketsDir, { recursive: true });
     await fn({ board, repo });
   });
@@ -61,21 +81,38 @@ async function withTestBoard(
 
 /** Same as `withTestBoard`, but also builds a second `BoardRef` rooted at `repo.worktreeDirs[0]` — see `claim.test.ts`'s own doc comment for the sharing caveat. */
 async function withTwoWorktreeBoards(
-  fn: (ctx: { board: BoardRef; board2: BoardRef; repo: TempRepo }) => Promise<void>,
+  fn: (ctx: {
+    board: BoardRef;
+    board2: BoardRef;
+    repo: TempRepo;
+  }) => Promise<void>,
 ): Promise<void> {
   await withEnv(undefined, async () => {
     const repo = await tempRepo({ worktrees: 1 });
     const secondaryDir = repo.worktreeDirs[0];
     if (secondaryDir === undefined) throw new Error("expected a worktree");
-    const board = await buildBoardRef({ kind: "repo", name: "primary", root: repo.dir, env: hermeticEnv() });
-    const board2 = await buildBoardRef({ kind: "repo", name: "secondary", root: secondaryDir, env: hermeticEnv() });
+    const board = await buildBoardRef({
+      kind: "repo",
+      name: "primary",
+      root: repo.dir,
+      env: hermeticEnv(),
+    });
+    const board2 = await buildBoardRef({
+      kind: "repo",
+      name: "secondary",
+      root: secondaryDir,
+      env: hermeticEnv(),
+    });
     await mkdir(board.ticketsDir, { recursive: true });
     await mkdir(board2.ticketsDir, { recursive: true });
     await fn({ board, board2, repo });
   });
 }
 
-function fixtureTicket(id: string, title: string): { id: string; title: string; status: string; body: string } {
+function fixtureTicket(
+  id: string,
+  title: string,
+): { id: string; title: string; status: string; body: string } {
   return { id, title, status: "To Do", body: `Body for ${title}.` };
 }
 
@@ -84,7 +121,11 @@ function actorId(id: string): ActorId {
 }
 
 /** A well-formed, schema-valid cross-actor `renew` candidate, appended directly (bypassing `renew()`) to plant an event this module never decided to write itself. */
-function renewCandidate(ticket: string, actor: string, now: number): EventCandidate {
+function renewCandidate(
+  ticket: string,
+  actor: string,
+  now: number,
+): EventCandidate {
   return {
     event: "renew",
     ts: new Date(now).toISOString(),
@@ -101,28 +142,60 @@ function renewCandidate(ticket: string, actor: string, now: number): EventCandid
 
 test("release discards every id the lease ever accumulated (claim + 3 renews), not just the most recent", async () => {
   await withTestBoard(async ({ board }) => {
-    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-rel-all", "All ids")]);
+    await writeFixtureTickets(board.ticketsDir, [
+      fixtureTicket("ck-rel-all", "All ids"),
+    ]);
     const actor = actorId("actor-rel-all");
     const adapter = await createGitAdapter(board.root);
     const boardKey = await boardKeyFor(adapter);
 
-    const claimed = await claim({ board, ticket: "ck-rel-all", actor, now: NOW });
-    const renew1 = await renew({ board, ticket: "ck-rel-all", actor, now: NOW + 10 * 60_000 });
-    const renew2 = await renew({ board, ticket: "ck-rel-all", actor, now: NOW + 20 * 60_000 });
-    const renew3 = await renew({ board, ticket: "ck-rel-all", actor, now: NOW + 30 * 60_000 });
+    const claimed = await claim({
+      board,
+      ticket: "ck-rel-all",
+      actor,
+      now: NOW,
+    });
+    const renew1 = await renew({
+      board,
+      ticket: "ck-rel-all",
+      actor,
+      now: NOW + 10 * 60_000,
+    });
+    const renew2 = await renew({
+      board,
+      ticket: "ck-rel-all",
+      actor,
+      now: NOW + 20 * 60_000,
+    });
+    const renew3 = await renew({
+      board,
+      ticket: "ck-rel-all",
+      actor,
+      now: NOW + 30 * 60_000,
+    });
 
-    const ids: EventId[] = [claimed.eventId, renew1.eventId, renew2.eventId, renew3.eventId];
+    const ids: EventId[] = [
+      claimed.eventId,
+      renew1.eventId,
+      renew2.eventId,
+      renew3.eventId,
+    ];
     for (const id of ids) {
       expect(typeof (await firstSeen(boardKey, id))).toBe("number");
     }
 
-    await release({ board, ticket: "ck-rel-all", actor, now: NOW + 40 * 60_000 });
+    await release({
+      board,
+      ticket: "ck-rel-all",
+      actor,
+      now: NOW + 40 * 60_000,
+    });
 
     for (const id of ids) {
       expect(await firstSeen(boardKey, id)).toBeNull();
     }
   });
-});
+}, 15_000);
 
 // ============================================================================
 // Required test 4: a non-anchoring renew's id is still discarded
@@ -130,28 +203,50 @@ test("release discards every id the lease ever accumulated (claim + 3 renews), n
 
 test("a cross-actor renew that does not become the anchor is still discarded on release", async () => {
   await withTestBoard(async ({ board }) => {
-    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-rel-cross", "Cross actor")]);
+    await writeFixtureTickets(board.ticketsDir, [
+      fixtureTicket("ck-rel-cross", "Cross actor"),
+    ]);
     const holder = actorId("actor-rel-cross-holder");
     const interloper = actorId("actor-rel-cross-interloper");
     const adapter = await createGitAdapter(board.root);
     const boardKey = await boardKeyFor(adapter);
 
-    const claimed = await claim({ board, ticket: "ck-rel-cross", actor: holder, now: NOW });
+    const claimed = await claim({
+      board,
+      ticket: "ck-rel-cross",
+      actor: holder,
+      now: NOW,
+    });
 
     // Plant a cross-actor `renew` directly in the log — never anchoring
     // (Ruling M2, `state/fold.ts`): a `renew` against a live anchor held by
     // a DIFFERENT actor neither extends nor reassigns it.
     const plantedNow = NOW + 5 * 60_000;
-    await append(adapter, board.coordinationRef, renewCandidate("ck-rel-cross", interloper, plantedNow), { now: plantedNow });
-    const events = await read(adapter, board.coordinationRef, { now: plantedNow });
-    const plantedRecord = events.find((r) => r.event.event === "renew" && r.event.actor === interloper);
-    if (plantedRecord === undefined) throw new Error("expected the planted renew to be in the log");
+    await append(
+      adapter,
+      board.coordinationRef,
+      renewCandidate("ck-rel-cross", interloper, plantedNow),
+      { now: plantedNow },
+    );
+    const events = await read(adapter, board.coordinationRef, {
+      now: plantedNow,
+    });
+    const plantedRecord = events.find(
+      (r) => r.event.event === "renew" && r.event.actor === interloper,
+    );
+    if (plantedRecord === undefined)
+      throw new Error("expected the planted renew to be in the log");
     const plantedId = plantedRecord.event.id;
 
     // Confirm the fold did NOT treat the plant as the anchor: a competing
     // claim still names `holder`, never `interloper`.
     const rejection = await expectCode(
-      claim({ board, ticket: "ck-rel-cross", actor: actorId("actor-rel-cross-third"), now: plantedNow }),
+      claim({
+        board,
+        ticket: "ck-rel-cross",
+        actor: actorId("actor-rel-cross-third"),
+        now: plantedNow,
+      }),
       ErrorCodes.CLAIM_REJECTED,
     );
     expect(rejection.details?.holder).toBe(holder);
@@ -164,7 +259,12 @@ test("a cross-actor renew that does not become the anchor is still discarded on 
     // have joined the run at all) — it is testing that `release()`'s own
     // discard walk, described next, still reaches an id the fold never
     // treated as the anchor.
-    await release({ board, ticket: "ck-rel-cross", actor: holder, now: plantedNow + 60_000 });
+    await release({
+      board,
+      ticket: "ck-rel-cross",
+      actor: holder,
+      now: plantedNow + 60_000,
+    });
 
     expect(await firstSeen(boardKey, claimed.eventId)).toBeNull();
     expect(await firstSeen(boardKey, plantedId)).toBeNull();
@@ -178,14 +278,26 @@ test("a cross-actor renew that does not become the anchor is still discarded on 
 
 test("a previous, already-terminated lease's ids are not re-walked by a later release", async () => {
   await withTestBoard(async ({ board }) => {
-    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-rel-boundary", "Boundary")]);
+    await writeFixtureTickets(board.ticketsDir, [
+      fixtureTicket("ck-rel-boundary", "Boundary"),
+    ]);
     const actor = actorId("actor-rel-boundary");
     const adapter = await createGitAdapter(board.root);
     const boardKey = await boardKeyFor(adapter);
 
     // First run: claim, then release. Its id is discarded.
-    const firstClaim = await claim({ board, ticket: "ck-rel-boundary", actor, now: NOW });
-    await release({ board, ticket: "ck-rel-boundary", actor, now: NOW + 10 * 60_000 });
+    const firstClaim = await claim({
+      board,
+      ticket: "ck-rel-boundary",
+      actor,
+      now: NOW,
+    });
+    await release({
+      board,
+      ticket: "ck-rel-boundary",
+      actor,
+      now: NOW + 10 * 60_000,
+    });
     expect(await firstSeen(boardKey, firstClaim.eventId)).toBeNull();
 
     // Plant a FRESH record for the first run's id, by hand — simulating
@@ -201,8 +313,18 @@ test("a previous, already-terminated lease's ids are not re-walked by a later re
     expect(await firstSeen(boardKey, firstClaim.eventId)).toBe(plantedAt);
 
     // Second run: claim again, then release again.
-    const secondClaim = await claim({ board, ticket: "ck-rel-boundary", actor, now: NOW + 30 * 60_000 });
-    await release({ board, ticket: "ck-rel-boundary", actor, now: NOW + 40 * 60_000 });
+    const secondClaim = await claim({
+      board,
+      ticket: "ck-rel-boundary",
+      actor,
+      now: NOW + 30 * 60_000,
+    });
+    await release({
+      board,
+      ticket: "ck-rel-boundary",
+      actor,
+      now: NOW + 40 * 60_000,
+    });
 
     // The first run's planted record survives; only the second run's id was
     // discarded.
@@ -218,9 +340,16 @@ test("a previous, already-terminated lease's ids are not re-walked by a later re
 describe("release — rejection paths", () => {
   test("no lease at all -> CLAIM_REJECTED / not-held, no event appended", async () => {
     await withTestBoard(async ({ board }) => {
-      await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-rel-noheld", "No lease")]);
+      await writeFixtureTickets(board.ticketsDir, [
+        fixtureTicket("ck-rel-noheld", "No lease"),
+      ]);
       const rejection = await expectCode(
-        release({ board, ticket: "ck-rel-noheld", actor: actorId("actor-x"), now: NOW }),
+        release({
+          board,
+          ticket: "ck-rel-noheld",
+          actor: actorId("actor-x"),
+          now: NOW,
+        }),
         ErrorCodes.CLAIM_REJECTED,
       );
       expect(rejection.details?.reason).toBe("not-held");
@@ -231,12 +360,24 @@ describe("release — rejection paths", () => {
 
   test("release by a non-holder -> CLAIM_REJECTED / not-holder (distinct from not-held), no event appended", async () => {
     await withTestBoard(async ({ board }) => {
-      await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-rel-nonholder", "Non-holder")]);
+      await writeFixtureTickets(board.ticketsDir, [
+        fixtureTicket("ck-rel-nonholder", "Non-holder"),
+      ]);
       const holder = actorId("actor-rel-holder");
-      await claim({ board, ticket: "ck-rel-nonholder", actor: holder, now: NOW });
+      await claim({
+        board,
+        ticket: "ck-rel-nonholder",
+        actor: holder,
+        now: NOW,
+      });
 
       const rejection = await expectCode(
-        release({ board, ticket: "ck-rel-nonholder", actor: actorId("actor-rel-notholder"), now: NOW }),
+        release({
+          board,
+          ticket: "ck-rel-nonholder",
+          actor: actorId("actor-rel-notholder"),
+          now: NOW,
+        }),
         ErrorCodes.CLAIM_REJECTED,
       );
       expect(rejection.details?.reason).toBe("not-holder");
@@ -248,7 +389,12 @@ describe("release — rejection paths", () => {
 
       // A fresh fold still shows `holder` as the live anchor.
       const stillHeld = await expectCode(
-        claim({ board, ticket: "ck-rel-nonholder", actor: actorId("actor-rel-third"), now: NOW }),
+        claim({
+          board,
+          ticket: "ck-rel-nonholder",
+          actor: actorId("actor-rel-third"),
+          now: NOW,
+        }),
         ErrorCodes.CLAIM_REJECTED,
       );
       expect(stillHeld.details?.holder).toBe(holder);
@@ -257,16 +403,23 @@ describe("release — rejection paths", () => {
 
   test("release on an expired lease -> CLAIM_REJECTED / lease-expired, no event appended", async () => {
     await withTestBoard(async ({ board }) => {
-      await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-rel-expired", "Expired")]);
+      await writeFixtureTickets(board.ticketsDir, [
+        fixtureTicket("ck-rel-expired", "Expired"),
+      ]);
       const actor = actorId("actor-rel-expired");
       await claim({ board, ticket: "ck-rel-expired", actor, now: NOW });
 
       const pastExpiry = NOW + LEASE_TTL_MS + 1;
-      const rejection = await expectCode(release({ board, ticket: "ck-rel-expired", actor, now: pastExpiry }), ErrorCodes.CLAIM_REJECTED);
+      const rejection = await expectCode(
+        release({ board, ticket: "ck-rel-expired", actor, now: pastExpiry }),
+        ErrorCodes.CLAIM_REJECTED,
+      );
       expect(rejection.details?.reason).toBe("lease-expired");
 
       const adapter = await createGitAdapter(board.root);
-      const records = await read(adapter, board.coordinationRef, { now: pastExpiry });
+      const records = await read(adapter, board.coordinationRef, {
+        now: pastExpiry,
+      });
       expect(records.filter((r) => r.event.event === "release").length).toBe(0);
     });
   });
@@ -276,62 +429,72 @@ describe("release — rejection paths", () => {
 // Required test 8: the release-vs-competitor CAS race
 // ============================================================================
 
-test(
-  "the release-vs-competitor CAS race: A's release loses its CAS to B's expire+reclaim and rejects, never destroying B's lease",
-  async () => {
-    await withTwoWorktreeBoards(async ({ board, board2 }) => {
-      const ticket = fixtureTicket("ck-rel-race", "Release race");
-      await writeFixtureTickets(board.ticketsDir, [ticket]);
-      await writeFixtureTickets(board2.ticketsDir, [ticket]);
+test("the release-vs-competitor CAS race: A's release loses its CAS to B's expire+reclaim and rejects, never destroying B's lease", async () => {
+  await withTwoWorktreeBoards(async ({ board, board2 }) => {
+    const ticket = fixtureTicket("ck-rel-race", "Release race");
+    await writeFixtureTickets(board.ticketsDir, [ticket]);
+    await writeFixtureTickets(board2.ticketsDir, [ticket]);
 
-      const actorA = actorId("actor-rel-race-a");
-      const actorB = actorId("actor-rel-race-b");
-      await claim({ board, ticket: "ck-rel-race", actor: actorA, now: NOW });
+    const actorA = actorId("actor-rel-race-a");
+    const actorB = actorId("actor-rel-race-b");
+    await claim({ board, ticket: "ck-rel-race", actor: actorA, now: NOW });
 
-      // Two DIFFERENT `now` values are required (this file's own required-
-      // tests brief, item 8): A's own fold must see its lease as still LIVE
-      // (so `release` gets past the `lease-expired` check and reaches the
-      // append where the hook fires), while B's reclaim must see the SAME
-      // lease as EXPIRED (so B may expire and reclaim it). A single shared
-      // `now` would make both folds compute the same `expiresAtMs`,
-      // rejecting A with `lease-expired` on attempt 1 before the hook ever
-      // runs.
-      const aReleaseNow = NOW + LEASE_TTL_MS - 1;
-      const bReclaimNow = NOW + LEASE_TTL_MS + 1;
+    // Two DIFFERENT `now` values are required (this file's own required-
+    // tests brief, item 8): A's own fold must see its lease as still LIVE
+    // (so `release` gets past the `lease-expired` check and reaches the
+    // append where the hook fires), while B's reclaim must see the SAME
+    // lease as EXPIRED (so B may expire and reclaim it). A single shared
+    // `now` would make both folds compute the same `expiresAtMs`,
+    // rejecting A with `lease-expired` on attempt 1 before the hook ever
+    // runs.
+    const aReleaseNow = NOW + LEASE_TTL_MS - 1;
+    const bReclaimNow = NOW + LEASE_TTL_MS + 1;
 
-      const beforeAppendAttempts: number[] = [];
-      const hooks: ReleaseHooks = {
-        beforeAppend: async (attemptNumber) => {
-          beforeAppendAttempts.push(attemptNumber);
-          if (beforeAppendAttempts.length === 1) {
-            // A full, independent reclaim from the SECOND worktree, landing
-            // while A's own release decision is still in flight.
-            const reclaimed = await claim({ board: board2, ticket: "ck-rel-race", actor: actorB, now: bReclaimNow });
-            // An uncontested reclaim spends one attempt on the `expire` and
-            // one on the `claim` (`attempts` is >= 2 by design) — not a
-            // signal that a race happened here specifically.
-            expect(reclaimed.kind).toBe("claim");
-          }
-        },
-      };
+    const beforeAppendAttempts: number[] = [];
+    const hooks: ReleaseHooks = {
+      beforeAppend: async (attemptNumber) => {
+        beforeAppendAttempts.push(attemptNumber);
+        if (beforeAppendAttempts.length === 1) {
+          // A full, independent reclaim from the SECOND worktree, landing
+          // while A's own release decision is still in flight.
+          const reclaimed = await claim({
+            board: board2,
+            ticket: "ck-rel-race",
+            actor: actorB,
+            now: bReclaimNow,
+          });
+          // An uncontested reclaim spends one attempt on the `expire` and
+          // one on the `claim` (`attempts` is >= 2 by design) — not a
+          // signal that a race happened here specifically.
+          expect(reclaimed.kind).toBe("claim");
+        }
+      },
+    };
 
-      const rejection = await expectCode(
-        releaseCore({ board, ticket: "ck-rel-race", actor: actorA, now: aReleaseNow }, hooks),
-        ErrorCodes.CLAIM_REJECTED,
-      );
-      expect(beforeAppendAttempts).toEqual([1]);
-      expect(rejection.details?.reason).toBe("not-holder");
-      expect(rejection.details?.holder).toBe(actorB);
+    const rejection = await expectCode(
+      releaseCore(
+        { board, ticket: "ck-rel-race", actor: actorA, now: aReleaseNow },
+        hooks,
+      ),
+      ErrorCodes.CLAIM_REJECTED,
+    );
+    expect(beforeAppendAttempts).toEqual([1]);
+    expect(rejection.details?.reason).toBe("not-holder");
+    expect(rejection.details?.holder).toBe(actorB);
 
-      // B's claim is still the live anchor afterwards.
-      const stillHeldByB = await expectCode(
-        claim({ board, ticket: "ck-rel-race", actor: actorId("actor-rel-race-third"), now: bReclaimNow }),
-        ErrorCodes.CLAIM_REJECTED,
-      );
-      expect(stillHeldByB.details?.holder).toBe(actorB);
-    });
-  },
-);
+    // B's claim is still the live anchor afterwards.
+    const stillHeldByB = await expectCode(
+      claim({
+        board,
+        ticket: "ck-rel-race",
+        actor: actorId("actor-rel-race-third"),
+        now: bReclaimNow,
+      }),
+      ErrorCodes.CLAIM_REJECTED,
+    );
+    expect(stillHeldByB.details?.holder).toBe(actorB);
+  });
+});
 
 // ============================================================================
 // The test-only `beforeAppend` seam is exported, even if not exercised here
@@ -339,7 +502,9 @@ test(
 
 test("releaseCore accepts a hooks object with no-op default behavior (mirrors claimCore)", async () => {
   await withTestBoard(async ({ board }) => {
-    await writeFixtureTickets(board.ticketsDir, [fixtureTicket("ck-rel-hook", "Hook")]);
+    await writeFixtureTickets(board.ticketsDir, [
+      fixtureTicket("ck-rel-hook", "Hook"),
+    ]);
     const actor = actorId("actor-rel-hook");
     await claim({ board, ticket: "ck-rel-hook", actor, now: NOW });
 
@@ -349,7 +514,10 @@ test("releaseCore accepts a hooks object with no-op default behavior (mirrors cl
         attempts.push(attemptNumber);
       },
     };
-    const result = await releaseCore({ board, ticket: "ck-rel-hook", actor, now: NOW + 1000 }, hooks);
+    const result = await releaseCore(
+      { board, ticket: "ck-rel-hook", actor, now: NOW + 1000 },
+      hooks,
+    );
     expect(attempts).toEqual([1]);
     expect(result.attempts).toBe(1);
   });
@@ -407,8 +575,18 @@ test("KNOWN GAP: a discarded observation is resurrected by the next fold (fix be
     const adapter = await createGitAdapter(board.root);
     const boardKey = await boardKeyFor(adapter);
 
-    const claimed = await claim({ board, ticket: "ck-gap-released", actor, now: NOW });
-    await release({ board, ticket: "ck-gap-released", actor, now: NOW + 60_000 });
+    const claimed = await claim({
+      board,
+      ticket: "ck-gap-released",
+      actor,
+      now: NOW,
+    });
+    await release({
+      board,
+      ticket: "ck-gap-released",
+      actor,
+      now: NOW + 60_000,
+    });
 
     // The discard walk did its job: the id is gone immediately after
     // release, exactly as tests 1/4/5/6 above already prove.
@@ -418,7 +596,12 @@ test("KNOWN GAP: a discarded observation is resurrected by the next fold (fix be
     // ticket, not even "ck-gap-released" itself -- is enough to bring it
     // back, because `observeAndFold` re-observes every lease-bearing event
     // in the window for every known ticket, unconditionally.
-    await claim({ board, ticket: "ck-gap-other", actor: actorId("actor-gap-other"), now: NOW + 120_000 });
+    await claim({
+      board,
+      ticket: "ck-gap-other",
+      actor: actorId("actor-gap-other"),
+      now: NOW + 120_000,
+    });
 
     // THE DEFECT, PINNED: the discarded id is back, with a fresh
     // `firstSeen`, and is now permanently unreachable by any future discard
@@ -465,8 +648,19 @@ test("a resurrected record NEWER than the current anchor does not extend the lea
     const forcer = actorId("actor-probe2-forcer");
     const boardKey = await boardKeyFor(await createGitAdapter(board.root));
 
-    const a1 = await claim({ board, ticket: "ck-probe2", actor: original, now: NOW });
-    const b1 = await claim({ board, ticket: "ck-probe2", actor: forcer, now: NOW + 5 * 60_000, force: true });
+    const a1 = await claim({
+      board,
+      ticket: "ck-probe2",
+      actor: original,
+      now: NOW,
+    });
+    const b1 = await claim({
+      board,
+      ticket: "ck-probe2",
+      actor: forcer,
+      now: NOW + 5 * 60_000,
+      force: true,
+    });
     expect(b1.kind).toBe("takeover");
 
     // The takeover's own discard walk already removed the displaced claim.
@@ -474,7 +668,12 @@ test("a resurrected record NEWER than the current anchor does not extend the lea
 
     // ONE fold over an unrelated ticket resurrects it -- at THIS fold's
     // `now`, which is LATER than the anchor's own `firstSeen` (NOW + 5m).
-    await claim({ board, ticket: "ck-probe2-other", actor: actorId("actor-probe2-other"), now: NOW + 6 * 60_000 });
+    await claim({
+      board,
+      ticket: "ck-probe2-other",
+      actor: actorId("actor-probe2-other"),
+      now: NOW + 6 * 60_000,
+    });
 
     // Premise check: `a1` really did resurrect, and strictly NEWER than
     // `b1`'s own anchor `firstSeen` -- without both of these, the reclaim

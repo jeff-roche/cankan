@@ -33,7 +33,11 @@ describe("R8 — readySet sweep, measured", () => {
       });
     });
 
-    const state = foldState(tickets, [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const state = foldState(tickets, [], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     const flatDependenciesFor = (id: TicketId): readonly string[] => {
       const match = /ck-(\d+)/.exec(id);
@@ -48,7 +52,9 @@ describe("R8 — readySet sweep, measured", () => {
 
     // R8's own sanctioned exception to "no stray logging" — the brief
     // requires the measured number to be visible, not silently asserted.
-    console.log(`[R8 benchmark] readySet over ${TICKET_COUNT} tickets: ${elapsedMs.toFixed(1)}ms`);
+    console.log(
+      `[R8 benchmark] readySet over ${TICKET_COUNT} tickets: ${elapsedMs.toFixed(1)}ms`,
+    );
 
     expect(sweep.verdicts.size).toBe(TICKET_COUNT);
     expect(sweep.ambiguousIds).toEqual([]);
@@ -61,5 +67,5 @@ describe("R8 — readySet sweep, measured", () => {
     // Very loose ceiling (R8: measure, don't estimate — this is a tripwire,
     // not a performance target). See this file's own comment.
     expect(elapsedMs).toBeLessThan(15_000);
-  });
+  }, 15_000);
 });

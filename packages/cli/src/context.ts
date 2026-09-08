@@ -13,6 +13,17 @@ export interface GlobalArgs {
   readonly v?: boolean;
 }
 
+export const globalArgs = {
+  json: { type: "boolean", description: "Emit machine-readable JSON" },
+  plain: { type: "boolean", description: "Disable colors and decoration" },
+  actor: { type: "string", description: "Actor identity" },
+  cwd: { type: "string", description: "Working directory" },
+  board: { type: "string", description: "Board selector" },
+  yes: { type: "boolean", description: "Skip confirmations" },
+  q: { type: "boolean", alias: "q", description: "Quiet output" },
+  v: { type: "boolean", alias: "v", description: "Verbose output" },
+} as const;
+
 export interface CoreHandle {
   readonly adapter: core.git.GitAdapter;
   readonly store: core.store.TicketStore;

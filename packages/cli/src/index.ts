@@ -6,4 +6,19 @@ export type { CommandSpec } from "./registry";
 export { createOutput } from "./output";
 export type { Output, OutputMode, OutputOptions } from "./output";
 export { detectBackers, initCommand, initRepo } from "./commands/init";
-export type { BackerType, DetectedBacker, InitOptions, InitResult } from "./commands/init";
+export type {
+  BackerType,
+  DetectedBacker,
+  InitOptions,
+  InitResult,
+} from "./commands/init";
+export {
+  configCommand,
+  configGetCommand,
+  configSetCommand,
+  configShowCommand,
+  formatConfigGet,
+  formatConfigShow,
+  setConfigValue,
+} from "./commands/config";
+export type { ConfigTarget, SetConfigValueOptions } from "./commands/config";

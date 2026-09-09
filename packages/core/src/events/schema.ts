@@ -173,8 +173,8 @@ export function canonicalizeTicketId(id: string): TicketId {
 // Flagged in task-1-report.md rather than silently choosing either the
 // stricter or the looser rule.
 const BIDI_OR_ZERO_WIDTH_CODE_POINTS = new Set([
-  0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067,
-  0x2068, 0x2069, 0xfeff,
+  0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d,
+  0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0xfeff,
 ]);
 
 /** Matches `ticket/filename.ts`'s `MAX_ID_BYTES` exactly — see the invariant comment above. */
@@ -185,14 +185,18 @@ function isAsciiControlOrDel(code: number): boolean {
 }
 
 /** The half of the guard shared by both id-shaped domains: NUL, control characters, bidi/zero-width, whitespace-only, and the byte-length cap. Never scans past the first hit. */
-function controlBidiWhitespaceOrLengthReason(value: string): string | undefined {
+function controlBidiWhitespaceOrLengthReason(
+  value: string,
+): string | undefined {
   if (value.includes("\0")) return "contains a NUL byte";
   if (value.trim().length === 0) return "is whitespace-only";
-  if (Buffer.byteLength(value, "utf8") > MAX_ID_SHAPE_BYTES) return `is longer than ${MAX_ID_SHAPE_BYTES} bytes`;
+  if (Buffer.byteLength(value, "utf8") > MAX_ID_SHAPE_BYTES)
+    return `is longer than ${MAX_ID_SHAPE_BYTES} bytes`;
   for (const ch of value) {
     const code = ch.codePointAt(0) ?? 0;
     if (isAsciiControlOrDel(code)) return "contains a control character";
-    if (BIDI_OR_ZERO_WIDTH_CODE_POINTS.has(code)) return "contains a bidirectional-formatting or zero-width character";
+    if (BIDI_OR_ZERO_WIDTH_CODE_POINTS.has(code))
+      return "contains a bidirectional-formatting or zero-width character";
   }
   return undefined;
 }
@@ -210,7 +214,8 @@ function controlBidiWhitespaceOrLengthReason(value: string): string | undefined 
  * finding required this module to actually follow.
  */
 function unsafeTicketIdShapeReason(value: string): string | undefined {
-  if (value.includes("/") || value.includes("\\")) return "contains a path separator";
+  if (value.includes("/") || value.includes("\\"))
+    return "contains a path separator";
   if (value === ".") return "is a single dot";
   if (value === "..") return "is a double dot";
   return controlBidiWhitespaceOrLengthReason(value);
@@ -281,7 +286,8 @@ const TS_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
  * optional, to tolerate a hand-built value with none). Every worked example
  * in CONCEPT.md's event log section (~line 477) is in this form.
  */
-const ISO_8601_UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+const ISO_8601_UTC_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
 
 /**
  * **Fix round 1, finding L4 / Ruling R13.** `Date.parse` does not return
@@ -336,7 +342,7 @@ function isTsWithinBounds(ts: string, nowMs: number): boolean {
 }
 
 // ============================================================================
-// The envelope — common to all twelve kinds
+// The envelope — common to all event kinds
 // ============================================================================
 
 /**
@@ -381,12 +387,18 @@ const parentSchema = z
 
 const tsSchema = z
   .string()
-  .regex(ISO_8601_UTC_PATTERN, "ts must be an ISO-8601 UTC instant (YYYY-MM-DDTHH:mm:ss[.sss]Z)")
+  .regex(
+    ISO_8601_UTC_PATTERN,
+    "ts must be an ISO-8601 UTC instant (YYYY-MM-DDTHH:mm:ss[.sss]Z)",
+  )
   .refine(isRealCalendarInstant, "ts must be a real calendar instant");
 
 const eventIdSchema = z
   .string()
-  .regex(ULID_PATTERN, "event id must be a 26-character uppercase Crockford base32 ULID")
+  .regex(
+    ULID_PATTERN,
+    "event id must be a 26-character uppercase Crockford base32 ULID",
+  )
   .transform((s) => s as EventId);
 
 /**
@@ -450,13 +462,15 @@ const envelopeShape = {
 //
 // The discriminant (`event`) makes obligation 9 structural rather than a
 // separate check: `z.discriminatedUnion` fails closed on any `event` value
-// that does not match one of the twelve literals below (verified directly —
+// that does not match one of the event literals below (verified directly —
 // see task-1-report.md's zod probe), consistent with the same fail-closed
 // reasoning: a kind this version does not know is a kind whose shape this
 // version cannot vouch for, and nothing downstream should be handed a value
 // this schema could not validate.
 
-const createEventSchema = z.object({ ...envelopeShape, event: z.literal("create") }).strict();
+const createEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("create") })
+  .strict();
 
 /**
  * `lease_until` is carried for display only (CONCEPT.md's worked example,
@@ -483,11 +497,18 @@ const createEventSchema = z.object({ ...envelopeShape, event: z.literal("create"
  */
 const leaseUntilSchema = z
   .string()
-  .regex(ISO_8601_UTC_PATTERN, "lease_until must be an ISO-8601 UTC instant (YYYY-MM-DDTHH:mm:ss[.sss]Z)")
+  .regex(
+    ISO_8601_UTC_PATTERN,
+    "lease_until must be an ISO-8601 UTC instant (YYYY-MM-DDTHH:mm:ss[.sss]Z)",
+  )
   .refine(isRealCalendarInstant, "lease_until must be a real calendar instant");
 
 const claimEventSchema = z
-  .object({ ...envelopeShape, event: z.literal("claim"), lease_until: leaseUntilSchema })
+  .object({
+    ...envelopeShape,
+    event: z.literal("claim"),
+    lease_until: leaseUntilSchema,
+  })
   .strict();
 
 /**
@@ -498,16 +519,28 @@ const claimEventSchema = z
  * to provide.
  */
 const takeoverEventSchema = z
-  .object({ ...envelopeShape, event: z.literal("takeover"), lease_until: leaseUntilSchema })
+  .object({
+    ...envelopeShape,
+    event: z.literal("takeover"),
+    lease_until: leaseUntilSchema,
+  })
   .strict();
 
 const renewEventSchema = z
-  .object({ ...envelopeShape, event: z.literal("renew"), lease_until: leaseUntilSchema })
+  .object({
+    ...envelopeShape,
+    event: z.literal("renew"),
+    lease_until: leaseUntilSchema,
+  })
   .strict();
 
-const releaseEventSchema = z.object({ ...envelopeShape, event: z.literal("release") }).strict();
+const releaseEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("release") })
+  .strict();
 
-const expireEventSchema = z.object({ ...envelopeShape, event: z.literal("expire") }).strict();
+const expireEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("expire") })
+  .strict();
 
 // ============================================================================
 // Terminal-hostile free text — fix round 1, finding L5, Ruling R14
@@ -582,7 +615,15 @@ const moveEventSchema = z
  * optional.
  */
 const closeEventSchema = z
-  .object({ ...envelopeShape, event: z.literal("close"), reason: z.string().max(MAX_CLOSE_REASON_CHARS).optional() })
+  .object({
+    ...envelopeShape,
+    event: z.literal("close"),
+    reason: z.string().max(MAX_CLOSE_REASON_CHARS).optional(),
+  })
+  .strict();
+
+const reopenEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("reopen") })
   .strict();
 
 /**
@@ -616,7 +657,8 @@ const aliasEventSchema = z
     if (data.from === data.to) {
       ctx.addIssue({
         code: "custom",
-        message: "alias.from and alias.to must not be the same ticket after canonicalization",
+        message:
+          "alias.from and alias.to must not be the same ticket after canonicalization",
         path: ["to"],
       });
     }
@@ -656,7 +698,11 @@ const hookEventSchema = z
 
 /** `text` sourced from CONCEPT.md's CLI reference: `cankan comment <id> <text>` (~line 532). */
 const commentEventSchema = z
-  .object({ ...envelopeShape, event: z.literal("comment"), text: z.string().min(1).max(MAX_COMMENT_TEXT_CHARS) })
+  .object({
+    ...envelopeShape,
+    event: z.literal("comment"),
+    text: z.string().min(1).max(MAX_COMMENT_TEXT_CHARS),
+  })
   .strict();
 
 /**
@@ -668,7 +714,9 @@ const commentEventSchema = z
  * envelope's `ticket` already carries. Left envelope-only rather than
  * guessing at a content-hash or diff field no source asks for.
  */
-const externalWriteEventSchema = z.object({ ...envelopeShape, event: z.literal("external-write") }).strict();
+const externalWriteEventSchema = z
+  .object({ ...envelopeShape, event: z.literal("external-write") })
+  .strict();
 
 // ============================================================================
 // The union
@@ -683,13 +731,14 @@ const eventUnionSchema = z.discriminatedUnion("event", [
   expireEventSchema,
   moveEventSchema,
   closeEventSchema,
+  reopenEventSchema,
   aliasEventSchema,
   hookEventSchema,
   commentEventSchema,
   externalWriteEventSchema,
 ]);
 
-/** The twelve event kinds, in the order they appear in the union above. */
+/** The thirteen event kinds, in the order they appear in the union above. */
 export const EVENT_KINDS = [
   "create",
   "claim",
@@ -699,6 +748,7 @@ export const EVENT_KINDS = [
   "expire",
   "move",
   "close",
+  "reopen",
   "alias",
   "hook",
   "comment",
@@ -715,6 +765,7 @@ export type ReleaseEvent = z.infer<typeof releaseEventSchema>;
 export type ExpireEvent = z.infer<typeof expireEventSchema>;
 export type MoveEvent = z.infer<typeof moveEventSchema>;
 export type CloseEvent = z.infer<typeof closeEventSchema>;
+export type ReopenEvent = z.infer<typeof reopenEventSchema>;
 export type AliasEvent = z.infer<typeof aliasEventSchema>;
 export type HookEvent = z.infer<typeof hookEventSchema>;
 export type CommentEvent = z.infer<typeof commentEventSchema>;
@@ -827,7 +878,10 @@ function projectIssues(issues: z.ZodError["issues"]): EventValidationIssue[] {
  * needs to canonicalize again before using `ticket` (or `alias`'s
  * `from`/`to`) as a key.
  */
-export function parseEvent(line: string, options: ParseEventOptions | null = {}): ParseEventResult {
+export function parseEvent(
+  line: string,
+  options: ParseEventOptions | null = {},
+): ParseEventResult {
   // Fix round 3 (Ruling R31/R32, orchestrator security review): a default
   // parameter does not apply to an explicit `null` — confirmed by probe,
   // `parseEvent('{"event":"comment"}', null)` previously threw a raw
@@ -859,7 +913,9 @@ export function parseEvent(line: string, options: ParseEventOptions | null = {})
       error: {
         reason: "invalid-json",
         message: `line is not valid JSON (${line.length} characters)`,
-        issues: [{ path: "", message: "line is not valid JSON", code: "invalid_json" }],
+        issues: [
+          { path: "", message: "line is not valid JSON", code: "invalid_json" },
+        ],
       },
     };
   }
@@ -891,7 +947,13 @@ export function parseEvent(line: string, options: ParseEventOptions | null = {})
       error: {
         reason: "schema-invalid",
         message: `ts ${event.ts} is outside the allowed window [${PROJECT_EPOCH}, now+24h]`,
-        issues: [{ path: "ts", message: "ts is outside the allowed window", code: "ts_out_of_bounds" }],
+        issues: [
+          {
+            path: "ts",
+            message: "ts is outside the allowed window",
+            code: "ts_out_of_bounds",
+          },
+        ],
       },
     };
   }

@@ -24,6 +24,7 @@ describe("core.ticket — the M2.2 public surface", () => {
       "create",
       "move",
       "close",
+      "reopen",
       "generateTicketId",
       "keepOnDiskIdCasing",
       "normalizeTicketIdForComparison",

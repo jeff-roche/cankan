@@ -73,8 +73,8 @@
  * spec (CONCEPT.md:542). The rule that governs auto-acting: readiness must
  * never be the sole gate on an action that is not reversible; claiming
  * qualifies as reversible because release and expiry undo it. The sharp
- * edge is that a forged `close` stays permanent until #105 lands a `reopen`
- * event kind — see `ready.ts` for the full attack and the ruling.
+ * edge is that a forged `close` can steer readiness until a later `reopen`
+ * restores the blocker — see `ready.ts` for the full attack and the ruling.
  *
  * `DepsErrorCodes` (`./errors.ts`) — `EXCLUDED_LABELS_WITHOUT_LABELS_FOR`
  * (`isReady`/`readySet` was given a non-empty `excludedLabels` with no
@@ -136,9 +136,19 @@ export type {
   DependencyGraphNode,
   TypedDependencyInput,
 } from "./graph";
-export { blockers, buildGraph, normalizeDependencyId, wouldCreateCycle } from "./graph";
+export {
+  blockers,
+  buildGraph,
+  normalizeDependencyId,
+  wouldCreateCycle,
+} from "./graph";
 
 export { DepsErrorCodes } from "./errors";
 
-export type { IsReadyOptions, ReadinessBlocker, ReadinessVerdict, ReadySetResult } from "./ready";
+export type {
+  IsReadyOptions,
+  ReadinessBlocker,
+  ReadinessVerdict,
+  ReadySetResult,
+} from "./ready";
 export { isReady, readySet } from "./ready";

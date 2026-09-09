@@ -22,7 +22,9 @@ const REAL_ULID = "01M1RRC3FBMZYZS4SNMYZHJV6R";
 const TS = "2026-09-04T10:12:00Z";
 const LEASE_UNTIL = "2026-09-04T12:12:00Z";
 
-function envelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+function envelope(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
   return {
     ts: TS,
     id: REAL_ULID,
@@ -42,9 +44,13 @@ const validPayloadByKind: Record<EventKind, Record<string, unknown>> = {
   expire: envelope({ event: "expire" }),
   move: envelope({ event: "move", from: "In Progress", to: "In Review" }),
   close: envelope({ event: "close", reason: "won't fix" }),
+  reopen: envelope({ event: "reopen" }),
   alias: envelope({ event: "alias", from: "TASK-12", to: "ck-7f3a9c" }),
   hook: envelope({ event: "hook", title: "Add rate limiting", output: "ok\n" }),
-  comment: envelope({ event: "comment", text: "found existing limiter, reusing" }),
+  comment: envelope({
+    event: "comment",
+    text: "found existing limiter, reusing",
+  }),
   "external-write": envelope({ event: "external-write" }),
 };
 
@@ -68,7 +74,7 @@ describe("every kind round-trips", () => {
     });
   }
 
-  test("EVENT_KINDS names exactly the twelve kinds Ruling R1 decided", () => {
+  test("EVENT_KINDS includes the reopen lifecycle event", () => {
     const actual: string[] = [...EVENT_KINDS].sort();
     const expected: string[] = [
       "create",
@@ -79,6 +85,7 @@ describe("every kind round-trips", () => {
       "expire",
       "move",
       "close",
+      "reopen",
       "alias",
       "hook",
       "comment",
@@ -126,7 +133,9 @@ describe("obligation 1 — validated at the boundary, not cast", () => {
     const result = parse(envelope({ event: "claim", lease_until: 12345 }));
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
-    expect(result.error.issues.some((i) => i.path === "lease_until")).toBe(true);
+    expect(result.error.issues.some((i) => i.path === "lease_until")).toBe(
+      true,
+    );
   });
 
   test("success returns a typed event, failure never throws", () => {
@@ -174,7 +183,9 @@ describe("obligation 2 — event ids are ULIDs, validated on read", () => {
       const withExcluded = `0${excluded}ARZ3NDEKTSV4RRFFQ69G5FZV`;
       expect(withExcluded.length).toBe(26);
       expect(isValidEventId(withExcluded)).toBe(false);
-      expect(parse(envelope({ event: "release", id: withExcluded })).ok).toBe(false);
+      expect(parse(envelope({ event: "release", id: withExcluded })).ok).toBe(
+        false,
+      );
     }
   });
 
@@ -189,7 +200,9 @@ describe("obligation 2 — event ids are ULIDs, validated on read", () => {
   test("timestamp overflow — leading letter — is rejected; ulid's own isValid does not reject this (see probe)", () => {
     const overflowLetter = "ZZZZZZZZZZZZZZZZZZZZZZZZZZ";
     expect(isValidEventId(overflowLetter)).toBe(false);
-    expect(parse(envelope({ event: "release", id: overflowLetter })).ok).toBe(false);
+    expect(parse(envelope({ event: "release", id: overflowLetter })).ok).toBe(
+      false,
+    );
   });
 
   test("the maximum valid ULID (7ZZZ...) is accepted — the boundary is inclusive", () => {
@@ -200,7 +213,9 @@ describe("obligation 2 — event ids are ULIDs, validated on read", () => {
 
   test("a non-ULID string is rejected", () => {
     expect(isValidEventId("evt-01J9ZZZZZZZZZZZZZZZZZZZZZZ")).toBe(false);
-    expect(parse(envelope({ event: "release", id: "not-a-ulid" })).ok).toBe(false);
+    expect(parse(envelope({ event: "release", id: "not-a-ulid" })).ok).toBe(
+      false,
+    );
   });
 });
 
@@ -222,7 +237,9 @@ describe("obligation 3 — ticket canonicalized on read", () => {
   });
 
   test("a non-string ticket fails — deleting the type check would let this through", () => {
-    expect(parse(envelope({ event: "release", ticket: { evil: true } })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "release", ticket: { evil: true } })).ok,
+    ).toBe(false);
   });
 
   test("an empty-string ticket fails", () => {
@@ -238,16 +255,25 @@ describe("obligation 3 — ticket canonicalized on read", () => {
 
 describe("fix round 1 M2 — ticket structural id-shape guard", () => {
   test("a path-traversal-shaped ticket is rejected", () => {
-    const result = parse(envelope({ event: "release", ticket: "../../../../home/victim/.gitconfig" }));
+    const result = parse(
+      envelope({
+        event: "release",
+        ticket: "../../../../home/victim/.gitconfig",
+      }),
+    );
     expect(result.ok).toBe(false);
   });
 
   test("an absolute-path-shaped ticket is rejected", () => {
-    expect(parse(envelope({ event: "release", ticket: "/etc/passwd" })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "release", ticket: "/etc/passwd" })).ok,
+    ).toBe(false);
   });
 
   test("a ticket containing a raw ANSI escape is rejected", () => {
-    expect(parse(envelope({ event: "release", ticket: "\x1b[2Jck-1" })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "release", ticket: "\x1b[2Jck-1" })).ok,
+    ).toBe(false);
   });
 
   test("a whitespace-only ticket is rejected", () => {
@@ -255,11 +281,15 @@ describe("fix round 1 M2 — ticket structural id-shape guard", () => {
   });
 
   test("a ticket containing a NUL byte is rejected", () => {
-    expect(parse(envelope({ event: "release", ticket: "ck-1\0evil" })).ok).toBe(false);
+    expect(parse(envelope({ event: "release", ticket: "ck-1\0evil" })).ok).toBe(
+      false,
+    );
   });
 
   test("a ticket containing a bidi override is rejected", () => {
-    expect(parse(envelope({ event: "release", ticket: "ck-1‮" })).ok).toBe(false);
+    expect(parse(envelope({ event: "release", ticket: "ck-1‮" })).ok).toBe(
+      false,
+    );
   });
 
   test("a ticket exactly '.' or '..' is rejected", () => {
@@ -268,11 +298,19 @@ describe("fix round 1 M2 — ticket structural id-shape guard", () => {
   });
 
   test("a ticket over 100 UTF-8 bytes is rejected", () => {
-    expect(parse(envelope({ event: "release", ticket: `ck-${"a".repeat(100)}` })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "release", ticket: `ck-${"a".repeat(100)}` })).ok,
+    ).toBe(false);
   });
 
   test("legitimate ticket ids still pass — no false-positive regression", () => {
-    for (const ticket of ["ck-a1b2c3", "ck-7f3a9c", "TASK-12", "PROJ-45", "#123"]) {
+    for (const ticket of [
+      "ck-a1b2c3",
+      "ck-7f3a9c",
+      "TASK-12",
+      "PROJ-45",
+      "#123",
+    ]) {
       expect(parse(envelope({ event: "release", ticket })).ok).toBe(true);
     }
   });
@@ -282,7 +320,9 @@ describe("fix round 1 M2 — ticket structural id-shape guard", () => {
     // disclosed narrowing, not an oversight — rejecting only whitespace-only
     // (not any embedded whitespace) keeps this module strictly more
     // permissive than `unsafeIdReason`, never stricter.
-    expect(parse(envelope({ event: "release", ticket: "ck-1 .md" })).ok).toBe(true);
+    expect(parse(envelope({ event: "release", ticket: "ck-1 .md" })).ok).toBe(
+      true,
+    );
   });
 });
 
@@ -294,26 +334,42 @@ describe("obligation 4 — ts bounded to [PROJECT_EPOCH, now + 24h]", () => {
   const FIXED_NOW = Date.parse("2026-09-04T12:00:00Z");
 
   test("a ts before PROJECT_EPOCH is rejected", () => {
-    const result = parse(envelope({ event: "release", ts: "2019-12-31T23:59:59Z" }), FIXED_NOW);
+    const result = parse(
+      envelope({ event: "release", ts: "2019-12-31T23:59:59Z" }),
+      FIXED_NOW,
+    );
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
-    expect(result.error.issues.some((i) => i.code === "ts_out_of_bounds")).toBe(true);
+    expect(result.error.issues.some((i) => i.code === "ts_out_of_bounds")).toBe(
+      true,
+    );
   });
 
   test("a ts exactly at PROJECT_EPOCH is accepted — the lower boundary is inclusive", () => {
-    const result = parse(envelope({ event: "release", ts: PROJECT_EPOCH }), FIXED_NOW);
+    const result = parse(
+      envelope({ event: "release", ts: PROJECT_EPOCH }),
+      FIXED_NOW,
+    );
     expect(result.ok).toBe(true);
   });
 
   test("a ts more than 24h ahead of `now` is rejected", () => {
-    const tooFarFuture = new Date(FIXED_NOW + 25 * 60 * 60 * 1000).toISOString();
-    const result = parse(envelope({ event: "release", ts: tooFarFuture }), FIXED_NOW);
+    const tooFarFuture = new Date(
+      FIXED_NOW + 25 * 60 * 60 * 1000,
+    ).toISOString();
+    const result = parse(
+      envelope({ event: "release", ts: tooFarFuture }),
+      FIXED_NOW,
+    );
     expect(result.ok).toBe(false);
   });
 
   test("a ts exactly 24h ahead of `now` is accepted — the upper boundary is inclusive", () => {
     const exactlySkew = new Date(FIXED_NOW + 24 * 60 * 60 * 1000).toISOString();
-    const result = parse(envelope({ event: "release", ts: exactlySkew }), FIXED_NOW);
+    const result = parse(
+      envelope({ event: "release", ts: exactlySkew }),
+      FIXED_NOW,
+    );
     expect(result.ok).toBe(true);
   });
 
@@ -321,30 +377,45 @@ describe("obligation 4 — ts bounded to [PROJECT_EPOCH, now + 24h]", () => {
     const ts = "2026-08-31T23:59:00Z";
     const nowBeforeRollover = Date.parse("2026-08-31T23:59:30Z");
     const nowFarAfterRollover = Date.parse("2026-10-15T00:00:00Z");
-    expect(parse(envelope({ event: "release", ts }), nowBeforeRollover).ok).toBe(true);
+    expect(
+      parse(envelope({ event: "release", ts }), nowBeforeRollover).ok,
+    ).toBe(true);
     // Still within the fixed lower bound (well after PROJECT_EPOCH) but now
     // more than 24h behind a much-later `now` — irrelevant, since the ts is
     // in the *past* relative to now, which the lower bound (not now-relative)
     // never rejects. This demonstrates the fixed-epoch design doesn't rot: a
     // ts that was valid stays valid arbitrarily far into the future.
-    expect(parse(envelope({ event: "release", ts }), nowFarAfterRollover).ok).toBe(true);
+    expect(
+      parse(envelope({ event: "release", ts }), nowFarAfterRollover).ok,
+    ).toBe(true);
   });
 
   test("a non-ISO-8601 ts is rejected", () => {
-    expect(parse(envelope({ event: "release", ts: "not-a-date" })).ok).toBe(false);
-    expect(parse(envelope({ event: "release", ts: "2026/09/04 10:12:00" })).ok).toBe(false);
+    expect(parse(envelope({ event: "release", ts: "not-a-date" })).ok).toBe(
+      false,
+    );
+    expect(
+      parse(envelope({ event: "release", ts: "2026/09/04 10:12:00" })).ok,
+    ).toBe(false);
   });
 
   test("a calendar-invalid lease_until (shaped right, not a real date) is rejected", () => {
-    const result = parse(envelope({ event: "claim", lease_until: "2026-13-45T00:00:00Z" }));
+    const result = parse(
+      envelope({ event: "claim", lease_until: "2026-13-45T00:00:00Z" }),
+    );
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
-    expect(result.error.issues.some((i) => i.path === "lease_until")).toBe(true);
+    expect(result.error.issues.some((i) => i.path === "lease_until")).toBe(
+      true,
+    );
   });
 
   test("defaults `now` to Date.now() when not supplied", () => {
     const nearNow = new Date(Date.now() - 1000).toISOString();
-    expect(parseEvent(JSON.stringify(envelope({ event: "release", ts: nearNow }))).ok).toBe(true);
+    expect(
+      parseEvent(JSON.stringify(envelope({ event: "release", ts: nearNow })))
+        .ok,
+    ).toBe(true);
   });
 });
 
@@ -363,18 +434,27 @@ describe("fix round 1 L4 — calendar round-trip check (2026-02-30 rolls forward
   });
 
   test("a ts of 2026-02-30 (rolls forward to March 2) is rejected", () => {
-    const result = parse(envelope({ event: "release", ts: "2026-02-30T00:00:00Z" }));
+    const result = parse(
+      envelope({ event: "release", ts: "2026-02-30T00:00:00Z" }),
+    );
     expect(result.ok).toBe(false);
   });
 
   test("a lease_until of 2026-02-30 (rolls forward to March 2) is rejected", () => {
-    const result = parse(envelope({ event: "claim", lease_until: "2026-02-30T00:00:00Z" }));
+    const result = parse(
+      envelope({ event: "claim", lease_until: "2026-02-30T00:00:00Z" }),
+    );
     expect(result.ok).toBe(false);
   });
 
   test("a real, non-rolling ts and lease_until still pass", () => {
-    expect(parse(envelope({ event: "release", ts: "2026-09-04T10:12:00Z" })).ok).toBe(true);
-    expect(parse(envelope({ event: "claim", lease_until: "2026-09-04T12:12:00Z" })).ok).toBe(true);
+    expect(
+      parse(envelope({ event: "release", ts: "2026-09-04T10:12:00Z" })).ok,
+    ).toBe(true);
+    expect(
+      parse(envelope({ event: "claim", lease_until: "2026-09-04T12:12:00Z" }))
+        .ok,
+    ).toBe(true);
   });
 });
 
@@ -385,7 +465,12 @@ describe("fix round 1 L4 — calendar round-trip check (2026-02-30 rolls forward
 
 describe("obligation 5 — actor is an arbitrary string, not a checked identity", () => {
   test("any non-empty string is accepted as actor, with no git-identity or credential check", () => {
-    for (const actor of ["alice", "claude-code:alice/wt-auth", "literally anything the pusher typed", "🤖"]) {
+    for (const actor of [
+      "alice",
+      "claude-code:alice/wt-auth",
+      "literally anything the pusher typed",
+      "🤖",
+    ]) {
       expect(parse(envelope({ event: "release", actor })).ok).toBe(true);
     }
   });
@@ -405,16 +490,25 @@ describe("fix round 1 M2/R14 — actor/parent structural id-shape guard", () => 
     // A first draft applied ticket's full guard (including the
     // path-separator rule) to actor too, which rejected this exact
     // envelope default and broke nearly every test in this file.
-    expect(parse(envelope({ event: "release", actor: "claude-code:alice/wt-auth" })).ok).toBe(true);
-    expect(parse(envelope({ event: "release", actor: "codex:ci" })).ok).toBe(true);
+    expect(
+      parse(envelope({ event: "release", actor: "claude-code:alice/wt-auth" }))
+        .ok,
+    ).toBe(true);
+    expect(parse(envelope({ event: "release", actor: "codex:ci" })).ok).toBe(
+      true,
+    );
   });
 
   test("an actor containing a raw ANSI escape is rejected", () => {
-    expect(parse(envelope({ event: "release", actor: "\x1b[31malice\x1b[0m" })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "release", actor: "\x1b[31malice\x1b[0m" })).ok,
+    ).toBe(false);
   });
 
   test("an actor containing a NUL byte is rejected", () => {
-    expect(parse(envelope({ event: "release", actor: "alice\0evil" })).ok).toBe(false);
+    expect(parse(envelope({ event: "release", actor: "alice\0evil" })).ok).toBe(
+      false,
+    );
   });
 
   test("a whitespace-only actor is rejected", () => {
@@ -422,16 +516,24 @@ describe("fix round 1 M2/R14 — actor/parent structural id-shape guard", () => 
   });
 
   test("an actor containing a bidi override is rejected", () => {
-    expect(parse(envelope({ event: "release", actor: "alice‮" })).ok).toBe(false);
+    expect(parse(envelope({ event: "release", actor: "alice‮" })).ok).toBe(
+      false,
+    );
   });
 
   test("an actor over 200 characters is rejected", () => {
-    expect(parse(envelope({ event: "release", actor: "a".repeat(201) })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "release", actor: "a".repeat(201) })).ok,
+    ).toBe(false);
   });
 
   test("parent gets the identical guard, including the '/' regression check", () => {
-    expect(parse(envelope({ event: "release", parent: "alice/wt-auth" })).ok).toBe(true);
-    expect(parse(envelope({ event: "release", parent: "\x1b[31malice\x1b[0m" })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "release", parent: "alice/wt-auth" })).ok,
+    ).toBe(true);
+    expect(
+      parse(envelope({ event: "release", parent: "\x1b[31malice\x1b[0m" })).ok,
+    ).toBe(false);
   });
 });
 
@@ -441,7 +543,9 @@ describe("fix round 1 M2/R14 — actor/parent structural id-shape guard", () => 
 
 describe("obligation 7 — alias's from/to canonicalized and validated like ticket", () => {
   test("alias.from and alias.to are lowercased on read", () => {
-    const result = parse(envelope({ event: "alias", from: "TASK-12", to: "CK-7F3A9C" }));
+    const result = parse(
+      envelope({ event: "alias", from: "TASK-12", to: "CK-7F3A9C" }),
+    );
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error("unreachable");
     const event = result.event as AliasEvent;
@@ -450,15 +554,22 @@ describe("obligation 7 — alias's from/to canonicalized and validated like tick
   });
 
   test("a hostile (non-string) alias.to is rejected exactly as a hostile ticket would be", () => {
-    expect(parse(envelope({ event: "alias", from: "TASK-12", to: { evil: true } })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "alias", from: "TASK-12", to: { evil: true } }))
+        .ok,
+    ).toBe(false);
   });
 
   test("an empty alias.to is rejected", () => {
-    expect(parse(envelope({ event: "alias", from: "TASK-12", to: "" })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "alias", from: "TASK-12", to: "" })).ok,
+    ).toBe(false);
   });
 
   test("move's from/to are NOT canonicalized — they are column names, a different domain than alias's ticket-id from/to", () => {
-    const result = parse(envelope({ event: "move", from: "In Progress", to: "In Review" }));
+    const result = parse(
+      envelope({ event: "move", from: "In Progress", to: "In Review" }),
+    );
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error("unreachable");
     const event = result.event as MoveEvent;
@@ -467,7 +578,9 @@ describe("obligation 7 — alias's from/to canonicalized and validated like tick
   });
 
   test("type-level: MoveEvent's from/to is not the same type as AliasEvent's from/to", () => {
-    type _assert = Expect<Equal<IsAssignable<MoveEvent["from"], AliasEvent["from"]>, false>>;
+    type _assert = Expect<
+      Equal<IsAssignable<MoveEvent["from"], AliasEvent["from"]>, false>
+    >;
     const _typeOnly: _assert = true;
     void _typeOnly;
   });
@@ -480,16 +593,27 @@ describe("obligation 7 — alias's from/to canonicalized and validated like tick
 
 describe("fix round 1 M2 — alias.from/to get ticket's structural id-shape guard", () => {
   test("a path-traversal-shaped alias.to is rejected — the exact redirect primitive obligation 7 singles out", () => {
-    const result = parse(envelope({ event: "alias", from: "TASK-12", to: "../../../../home/victim/.gitconfig" }));
+    const result = parse(
+      envelope({
+        event: "alias",
+        from: "TASK-12",
+        to: "../../../../home/victim/.gitconfig",
+      }),
+    );
     expect(result.ok).toBe(false);
   });
 
   test("an alias.to containing a raw ANSI escape is rejected", () => {
-    expect(parse(envelope({ event: "alias", from: "TASK-12", to: "\x1b[2Jck-1" })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "alias", from: "TASK-12", to: "\x1b[2Jck-1" }))
+        .ok,
+    ).toBe(false);
   });
 
   test("an alias.from containing a bidi override is rejected", () => {
-    expect(parse(envelope({ event: "alias", from: "task-12‮", to: "ck-1" })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "alias", from: "task-12‮", to: "ck-1" })).ok,
+    ).toBe(false);
   });
 });
 
@@ -501,21 +625,29 @@ describe("fix round 1 M2 — alias.from/to get ticket's structural id-shape guar
 
 describe("fix round 1 L6 — alias self-loop rejected", () => {
   test("an exact self-loop is rejected", () => {
-    const result = parse(envelope({ event: "alias", from: "ck-1", to: "ck-1" }));
+    const result = parse(
+      envelope({ event: "alias", from: "ck-1", to: "ck-1" }),
+    );
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
-    expect(result.error.issues.some((i) => i.path === "to" && i.code === "custom")).toBe(true);
+    expect(
+      result.error.issues.some((i) => i.path === "to" && i.code === "custom"),
+    ).toBe(true);
   });
 
   test("a self-loop that only appears after canonicalization is rejected", () => {
     // Pre-canonicalization these differ ("CK-1" vs "ck-1"); a naive check
     // run before the transform would miss this.
-    const result = parse(envelope({ event: "alias", from: "CK-1", to: "ck-1" }));
+    const result = parse(
+      envelope({ event: "alias", from: "CK-1", to: "ck-1" }),
+    );
     expect(result.ok).toBe(false);
   });
 
   test("a genuine (non-self-loop) alias still parses", () => {
-    const result = parse(envelope({ event: "alias", from: "TASK-12", to: "ck-7f3a9c" }));
+    const result = parse(
+      envelope({ event: "alias", from: "TASK-12", to: "ck-7f3a9c" }),
+    );
     expect(result.ok).toBe(true);
   });
 });
@@ -526,26 +658,35 @@ describe("fix round 1 L6 — alias self-loop rejected", () => {
 
 describe("obligation 8 — an event with an unrecognized key is rejected", () => {
   test("an unrecognized top-level key fails — deleting .strict() would let this through", () => {
-    const result = parse(envelope({ event: "release", extra_field: "smuggled" }));
+    const result = parse(
+      envelope({ event: "release", extra_field: "smuggled" }),
+    );
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
-    expect(result.error.issues.some((i) => i.code === "unrecognized_keys")).toBe(true);
+    expect(
+      result.error.issues.some((i) => i.code === "unrecognized_keys"),
+    ).toBe(true);
   });
 
   test("__proto__ as a JSON key is rejected as an unrecognized key, and never touches the real prototype", () => {
-    const line = '{"ts":"2026-09-04T10:12:00Z","id":"01M1RRC3FBMZYZS4SNMYZHJV6R","actor":"alice","ticket":"ck-1","event":"release","__proto__":{"polluted":true}}';
+    const line =
+      '{"ts":"2026-09-04T10:12:00Z","id":"01M1RRC3FBMZYZS4SNMYZHJV6R","actor":"alice","ticket":"ck-1","event":"release","__proto__":{"polluted":true}}';
     const result = parseEvent(line);
     expect(result.ok).toBe(false);
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 
   test("constructor as a JSON key is rejected as an unrecognized key", () => {
-    const result = parse(envelope({ event: "release", constructor: { evil: true } }));
+    const result = parse(
+      envelope({ event: "release", constructor: { evil: true } }),
+    );
     expect(result.ok).toBe(false);
   });
 
   test("an unrecognized key on a kind-specific field set is also rejected", () => {
-    const result = parse(envelope({ event: "claim", lease_until: LEASE_UNTIL, sneaky: 1 }));
+    const result = parse(
+      envelope({ event: "claim", lease_until: LEASE_UNTIL, sneaky: 1 }),
+    );
     expect(result.ok).toBe(false);
   });
 });
@@ -558,21 +699,33 @@ describe("obligation 8 — an event with an unrecognized key is rejected", () =>
 describe("fix round 1 H1 — rejection messages do not republish untrusted bytes", () => {
   test("an unrecognized key containing an ANSI escape sequence does not appear in the failure message", () => {
     const evilKey = "\x1b[2K\x1b[1A\x1b[31mck-1 released by alice\x1b[0m";
-    const result = parseEvent(JSON.stringify(envelope({ event: "release", [evilKey]: 1 })));
+    const result = parseEvent(
+      JSON.stringify(envelope({ event: "release", [evilKey]: 1 })),
+    );
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
     const allText = JSON.stringify(result.error);
     expect(allText).not.toContain("\x1b");
     expect(allText).not.toContain("released by alice");
-    expect(result.error.issues.some((i) => i.code === "unrecognized_keys" && i.message === "event carries 1 unrecognized key")).toBe(true);
+    expect(
+      result.error.issues.some(
+        (i) =>
+          i.code === "unrecognized_keys" &&
+          i.message === "event carries 1 unrecognized key",
+      ),
+    ).toBe(true);
   });
 
   test("a 200KB unrecognized key does not blow up the failure message size", () => {
     const hugeKey = "k".repeat(200_000);
-    const result = parseEvent(JSON.stringify(envelope({ event: "release", [hugeKey]: 1 })));
+    const result = parseEvent(
+      JSON.stringify(envelope({ event: "release", [hugeKey]: 1 })),
+    );
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
-    const issue = result.error.issues.find((i) => i.code === "unrecognized_keys");
+    const issue = result.error.issues.find(
+      (i) => i.code === "unrecognized_keys",
+    );
     expect(issue).toBeDefined();
     expect((issue?.message.length ?? 0) < 100).toBe(true);
   });
@@ -609,12 +762,18 @@ describe("fix round 1 L5 — free-text fields remain terminal-hostile by design"
     const esc = "\x1b[31mhi\x1b[0m";
     expect(parse(envelope({ event: "comment", text: esc })).ok).toBe(true);
     expect(parse(envelope({ event: "close", reason: esc })).ok).toBe(true);
-    expect(parse(envelope({ event: "hook", title: esc, output: esc })).ok).toBe(true);
-    expect(parse(envelope({ event: "move", from: esc, to: "In Review" })).ok).toBe(true);
+    expect(parse(envelope({ event: "hook", title: esc, output: esc })).ok).toBe(
+      true,
+    );
+    expect(
+      parse(envelope({ event: "move", from: esc, to: "In Review" })).ok,
+    ).toBe(true);
   });
 
   test("actor does NOT get this treatment — the one field moved into the stricter id-shape guard (Ruling R14)", () => {
-    expect(parse(envelope({ event: "release", actor: "\x1b[31mhi\x1b[0m" })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "release", actor: "\x1b[31mhi\x1b[0m" })).ok,
+    ).toBe(false);
   });
 });
 
@@ -630,8 +789,12 @@ describe("fix round 1 M3 — free-text fields are bounded", () => {
   });
 
   test("a comment.text at the 10,000-character bound is accepted, one over is rejected", () => {
-    expect(parse(envelope({ event: "comment", text: "a".repeat(10_000) })).ok).toBe(true);
-    expect(parse(envelope({ event: "comment", text: "a".repeat(10_001) })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "comment", text: "a".repeat(10_000) })).ok,
+    ).toBe(true);
+    expect(
+      parse(envelope({ event: "comment", text: "a".repeat(10_001) })).ok,
+    ).toBe(false);
   });
 
   test("a 32MB close.reason is rejected", () => {
@@ -641,16 +804,29 @@ describe("fix round 1 M3 — free-text fields are bounded", () => {
 
   test("a 32MB hook.output is rejected", () => {
     const huge = "a".repeat(32 * 1024 * 1024);
-    expect(parse(envelope({ event: "hook", title: "x", output: huge })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "hook", title: "x", output: huge })).ok,
+    ).toBe(false);
   });
 
   test("hook.output at the 100,000-character bound is accepted, one over is rejected", () => {
-    expect(parse(envelope({ event: "hook", title: "x", output: "a".repeat(100_000) })).ok).toBe(true);
-    expect(parse(envelope({ event: "hook", title: "x", output: "a".repeat(100_001) })).ok).toBe(false);
+    expect(
+      parse(
+        envelope({ event: "hook", title: "x", output: "a".repeat(100_000) }),
+      ).ok,
+    ).toBe(true);
+    expect(
+      parse(
+        envelope({ event: "hook", title: "x", output: "a".repeat(100_001) }),
+      ).ok,
+    ).toBe(false);
   });
 
   test("an oversized move column name is rejected", () => {
-    expect(parse(envelope({ event: "move", from: "a".repeat(201), to: "In Review" })).ok).toBe(false);
+    expect(
+      parse(envelope({ event: "move", from: "a".repeat(201), to: "In Review" }))
+        .ok,
+    ).toBe(false);
   });
 });
 
@@ -705,8 +881,8 @@ describe("type-level sanity", () => {
     expect(claim.event).toBe("claim");
   });
 
-  test("Event is the union of all twelve kinds", () => {
+  test("Event is the union of all thirteen kinds", () => {
     const kinds = new Set<Event["event"]>(EVENT_KINDS);
-    expect(kinds.size).toBe(12);
+    expect(kinds.size).toBe(13);
   });
 });

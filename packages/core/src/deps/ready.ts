@@ -9,8 +9,8 @@
  * restates in this module's own words, because everything `isReady` builds
  * on inherits it in full:
  *
- * **Two pushed events — one `close`, one `alias` — neutralize any `blocks`
- * dependency on the board, and do so permanently until #105 lands.** Push a
+ * **Two pushed events — one `close`, one `alias` — can neutralize any `blocks`
+ * dependency on the board until a later `reopen` restores the blocker.** Push a
  * `close` event naming any real, closable ticket, then push an `alias
  * {from: <the dep id>, to: <that now-closed ticket>}`. The dependency's id
  * now resolves (through `blockedBy`'s alias-aware tiered index) to a closed
@@ -47,23 +47,9 @@
  *   enumerate up front, with no undo, needs a stronger gate than readiness
  *   alone — whatever that turns out to be is a decision for that consumer,
  *   not for `deps/`.
- * - **The sharp edge is the permanence, not the auto-action — that is the
- *   part of M2.8's security review that actually matters.** There is no
- *   `reopen` event kind, so a forged `close` cannot be undone through the log
- *   — the effect is permanent **until #105 lands**. That is the root cause,
- *   and it lives in `events/` (M2.7), not in this module. #105: "No reopen
- *   event kind: a forged close permanently neutralizes every blocks
- *   dependency on the board."
- * - **Convergence:** #105 records that M2.8 had already flagged this same
- *   `close`/`reopen` gap as a known limitation in its own Ruling R14 —
- *   reached from the *correctness* side (`state/fold.ts`'s own comment: with
- *   no `reopen` event kind, a legitimately reopened ticket still folds to
- *   `closed: true` forever, which `blockedBy` then treats as satisfied when
- *   it may not be — flagged there as a gap, not fixed) — while M2.8's
- *   security review reached the identical gap independently from the
- *   *security* side (a forgeable, permanent `close`). Two independent
- *   reviews converging on the same gap from opposite directions means it is
- *   **structural**, not an oversight in either lane.
+ * - **The sharp edge is attacker influence, not permanence.** A pushed close
+ *   can steer readiness, but a later `reopen` event restores the blocker. The
+ *   result remains advisory and must not be treated as authorization.
  *
  * **R1's flat-`dependencies` resolution is narrower than `blockedBy`'s, and
  * that narrowness is a partial mitigation, not a fix.** `deps/graph.ts`'s
@@ -187,7 +173,11 @@
 
 import { CanKanError } from "../errors";
 import { blockedBy } from "../state/index";
-import type { BoardState, DuplicateTicketId, TicketState } from "../state/index";
+import type {
+  BoardState,
+  DuplicateTicketId,
+  TicketState,
+} from "../state/index";
 import type { ActorId, TicketId } from "../types";
 import { DepsErrorCodes } from "./errors";
 import { indexById, normalizeDependencyId, resolveTier1 } from "./graph";
@@ -201,7 +191,11 @@ import { indexById, normalizeDependencyId, resolveTier1 } from "./graph";
 export type ReadinessBlocker =
   | { readonly kind: "closed" }
   | { readonly kind: "claimed"; readonly actor: ActorId }
-  | { readonly kind: "blocked"; readonly rawId: string; readonly resolvedTicket: TicketState | undefined }
+  | {
+      readonly kind: "blocked";
+      readonly rawId: string;
+      readonly resolvedTicket: TicketState | undefined;
+    }
   | { readonly kind: "excluded-label"; readonly label: string };
 
 /**
@@ -262,11 +256,17 @@ function assertIsReadyOptionsValid(
   // `flatDependenciesFor` function. Guard it explicitly rather than letting
   // `options.excludedLabels` a few lines below crash with a bare, uncoded
   // TypeError.
-  if (options === undefined || options === null || typeof options.flatDependenciesFor !== "function") {
+  if (
+    options === undefined ||
+    options === null ||
+    typeof options.flatDependenciesFor !== "function"
+  ) {
     throw new CanKanError(
       DepsErrorCodes.IS_READY_OPTIONS_REQUIRED,
       `${caller}: options.flatDependenciesFor is required and must be a function — there is no "assume no flat deps" default (Ruling R11); got ${
-        options === undefined || options === null ? "no options at all" : "options without a flatDependenciesFor function"
+        options === undefined || options === null
+          ? "no options at all"
+          : "options without a flatDependenciesFor function"
       }`,
       { details: {} },
     );
@@ -287,9 +287,14 @@ function assertIsReadyOptionsValid(
 }
 
 /** The de-duplication key for one outstanding blocker: the resolved target's normalized id when known, else the raw id's normalized form — same as `graph.ts`'s edge de-duplication, so a typed dep and a flat dep naming the same target (directly, or through `blockedBy`'s alias-aware resolution) collapse to one reason, not two (Ruling R1's worked example). Wrapped in a one-element `JSON.stringify` tuple (Ruling R13, fix round 1) for the same reason `graph.ts`'s `edgeDedupeKey` is: consistency with that function's discipline, even though this key currently has no second field to collide against. */
-function blockerDedupeKey(rawId: string, resolvedTicket: { readonly id: TicketId } | undefined): string {
+function blockerDedupeKey(
+  rawId: string,
+  resolvedTicket: { readonly id: TicketId } | undefined,
+): string {
   return JSON.stringify([
-    resolvedTicket !== undefined ? normalizeDependencyId(resolvedTicket.id) : normalizeDependencyId(rawId),
+    resolvedTicket !== undefined
+      ? normalizeDependencyId(resolvedTicket.id)
+      : normalizeDependencyId(rawId),
   ]);
 }
 
@@ -308,7 +313,11 @@ function blockerDedupeKey(rawId: string, resolvedTicket: { readonly id: TicketId
  * both its error codes escape to this function's own caller with their
  * `code` intact.
  */
-export function isReady(state: BoardState, ticketId: TicketId, options: IsReadyOptions): ReadinessVerdict {
+export function isReady(
+  state: BoardState,
+  ticketId: TicketId,
+  options: IsReadyOptions,
+): ReadinessVerdict {
   // Rulings R11, R23, R28 (fix rounds 1 and 2) — see assertIsReadyOptionsValid's own doc and this file's header.
   assertIsReadyOptionsValid(options, "isReady");
 
@@ -356,7 +365,11 @@ export function isReady(state: BoardState, ticketId: TicketId, options: IsReadyO
   const reportedBlockerKeys = new Set<string>();
   for (const dep of typedBlockers) {
     reportedBlockerKeys.add(blockerDedupeKey(dep.rawId, dep.resolvedTicket));
-    reasons.push({ kind: "blocked", rawId: dep.rawId, resolvedTicket: dep.resolvedTicket });
+    reasons.push({
+      kind: "blocked",
+      rawId: dep.rawId,
+      resolvedTicket: dep.resolvedTicket,
+    });
   }
 
   // Ruling R1: resolve Backlog.md's flat `dependencies` ourselves, tier 1
@@ -447,7 +460,10 @@ export interface ReadySetResult {
  * already established for `ambiguousIds` itself, applied here to caller
  * misconfiguration instead of board data.
  */
-export function readySet(state: BoardState, options: IsReadyOptions): ReadySetResult {
+export function readySet(
+  state: BoardState,
+  options: IsReadyOptions,
+): ReadySetResult {
   assertIsReadyOptionsValid(options, "readySet");
 
   const verdicts = new Map<TicketId, ReadinessVerdict>();

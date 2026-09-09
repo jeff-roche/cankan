@@ -10,7 +10,7 @@
  * `renew`) and delegates to `foldState`. See `fold.ts`'s own file comment
  * for the full design: why there are two functions (Ruling R7), the
  * `(month, line)` tie-break (Ruling R12), the status precedence rule
- * (Ruling R6), and the `close`/`reopen` gap (Ruling R14).
+ * (Ruling R6), and lifecycle close/reopen folding.
  *
  * ---- queries over an already-folded `BoardState` -------------------------
  *

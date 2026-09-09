@@ -7,6 +7,7 @@ import {
   serializeTicketFile,
   setCankanBlock,
   setScalarField,
+  setSequenceField,
 } from "../../src/ticket/frontmatter";
 import {
   CONCEPT_TICKET_EXAMPLE,
@@ -665,5 +666,37 @@ describe("round 2 fix-in: the alias-rejection message says 'alias', not 'anchor 
     // `containsAlias` actually rejects — it only matches `*name` alias
     // references, never a bare `&name` anchor definition.
     expect(error.message).not.toContain("anchor");
+  });
+});
+
+describe("setSequenceField (M3.5 assign)", () => {
+  test("sets an absent sequence field to a flat flow list", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    const output = serializeTicketFile(setSequenceField(parsed, "assignee", ["alice"]));
+    expect(output).toBe("---\nid: ck-1\ntitle: x\nstatus: To Do\nassignee: [alice]\n---\nbody\n");
+    expect(parseTicketFile(output).frontmatter.assignee).toEqual(["alice"]);
+  });
+
+  test("replaces an existing sequence field, preserving the rest of the file", () => {
+    const parsed = parseTicketFile(CONCEPT_TICKET_EXAMPLE);
+    const output = serializeTicketFile(setSequenceField(parsed, "assignee", ["bob", "claude-code:alice/wt-auth"]));
+    expect(output).toContain("assignee: [bob, claude-code:alice/wt-auth]");
+    expect(output).toContain("labels: [backend]");
+    expect(output).toContain("dependencies: [ck-2b1e44]");
+    expect(parseTicketFile(output).frontmatter.assignee).toEqual(["bob", "claude-code:alice/wt-auth"]);
+  });
+
+  test("rejects a non-sequence field", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    expect(() => setSequenceField(parsed, "title", ["a"])).toThrow(/not a sequence/);
+  });
+
+  test("quotes a value that is not a bare flow scalar", () => {
+    const raw = "---\nid: ck-1\ntitle: x\nstatus: To Do\n---\nbody\n";
+    const parsed = parseTicketFile(raw);
+    const output = serializeTicketFile(setSequenceField(parsed, "assignee", ["alice bob"]));
+    expect(parseTicketFile(output).frontmatter.assignee).toEqual(["alice bob"]);
   });
 });

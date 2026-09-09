@@ -21,6 +21,7 @@ describe("core.ticket — the M2.2 public surface", () => {
       "serializeTicketFile",
       "setCankanBlock",
       "setScalarField",
+      "setSequenceField",
       "create",
       "move",
       "close",

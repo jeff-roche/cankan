@@ -22,6 +22,16 @@ import {
   searchCommand,
   showCommand,
 } from "./commands/ticket";
+import {
+  coordActorsCommand,
+  coordAssignCommand,
+  coordClaimCommand,
+  coordExpireCommand,
+  coordMineCommand,
+  coordReadyCommand,
+  coordReleaseCommand,
+  coordRenewCommand,
+} from "./commands/coord";
 import { defineCommand } from "./registry";
 
 export { globalArgs } from "./context";
@@ -59,6 +69,14 @@ export const rootCommand = defineCommand({
     archive: archiveCommand,
     search: searchCommand,
     rank: rankCommand,
+    ready: coordReadyCommand,
+    claim: coordClaimCommand,
+    renew: coordRenewCommand,
+    release: coordReleaseCommand,
+    assign: coordAssignCommand,
+    mine: coordMineCommand,
+    actors: coordActorsCommand,
+    expire: coordExpireCommand,
   },
   default: "noop",
 });

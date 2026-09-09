@@ -116,15 +116,28 @@
 
 import { CanKanError, ErrorCodes, isCanKanError } from "../errors";
 import type { BoardRef, ActorId, TicketId } from "../types";
-import type { CasAttemptResult, CasRetryOptions, GitAdapter, RefSha } from "../git/index";
+import type {
+  CasAttemptResult,
+  CasRetryOptions,
+  GitAdapter,
+  RefSha,
+} from "../git/index";
 import { createGitAdapter, GitErrorCodes, withCasRetry } from "../git/index";
-import type { AppendedEvent, EventCandidate, EventId, EventRecord } from "../events/index";
+import type {
+  AppendedEvent,
+  EventCandidate,
+  EventId,
+  EventRecord,
+} from "../events/index";
 import { append, boardKeyFor, discard, observe, read } from "../events/index";
 import { EventErrorCodes } from "../events/errors";
 import type { BoardState, TicketState } from "../state/index";
 import { claimedBy, observeAndFold } from "../state/index";
 import type { TicketStore } from "../store/index";
-import { normalizeTicketIdForComparison, openTicketStore } from "../store/index";
+import {
+  normalizeTicketIdForComparison,
+  openTicketStore,
+} from "../store/index";
 import { loadBoardConfig } from "../board/index";
 import type { ConfigResult } from "../config/index";
 import { dispatchHooks } from "../hooks/dispatch";
@@ -172,11 +185,17 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 /** `clamp(max(2, ceil(leaseTtlMs / 30 days) + 1), 1, 120)` — see this file's own header for the "why." */
-function computeTrailingMonths(leaseTtlMs: number): number {
-  return clamp(Math.max(2, Math.ceil(leaseTtlMs / WINDOW_MONTH_MS) + 1), 1, MAX_TRAILING_MONTHS);
+export function computeTrailingMonths(leaseTtlMs: number): number {
+  return clamp(
+    Math.max(2, Math.ceil(leaseTtlMs / WINDOW_MONTH_MS) + 1),
+    1,
+    MAX_TRAILING_MONTHS,
+  );
 }
 
-async function resolveClaimContext(params: ResolveClaimContextParams): Promise<ClaimContext> {
+async function resolveClaimContext(
+  params: ResolveClaimContextParams,
+): Promise<ClaimContext> {
   const { board, now } = params;
   const adapter = await createGitAdapter(board.root);
   const boardKey = await boardKeyFor(adapter);
@@ -186,7 +205,8 @@ async function resolveClaimContext(params: ResolveClaimContextParams): Promise<C
   const store = await openTicketStore({ board, gitDirs });
   const config = await loadBoardConfig(board);
   const leaseTtlMs = parseDurationMs(config.value.claims.lease);
-  const trailingMonths = params.trailingMonths ?? computeTrailingMonths(leaseTtlMs);
+  const trailingMonths =
+    params.trailingMonths ?? computeTrailingMonths(leaseTtlMs);
   return {
     board,
     now,
@@ -255,9 +275,15 @@ interface BoardSnapshot {
  */
 async function snapshotBoard(ctx: ClaimContext): Promise<BoardSnapshot> {
   const parentSha = await ctx.adapter.readRef(ctx.ref);
-  const events = await read(ctx.adapter, ctx.ref, { now: ctx.now, trailingMonths: ctx.trailingMonths });
+  const events = await read(ctx.adapter, ctx.ref, {
+    now: ctx.now,
+    trailingMonths: ctx.trailingMonths,
+  });
   const { tickets } = await ctx.store.list();
-  const state = await observeAndFold(ctx.boardKey, tickets, events, { now: ctx.now, leaseTtlMs: ctx.leaseTtlMs });
+  const state = await observeAndFold(ctx.boardKey, tickets, events, {
+    now: ctx.now,
+    leaseTtlMs: ctx.leaseTtlMs,
+  });
   return { parentSha, state, events };
 }
 
@@ -278,8 +304,8 @@ async function snapshotBoard(ctx: ClaimContext): Promise<BoardSnapshot> {
  * for why a set, not a rejection, is what this call site needs.
  */
 const ECHO_UNSAFE_CODE_POINTS = new Set([
-  0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067,
-  0x2068, 0x2069, 0xfeff,
+  0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d,
+  0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0xfeff,
 ]);
 
 function isAsciiControlOrDel(code: number): boolean {
@@ -317,7 +343,8 @@ function sanitizeTicketQueryForEcho(ticketQuery: string): string {
   let stripped = "";
   for (const ch of ticketQuery) {
     const code = ch.codePointAt(0) ?? 0;
-    if (isAsciiControlOrDel(code) || ECHO_UNSAFE_CODE_POINTS.has(code)) continue;
+    if (isAsciiControlOrDel(code) || ECHO_UNSAFE_CODE_POINTS.has(code))
+      continue;
     stripped += ch;
   }
   let truncated = "";
@@ -330,7 +357,10 @@ function sanitizeTicketQueryForEcho(ticketQuery: string): string {
   return truncated;
 }
 
-function resolveTicket(state: BoardState, ticketQuery: string): TicketState {
+export function resolveTicket(
+  state: BoardState,
+  ticketQuery: string,
+): TicketState {
   const key = normalizeTicketIdForComparison(ticketQuery);
   const safeTicketQuery = sanitizeTicketQueryForEcho(ticketQuery);
   // Ruling D1: an id excluded from `state.tickets` because more than one
@@ -370,7 +400,10 @@ function resolveTicket(state: BoardState, ticketQuery: string): TicketState {
   // more than one rejects as ambiguous; zero remains `TICKET_NOT_FOUND`.
   const matches = state.tickets.filter((t) => {
     if (normalizeTicketIdForComparison(t.id) === key) return true;
-    return t.displayId !== undefined && normalizeTicketIdForComparison(t.displayId) === key;
+    return (
+      t.displayId !== undefined &&
+      normalizeTicketIdForComparison(t.displayId) === key
+    );
   });
   if (matches.length > 1) {
     throw new CanKanError(
@@ -381,9 +414,13 @@ function resolveTicket(state: BoardState, ticketQuery: string): TicketState {
   }
   const match = matches[0];
   if (match === undefined) {
-    throw new CanKanError(ClaimErrorCodes.TICKET_NOT_FOUND, `no ticket found matching "${safeTicketQuery}"`, {
-      details: { ticket: safeTicketQuery },
-    });
+    throw new CanKanError(
+      ClaimErrorCodes.TICKET_NOT_FOUND,
+      `no ticket found matching "${safeTicketQuery}"`,
+      {
+        details: { ticket: safeTicketQuery },
+      },
+    );
   }
   return match;
 }
@@ -402,14 +439,24 @@ type ClaimRejectionReason =
   | "lease-expired";
 
 /** Every "you asked to hold this ticket and you do not" outcome shares this one code (M3.10 maps it to exit 3) — see `claims/errors.ts`'s own header for the ruling. */
-function claimRejected(reason: ClaimRejectionReason, ticket: TicketId, extra?: Readonly<Record<string, unknown>>): CanKanError {
-  return new CanKanError(ErrorCodes.CLAIM_REJECTED, `claim rejected (${reason}) for ticket "${ticket}"`, {
-    details: { reason, ticket, ...extra },
-  });
+function claimRejected(
+  reason: ClaimRejectionReason,
+  ticket: TicketId,
+  extra?: Readonly<Record<string, unknown>>,
+): CanKanError {
+  return new CanKanError(
+    ErrorCodes.CLAIM_REJECTED,
+    `claim rejected (${reason}) for ticket "${ticket}"`,
+    {
+      details: { reason, ticket, ...extra },
+    },
+  );
 }
 
 function isStaleParentError(err: unknown): boolean {
-  return isCanKanError(err) && err.code === EventErrorCodes.EVENT_APPEND_STALE_PARENT;
+  return (
+    isCanKanError(err) && err.code === EventErrorCodes.EVENT_APPEND_STALE_PARENT
+  );
 }
 
 // ============================================================================
@@ -439,7 +486,10 @@ async function appendOrRetry(
   parentSha: RefSha | null,
 ): Promise<AppendedEvent | undefined> {
   try {
-    return await append(ctx.adapter, ctx.ref, candidate, { now: ctx.now, expectedParent: parentSha });
+    return await append(ctx.adapter, ctx.ref, candidate, {
+      now: ctx.now,
+      expectedParent: parentSha,
+    });
   } catch (err) {
     if (isStaleParentError(err)) {
       return undefined;
@@ -454,9 +504,18 @@ async function appendOrRetry(
 // ============================================================================
 
 /** The three event kinds that start or extend a lease — mirrors `state/fold.ts`'s own (file-private) `LEASE_ANCHOR_KINDS`; duplicated here because that module withholds it (`state/index.ts`'s own doc comment: internal folding machinery, not a public export). */
-const LEASE_ANCHOR_EVENT_KINDS: ReadonlySet<string> = new Set(["claim", "takeover", "renew"]);
+const LEASE_ANCHOR_EVENT_KINDS: ReadonlySet<string> = new Set([
+  "claim",
+  "takeover",
+  "renew",
+]);
 /** Every event kind that can end a lease outright, alongside the three above — mirrors `state/fold.ts`'s (file-private) `LEASE_AFFECTING_KINDS` for the same reason. */
-const LEASE_AFFECTING_EVENT_KINDS: ReadonlySet<string> = new Set([...LEASE_ANCHOR_EVENT_KINDS, "release", "close", "expire"]);
+const LEASE_AFFECTING_EVENT_KINDS: ReadonlySet<string> = new Set([
+  ...LEASE_ANCHOR_EVENT_KINDS,
+  "release",
+  "close",
+  "expire",
+]);
 
 /**
  * `(month, line)` chain-position comparator — mirrors `state/fold.ts`'s own
@@ -508,10 +567,15 @@ function compareChainPosition(a: EventRecord, b: EventRecord): number {
  * own doc comment measures directly (611 spawns at `trailingMonths: 120`);
  * this function does not attempt to.
  */
-function computeDiscardRun(events: readonly EventRecord[], ticketId: TicketId): readonly EventId[] {
+function computeDiscardRun(
+  events: readonly EventRecord[],
+  ticketId: TicketId,
+): readonly EventId[] {
   const key = normalizeTicketIdForComparison(ticketId);
   const relevant = events.filter(
-    (r) => LEASE_AFFECTING_EVENT_KINDS.has(r.event.event) && normalizeTicketIdForComparison(r.event.ticket) === key,
+    (r) =>
+      LEASE_AFFECTING_EVENT_KINDS.has(r.event.event) &&
+      normalizeTicketIdForComparison(r.event.ticket) === key,
   );
   const sorted = [...relevant].sort(compareChainPosition);
 
@@ -546,13 +610,19 @@ function computeDiscardRun(events: readonly EventRecord[], ticketId: TicketId): 
  * "my release was lost." `details.appended: true` lets a caller tell the
  * two situations apart.
  */
-async function runDiscardWalk(ctx: ClaimContext, ids: readonly EventId[]): Promise<void> {
+async function runDiscardWalk(
+  ctx: ClaimContext,
+  ids: readonly EventId[],
+): Promise<void> {
   for (const id of ids) {
     try {
       await discard(ctx.boardKey, id);
     } catch (err) {
       if (isCanKanError(err)) {
-        throw new CanKanError(err.code, err.message, { cause: err, details: { ...err.details, appended: true } });
+        throw new CanKanError(err.code, err.message, {
+          cause: err,
+          details: { ...err.details, appended: true },
+        });
       }
       throw err;
     }
@@ -582,32 +652,57 @@ const MAX_BACKOFF_MS = 60_000;
  * `casRetry` before forwarding it) calls `withCasRetry` directly, so this is
  * the only place that check can happen.
  */
-function validateCasRetry(casRetry: CasRetryOptions | undefined): CasRetryOptions | undefined {
+function validateCasRetry(
+  casRetry: CasRetryOptions | undefined,
+): CasRetryOptions | undefined {
   if (casRetry === undefined) {
     return undefined;
   }
   if (casRetry === null || typeof casRetry !== "object") {
-    throw new CanKanError(ClaimErrorCodes.INVALID_OPTION, `casRetry must be an object, got ${casRetry === null ? "null" : typeof casRetry}`, {
-      details: { type: casRetry === null ? "null" : typeof casRetry },
-    });
+    throw new CanKanError(
+      ClaimErrorCodes.INVALID_OPTION,
+      `casRetry must be an object, got ${casRetry === null ? "null" : typeof casRetry}`,
+      {
+        details: { type: casRetry === null ? "null" : typeof casRetry },
+      },
+    );
   }
   const { maxAttempts, backoffMs, sleep } = casRetry;
-  if (maxAttempts !== undefined && (!Number.isInteger(maxAttempts) || maxAttempts < MIN_CAS_ATTEMPTS || maxAttempts > MAX_CAS_ATTEMPTS)) {
+  if (
+    maxAttempts !== undefined &&
+    (!Number.isInteger(maxAttempts) ||
+      maxAttempts < MIN_CAS_ATTEMPTS ||
+      maxAttempts > MAX_CAS_ATTEMPTS)
+  ) {
     throw new CanKanError(
       ClaimErrorCodes.INVALID_OPTION,
       `casRetry.maxAttempts must be an integer in [${MIN_CAS_ATTEMPTS}, ${MAX_CAS_ATTEMPTS}] — the reclaim path (expire, then claim) spends one attempt on each`,
-      { details: { maxAttempts: typeof maxAttempts === "number" ? maxAttempts : null, min: MIN_CAS_ATTEMPTS, max: MAX_CAS_ATTEMPTS } },
+      {
+        details: {
+          maxAttempts: typeof maxAttempts === "number" ? maxAttempts : null,
+          min: MIN_CAS_ATTEMPTS,
+          max: MAX_CAS_ATTEMPTS,
+        },
+      },
     );
   }
   if (backoffMs !== undefined && typeof backoffMs !== "function") {
-    throw new CanKanError(ClaimErrorCodes.INVALID_OPTION, `casRetry.backoffMs must be a function, got ${typeof backoffMs}`, {
-      details: { type: typeof backoffMs },
-    });
+    throw new CanKanError(
+      ClaimErrorCodes.INVALID_OPTION,
+      `casRetry.backoffMs must be a function, got ${typeof backoffMs}`,
+      {
+        details: { type: typeof backoffMs },
+      },
+    );
   }
   if (sleep !== undefined && typeof sleep !== "function") {
-    throw new CanKanError(ClaimErrorCodes.INVALID_OPTION, `casRetry.sleep must be a function, got ${typeof sleep}`, {
-      details: { type: typeof sleep },
-    });
+    throw new CanKanError(
+      ClaimErrorCodes.INVALID_OPTION,
+      `casRetry.sleep must be a function, got ${typeof sleep}`,
+      {
+        details: { type: typeof sleep },
+      },
+    );
   }
   if (backoffMs === undefined) {
     return casRetry;
@@ -617,9 +712,13 @@ function validateCasRetry(casRetry: CasRetryOptions | undefined): CasRetryOption
     backoffMs: (attemptNumber: number) => {
       const ms = backoffMs(attemptNumber);
       if (!Number.isFinite(ms) || ms < 0 || ms > MAX_BACKOFF_MS) {
-        throw new CanKanError(ClaimErrorCodes.INVALID_OPTION, `casRetry.backoffMs must return a finite number in [0, ${MAX_BACKOFF_MS}], got ${ms}`, {
-          details: { backoffMs: ms, max: MAX_BACKOFF_MS },
-        });
+        throw new CanKanError(
+          ClaimErrorCodes.INVALID_OPTION,
+          `casRetry.backoffMs must return a finite number in [0, ${MAX_BACKOFF_MS}], got ${ms}`,
+          {
+            details: { backoffMs: ms, max: MAX_BACKOFF_MS },
+          },
+        );
       }
       return ms;
     },
@@ -721,7 +820,9 @@ async function claimAttempt(
       throw claimRejected("already-held-by-you", ticketState.id);
     }
     if (!params.force) {
-      throw claimRejected("already-held", ticketState.id, { holder: lease.actor });
+      throw claimRejected("already-held", ticketState.id, {
+        holder: lease.actor,
+      });
     }
     // `--force` authorizes taking over exactly ONE holder — the one
     // observed when this call first decided to force — never a chain of
@@ -730,7 +831,9 @@ async function claimAttempt(
     // target (two racing `--force` callers would otherwise ping-pong until
     // `maxAttempts` and both die with `GIT_CAS_CONTENTION_EXCEEDED`).
     if (forceState.holder !== undefined && lease.actor !== forceState.holder) {
-      throw claimRejected("already-held", ticketState.id, { holder: lease.actor });
+      throw claimRejected("already-held", ticketState.id, {
+        holder: lease.actor,
+      });
     }
     forceState.holder = lease.actor;
     useForce = true;
@@ -739,14 +842,17 @@ async function claimAttempt(
   if (ctx.maxPerActor !== 0) {
     const heldCount = claimedBy(state).get(params.actor)?.length ?? 0;
     if (heldCount >= ctx.maxPerActor) {
-      throw claimRejected("max-per-actor", ticketState.id, { limit: ctx.maxPerActor });
+      throw claimRejected("max-per-actor", ticketState.id, {
+        limit: ctx.maxPerActor,
+      });
     }
   }
 
   await hooks.beforeAppend?.(attemptNumber);
 
   const nowIso = new Date(ctx.now).toISOString();
-  const parentField = params.parent !== undefined ? { parent: params.parent } : {};
+  const parentField =
+    params.parent !== undefined ? { parent: params.parent } : {};
 
   if (lease?.expired) {
     // Observed expired, held by anyone. An honest reclaim is `expire` then
@@ -785,10 +891,26 @@ async function claimAttempt(
   // same observation-id discard obligation as the `expire` branch above —
   // computed from the pre-append `events`, before the append; empty for a
   // plain `claim` against an unclaimed ticket (nothing to displace).
-  const takeoverDisplacedRun = useForce ? computeDiscardRun(events, ticketState.id) : [];
+  const takeoverDisplacedRun = useForce
+    ? computeDiscardRun(events, ticketState.id)
+    : [];
   const candidate: EventCandidate = useForce
-    ? { event: "takeover", ts: nowIso, actor: params.actor, ticket: ticketState.id, lease_until: leaseUntilIso, ...parentField }
-    : { event: "claim", ts: nowIso, actor: params.actor, ticket: ticketState.id, lease_until: leaseUntilIso, ...parentField };
+    ? {
+        event: "takeover",
+        ts: nowIso,
+        actor: params.actor,
+        ticket: ticketState.id,
+        lease_until: leaseUntilIso,
+        ...parentField,
+      }
+    : {
+        event: "claim",
+        ts: nowIso,
+        actor: params.actor,
+        ticket: ticketState.id,
+        lease_until: leaseUntilIso,
+        ...parentField,
+      };
 
   const appended = await appendOrRetry(ctx, candidate, parentSha);
   if (appended === undefined) {
@@ -805,26 +927,41 @@ async function claimAttempt(
 
   return {
     done: true,
-    value: { ticketId: ticketState.id, eventId: appended.event.id, kind, leaseUntil: leaseUntilIso, attempts: attemptNumber },
+    value: {
+      ticketId: ticketState.id,
+      eventId: appended.event.id,
+      kind,
+      leaseUntil: leaseUntilIso,
+      attempts: attemptNumber,
+    },
   };
 }
 
 /** `claim()`'s implementation, plus the test-only `hooks` seam. `claim()` calls this with no hooks. */
-export async function claimCore(params: ClaimParams, hooks: ClaimHooks): Promise<ClaimResult> {
+export async function claimCore(
+  params: ClaimParams,
+  hooks: ClaimHooks,
+): Promise<ClaimResult> {
   const now = params.now ?? Date.now();
   const casRetry = validateCasRetry(params.casRetry);
   // `params.lease` overrides only the event's display `lease_until` field —
   // parsed up front (before any git invocation) so a malformed override
   // fails fast rather than after a wasted snapshot.
-  const leaseOverrideMs = params.lease !== undefined ? parseDurationMs(params.lease) : undefined;
+  const leaseOverrideMs =
+    params.lease !== undefined ? parseDurationMs(params.lease) : undefined;
 
-  const ctx = await resolveClaimContext({ board: params.board, now, trailingMonths: params.trailingMonths });
+  const ctx = await resolveClaimContext({
+    board: params.board,
+    now,
+    trailingMonths: params.trailingMonths,
+  });
   const leaseMs = leaseOverrideMs ?? ctx.leaseTtlMs;
 
   const forceState: { holder: ActorId | undefined } = { holder: undefined };
 
   const success = await withCasRetry<ClaimSuccess>(
-    (attemptNumber) => claimAttempt(ctx, params, leaseMs, hooks, attemptNumber, forceState),
+    (attemptNumber) =>
+      claimAttempt(ctx, params, leaseMs, hooks, attemptNumber, forceState),
     casRetry,
   );
 
@@ -952,20 +1089,36 @@ async function renewAttempt(
 
   return {
     done: true,
-    value: { ticketId: ticketState.id, eventId: appended.event.id, leaseUntil: leaseUntilIso, attempts: attemptNumber },
+    value: {
+      ticketId: ticketState.id,
+      eventId: appended.event.id,
+      leaseUntil: leaseUntilIso,
+      attempts: attemptNumber,
+    },
   };
 }
 
 /** `renew()`'s implementation, plus the test-only `hooks` seam. `renew()` calls this with no hooks. */
-export async function renewCore(params: RenewParams, hooks: RenewHooks): Promise<RenewResult> {
+export async function renewCore(
+  params: RenewParams,
+  hooks: RenewHooks,
+): Promise<RenewResult> {
   const now = params.now ?? Date.now();
   const casRetry = validateCasRetry(params.casRetry);
-  const leaseOverrideMs = params.lease !== undefined ? parseDurationMs(params.lease) : undefined;
+  const leaseOverrideMs =
+    params.lease !== undefined ? parseDurationMs(params.lease) : undefined;
 
-  const ctx = await resolveClaimContext({ board: params.board, now, trailingMonths: params.trailingMonths });
+  const ctx = await resolveClaimContext({
+    board: params.board,
+    now,
+    trailingMonths: params.trailingMonths,
+  });
   const leaseMs = leaseOverrideMs ?? ctx.leaseTtlMs;
 
-  const success = await withCasRetry<RenewSuccess>((attemptNumber) => renewAttempt(ctx, params, leaseMs, hooks, attemptNumber), casRetry);
+  const success = await withCasRetry<RenewSuccess>(
+    (attemptNumber) => renewAttempt(ctx, params, leaseMs, hooks, attemptNumber),
+    casRetry,
+  );
 
   return {
     ticket: success.ticketId,
@@ -1075,18 +1228,40 @@ async function releaseAttempt(
   await runDiscardWalk(ctx, run);
   await dispatchHooks(ctx, "release", ticketState.id, params.actor);
 
-  return { done: true, value: { ticketId: ticketState.id, eventId: appended.event.id, attempts: attemptNumber } };
+  return {
+    done: true,
+    value: {
+      ticketId: ticketState.id,
+      eventId: appended.event.id,
+      attempts: attemptNumber,
+    },
+  };
 }
 
 /** `release()`'s implementation, plus the test-only `hooks` seam. `release()` calls this with no hooks. */
-export async function releaseCore(params: ReleaseParams, hooks: ReleaseHooks): Promise<ReleaseResult> {
+export async function releaseCore(
+  params: ReleaseParams,
+  hooks: ReleaseHooks,
+): Promise<ReleaseResult> {
   const now = params.now ?? Date.now();
   const casRetry = validateCasRetry(params.casRetry);
-  const ctx = await resolveClaimContext({ board: params.board, now, trailingMonths: params.trailingMonths });
+  const ctx = await resolveClaimContext({
+    board: params.board,
+    now,
+    trailingMonths: params.trailingMonths,
+  });
 
-  const success = await withCasRetry<ReleaseSuccess>((attemptNumber) => releaseAttempt(ctx, params, hooks, attemptNumber), casRetry);
+  const success = await withCasRetry<ReleaseSuccess>(
+    (attemptNumber) => releaseAttempt(ctx, params, hooks, attemptNumber),
+    casRetry,
+  );
 
-  return { ticket: success.ticketId, actor: params.actor, eventId: success.eventId, attempts: success.attempts };
+  return {
+    ticket: success.ticketId,
+    actor: params.actor,
+    eventId: success.eventId,
+    attempts: success.attempts,
+  };
 }
 
 /** Ends `params.actor`'s own live lease on a ticket. See `releaseAttempt`'s doc comment for the three rejection cases and why the CAS matters here specifically. */
@@ -1138,10 +1313,15 @@ export interface ExpireStaleResult {
 
 /** Test-only injection point for `expireStaleCore`'s internal per-ticket retry loops — same pattern as `ClaimHooks`, keyed additionally by which ticket's cycle is about to append. Not part of the public surface. */
 export interface ExpireStaleHooks {
-  readonly beforeAppend?: (ticket: TicketId, attemptNumber: number) => Promise<void>;
+  readonly beforeAppend?: (
+    ticket: TicketId,
+    attemptNumber: number,
+  ) => Promise<void>;
 }
 
-type ExpireAttemptValue = { readonly kind: "expired"; readonly eventId: EventId } | { readonly kind: "skipped" };
+type ExpireAttemptValue =
+  | { readonly kind: "expired"; readonly eventId: EventId }
+  | { readonly kind: "skipped" };
 
 /**
  * One ticket's own CAS cycle: re-snapshot, confirm the lease is *still*
@@ -1162,7 +1342,9 @@ async function expireStaleAttempt(
 ): Promise<CasAttemptResult<ExpireAttemptValue>> {
   const key = normalizeTicketIdForComparison(ticketId);
   const { parentSha, state, events } = await snapshotBoard(ctx);
-  const ticketState = state.tickets.find((t) => normalizeTicketIdForComparison(t.id) === key);
+  const ticketState = state.tickets.find(
+    (t) => normalizeTicketIdForComparison(t.id) === key,
+  );
   const lease = ticketState?.lease;
 
   if (ticketState === undefined || lease === undefined || !lease.expired) {
@@ -1220,7 +1402,8 @@ async function sweepOneTicket(
 ): Promise<ExpireStaleTicketResult> {
   try {
     const outcome = await withCasRetry<ExpireAttemptValue>(
-      (attemptNumber) => expireStaleAttempt(ctx, ticketId, actor, hooks, attemptNumber),
+      (attemptNumber) =>
+        expireStaleAttempt(ctx, ticketId, actor, hooks, attemptNumber),
       casRetry,
     );
     if (outcome.kind === "expired") {
@@ -1228,7 +1411,10 @@ async function sweepOneTicket(
     }
     return { ticket: ticketId, outcome: "skipped", reason: "renewed" };
   } catch (err) {
-    if (isCanKanError(err) && err.code === GitErrorCodes.GIT_CAS_CONTENTION_EXCEEDED) {
+    if (
+      isCanKanError(err) &&
+      err.code === GitErrorCodes.GIT_CAS_CONTENTION_EXCEEDED
+    ) {
       // This ticket's own cycle lost the race repeatedly against unrelated
       // contention — a per-ticket skip (this file's header: "your CAS lost
       // the race" is explicitly grouped with "renewed underneath you" as a
@@ -1254,10 +1440,17 @@ async function sweepOneTicket(
  * A dry run reports the same candidate list with no event appended and
  * nothing discarded — it does not even enter the per-ticket loop.
  */
-export async function expireStaleCore(params: ExpireStaleParams, hooks: ExpireStaleHooks): Promise<ExpireStaleResult> {
+export async function expireStaleCore(
+  params: ExpireStaleParams,
+  hooks: ExpireStaleHooks,
+): Promise<ExpireStaleResult> {
   const now = params.now ?? Date.now();
   const casRetry = validateCasRetry(params.casRetry);
-  const ctx = await resolveClaimContext({ board: params.board, now, trailingMonths: params.trailingMonths });
+  const ctx = await resolveClaimContext({
+    board: params.board,
+    now,
+    trailingMonths: params.trailingMonths,
+  });
   const dryRun = params.dryRun ?? false;
 
   const { state } = await snapshotBoard(ctx);
@@ -1266,18 +1459,25 @@ export async function expireStaleCore(params: ExpireStaleParams, hooks: ExpireSt
   if (dryRun) {
     return {
       dryRun: true,
-      tickets: candidates.map((t) => ({ ticket: t.id, outcome: "expired" as const })),
+      tickets: candidates.map((t) => ({
+        ticket: t.id,
+        outcome: "expired" as const,
+      })),
     };
   }
 
   const tickets: ExpireStaleTicketResult[] = [];
   for (const candidate of candidates) {
-    tickets.push(await sweepOneTicket(ctx, candidate.id, params.actor, hooks, casRetry));
+    tickets.push(
+      await sweepOneTicket(ctx, candidate.id, params.actor, hooks, casRetry),
+    );
   }
   return { dryRun: false, tickets };
 }
 
 /** Sweeps the board, ending every lease this reader currently observes as expired. See `expireStaleAttempt`'s and `sweepOneTicket`'s doc comments for the failure-disposition ruling this implements. */
-export function expireStale(params: ExpireStaleParams): Promise<ExpireStaleResult> {
+export function expireStale(
+  params: ExpireStaleParams,
+): Promise<ExpireStaleResult> {
   return expireStaleCore(params, {});
 }

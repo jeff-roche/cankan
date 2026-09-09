@@ -11,7 +11,6 @@ import {
   coordActorsCommand,
   coordAssignCommand,
   coordClaimCommand,
-  coordCommand,
   coordExpireCommand,
   coordMineCommand,
   coordReadyCommand,
@@ -50,7 +49,6 @@ export const rootCommand = defineCommand({
     mine: coordMineCommand,
     actors: coordActorsCommand,
     expire: coordExpireCommand,
-    coord: coordCommand,
   },
   default: "noop",
 });

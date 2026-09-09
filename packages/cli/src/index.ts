@@ -29,7 +29,6 @@ export {
   coordActorsCommand,
   coordAssignCommand,
   coordClaimCommand,
-  coordCommand,
   coordExpireCommand,
   coordMineCommand,
   coordReady,
@@ -38,11 +37,8 @@ export {
   coordRenewCommand,
   listActors,
   mine,
-  parseLimitOption,
   releaseAll,
   renewAll,
-  resolveAssignActors,
-  runExpireSweep,
 } from "./commands/coord";
 export type {
   ActiveActorGroup,

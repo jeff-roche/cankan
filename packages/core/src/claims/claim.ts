@@ -357,7 +357,10 @@ function sanitizeTicketQueryForEcho(ticketQuery: string): string {
   return truncated;
 }
 
-function resolveTicket(state: BoardState, ticketQuery: string): TicketState {
+export function resolveTicket(
+  state: BoardState,
+  ticketQuery: string,
+): TicketState {
   const key = normalizeTicketIdForComparison(ticketQuery);
   const safeTicketQuery = sanitizeTicketQueryForEcho(ticketQuery);
   // Ruling D1: an id excluded from `state.tickets` because more than one

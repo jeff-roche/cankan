@@ -1,7 +1,7 @@
 /**
  * `claims/index.ts` — the public surface of M2.10: `claim`, `renew`,
- * `release`, `expireStale`, their parameter/result types, this module's own
- * error codes, and the duration parser they depend on.
+ * `release`, `expireStale`, ticket resolution, their parameter/result types,
+ * this module's own error codes, and the duration parser they depend on.
  *
  * **Deliberately not re-exported here**: `claimCore`/`renewCore`/
  * `releaseCore`/`expireStaleCore` (`claim.ts`) — the test-only seams behind
@@ -28,3 +28,4 @@ export { ClaimErrorCodes } from "./errors";
 
 export { parseDurationMs } from "./duration";
 export { computeTrailingMonths } from "./claim";
+export { resolveTicket } from "./claim";

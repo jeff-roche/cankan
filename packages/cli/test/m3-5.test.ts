@@ -3,11 +3,11 @@ import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import * as core from "@jeff-roche/cankan-core";
 import {
+  assignTicket,
   claimNext,
   coordReady,
   releaseAll,
   renewAll,
-  resolveAssignActors,
   runExpireSweep,
 } from "../src/commands/coord";
 import { makeContext } from "./helpers";
@@ -30,12 +30,26 @@ test("M3.5 assign is a formatting-preserving frontmatter hint, not a lease", asy
         const before = await context.core.adapter.readRef(
           context.board.coordinationRef,
         );
-        await context.core.store.write(
-          core.ticket.setSequenceField(
-            stored.ticket,
-            "assignee",
-            resolveAssignActors(["alice"]),
-          ),
+        await assignTicket(
+          context.core,
+          context.board,
+          context.config,
+          "ck-alpha",
+          "alice",
+        );
+        await assignTicket(
+          context.core,
+          context.board,
+          context.config,
+          "ck-alpha",
+          "bob",
+        );
+        await assignTicket(
+          context.core,
+          context.board,
+          context.config,
+          "ck-alpha",
+          "alice",
         );
         const after = await context.core.adapter.readRef(
           context.board.coordinationRef,
@@ -44,11 +58,28 @@ test("M3.5 assign is a formatting-preserving frontmatter hint, not a lease", asy
         expect(after).toBe(before);
         const rewritten = await context.core.store.get("ck-alpha");
         if (rewritten === undefined) throw new Error("ticket vanished");
-        expect(rewritten.ticket.frontmatter.assignee).toEqual(["alice"]);
+        expect(rewritten.ticket.frontmatter.assignee).toEqual(["alice", "bob"]);
         const onDisk = await readFile(rewritten.path, "utf8");
-        expect(onDisk).toContain("assignee: [alice]");
+        expect(onDisk).toContain("assignee: [alice, bob]");
         expect(onDisk).toContain("id: ck-alpha");
         expect(onDisk).toContain("title: Alpha");
+        await core.ticket.close({
+          board: context.board,
+          ticket: "ck-alpha",
+          actor: context.actor.id,
+        });
+        await expect(
+          assignTicket(
+            context.core,
+            context.board,
+            context.config,
+            "ck-alpha",
+            "carol",
+          ),
+        ).rejects.toMatchObject({
+          code: core.ErrorCodes.CLAIM_REJECTED,
+          details: { reason: "closed" },
+        });
       } finally {
         context.core.dispose();
       }

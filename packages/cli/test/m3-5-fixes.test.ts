@@ -7,6 +7,7 @@ import {
   claimExplicit,
   claimNext,
   coordReady,
+  listActors,
   mine,
   parseLimitOption,
   renewAll,
@@ -235,10 +236,15 @@ test("M3.5 renewAll skips a claim lost to a competing takeover", async () => {
           context.board,
           context.actor.id,
           context.config,
+          { lease: "1h" },
         );
         // Only the still-held ticket is renewed; the lost one is skipped, and
         // the sweep did not abort.
         expect(renewed.map((r) => r.ticket)).toEqual(["ck-b"]);
+        const remainingMs =
+          new Date(renewed[0].leaseUntil).getTime() - Date.now();
+        expect(remainingMs).toBeGreaterThan(30 * 60 * 1000);
+        expect(remainingMs).toBeLessThan(90 * 60 * 1000);
       } finally {
         context.core.dispose();
       }
@@ -303,6 +309,33 @@ test("M3.5 mine lists claims and assignments", async () => {
         );
         expect(result.claims).toEqual(["ck-a"]);
         expect(result.assignments).toEqual(["ck-b"]);
+      } finally {
+        context.core.dispose();
+      }
+    });
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("M3.5 actors lists current claims without an active filter", async () => {
+  const repo = await makeTempRepo();
+  try {
+    await withEnv(undefined, async () => {
+      await mkdir(join(repo.dir, "backlog", "tasks"), { recursive: true });
+      await writeFixtureTickets(join(repo.dir, "backlog", "tasks"), [
+        { id: "ck-a", title: "A", status: "To Do", body: "A" },
+      ]);
+      const context = await makeContext(repo.dir);
+      try {
+        await core.claims.claim({
+          board: context.board,
+          ticket: "ck-a",
+          actor: context.actor.id,
+        });
+        await expect(
+          listActors(context.core, context.board, context.config),
+        ).resolves.toEqual([{ actor: context.actor.id, tickets: ["ck-a"] }]);
       } finally {
         context.core.dispose();
       }

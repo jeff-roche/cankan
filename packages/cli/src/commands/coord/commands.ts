@@ -8,6 +8,7 @@ import {
 import { defineCommand } from "../../registry";
 import {
   activeActors,
+  assignTicket,
   claimExplicit,
   claimNext,
   coordReady,
@@ -16,9 +17,8 @@ import {
   parseLimitOption,
   releaseAll,
   renewAll,
-  resolveAssignActors,
   runExpireSweep,
-} from "./index";
+} from "./logic";
 
 interface CoordArgs extends GlobalArgs {
   readonly id?: string;
@@ -35,6 +35,10 @@ interface CoordArgs extends GlobalArgs {
   readonly target?: string;
   readonly dryRun?: boolean;
   readonly active?: string;
+}
+
+function coordArgs(args: unknown): CoordArgs {
+  return args as CoordArgs;
 }
 
 async function withCoordContext<T>(
@@ -64,7 +68,7 @@ export const coordReadyCommand = defineCommand({
     queue: { type: "string", description: "Named queue" },
   },
   async run({ args }) {
-    const parsed = args as CoordArgs;
+    const parsed = coordArgs(args);
     await withCoordContext(parsed, async (context) => {
       const limit = parseLimitOption(parsed.limit);
       context.output.write(
@@ -111,7 +115,7 @@ export const coordClaimCommand = defineCommand({
     backer: { type: "string", description: "Restrict --next to a backer" },
   },
   async run({ args }) {
-    const parsed = args as CoordArgs;
+    const parsed = coordArgs(args);
     await withCoordContext(parsed, async (context) => {
       const parent =
         context.actor.parent === null ? undefined : context.actor.parent;
@@ -171,7 +175,7 @@ export const coordRenewCommand = defineCommand({
     lease: { type: "string", description: "Lease duration override" },
   },
   async run({ args }) {
-    const parsed = args as CoordArgs;
+    const parsed = coordArgs(args);
     await withCoordContext(parsed, async (context) => {
       if (parsed.id === undefined) {
         context.output.write(
@@ -180,6 +184,7 @@ export const coordRenewCommand = defineCommand({
             context.board,
             context.actor.id,
             context.config,
+            parsed.lease !== undefined ? { lease: parsed.lease } : {},
           ),
         );
         return;
@@ -207,7 +212,7 @@ export const coordReleaseCommand = defineCommand({
     all: { type: "boolean", description: "Release every claim you hold" },
   },
   async run({ args }) {
-    const parsed = args as CoordArgs;
+    const parsed = coordArgs(args);
     await withCoordContext(parsed, async (context) => {
       if (parsed.all) {
         context.output.write(
@@ -248,7 +253,7 @@ export const coordAssignCommand = defineCommand({
     target: { type: "positional", description: "Actor to assign" },
   },
   async run({ args }) {
-    const parsed = args as CoordArgs;
+    const parsed = coordArgs(args);
     await withCoordContext(parsed, async (context) => {
       if (parsed.id === undefined || parsed.target === undefined) {
         throw new core.CanKanError(
@@ -256,19 +261,15 @@ export const coordAssignCommand = defineCommand({
           "assign requires an id and a target actor",
         );
       }
-      const stored = await context.core.store.get(parsed.id);
-      if (stored === undefined) {
-        throw new core.CanKanError(
-          core.ErrorCodes.USAGE,
-          `no ticket found matching "${parsed.id}"`,
-        );
-      }
-      const [assignee] = resolveAssignActors([parsed.target]);
-      const updated = core.ticket.setSequenceField(stored.ticket, "assignee", [
-        assignee,
-      ]);
-      const written = await context.core.store.write(updated);
-      context.output.write({ id: written.id, assignee: [assignee] });
+      context.output.write(
+        await assignTicket(
+          context.core,
+          context.board,
+          context.config,
+          parsed.id,
+          parsed.target,
+        ),
+      );
     });
   },
 });
@@ -277,7 +278,7 @@ export const coordMineCommand = defineCommand({
   meta: { name: "mine", description: "My claims and assignments" },
   args: { ...globalArgs },
   async run({ args }) {
-    const parsed = args as CoordArgs;
+    const parsed = coordArgs(args);
     await withCoordContext(parsed, async (context) => {
       context.output.write(
         await mine(
@@ -301,7 +302,7 @@ export const coordActorsCommand = defineCommand({
     },
   },
   async run({ args }) {
-    const parsed = args as CoordArgs;
+    const parsed = coordArgs(args);
     await withCoordContext(parsed, async (context) => {
       if (parsed.active !== undefined) {
         context.output.write(
@@ -334,7 +335,7 @@ export const coordExpireCommand = defineCommand({
     },
   },
   async run({ args }) {
-    const parsed = args as CoordArgs;
+    const parsed = coordArgs(args);
     await withCoordContext(parsed, async (context) => {
       context.output.write(
         await runExpireSweep(context.board, context.actor.id, {
@@ -342,20 +343,5 @@ export const coordExpireCommand = defineCommand({
         }),
       );
     });
-  },
-});
-
-export const coordCommand = defineCommand({
-  meta: { name: "coord", description: "Coordination commands" },
-  args: globalArgs,
-  subCommands: {
-    ready: coordReadyCommand,
-    claim: coordClaimCommand,
-    renew: coordRenewCommand,
-    release: coordReleaseCommand,
-    assign: coordAssignCommand,
-    mine: coordMineCommand,
-    actors: coordActorsCommand,
-    expire: coordExpireCommand,
   },
 });

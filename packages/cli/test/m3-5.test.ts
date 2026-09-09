@@ -10,23 +10,10 @@ import {
   resolveAssignActors,
   runExpireSweep,
 } from "../src/commands/coord";
-import { buildContext } from "../src/context";
-import { initRepo } from "../src/commands/init";
+import { makeContext } from "./helpers";
 import { writeFixtureTickets } from "../../test-utils/src/fixtureTickets";
 import { makeTempRepo } from "../../test-utils/src/tempRepo";
 import { withEnv } from "../../test-utils/src/withEnv";
-
-async function makeContext(
-  repoDir: string,
-): Promise<ReturnType<typeof buildContext>> {
-  await initRepo({
-    cwd: repoDir,
-    noWizard: true,
-    noBackers: true,
-    env: process.env,
-  });
-  return buildContext({ cwd: repoDir, json: true });
-}
 
 test("M3.5 assign is a formatting-preserving frontmatter hint, not a lease", async () => {
   const repo = await makeTempRepo();

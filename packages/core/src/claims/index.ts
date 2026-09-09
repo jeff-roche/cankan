@@ -27,3 +27,4 @@ export type {
 export { ClaimErrorCodes } from "./errors";
 
 export { parseDurationMs } from "./duration";
+export { computeTrailingMonths } from "./claim";

@@ -12,7 +12,11 @@ import {
 import type { Document } from "yaml";
 import { CanKanError, ErrorCodes } from "../errors";
 import { TicketErrorCodes } from "./errors";
-import { type CankanBlock, type TicketFrontmatter, ticketFrontmatterSchema } from "./schema";
+import {
+  type CankanBlock,
+  type TicketFrontmatter,
+  ticketFrontmatterSchema,
+} from "./schema";
 
 /**
  * Parsing and serializing ticket frontmatter — the bar is **byte-identical
@@ -81,7 +85,9 @@ import { type CankanBlock, type TicketFrontmatter, ticketFrontmatterSchema } fro
  * means `FRONTMATTER_MALFORMED`.
  */
 
-type GrayMatterEngines = NonNullable<NonNullable<Parameters<typeof matter>[1]>["engines"]>;
+type GrayMatterEngines = NonNullable<
+  NonNullable<Parameters<typeof matter>[1]>["engines"]
+>;
 
 // `undefined` is what actually disables the built-in engine — gray-matter's
 // `defaults.js` does `Object.assign({}, builtins, opts.engines)`, so an own
@@ -91,7 +97,9 @@ type GrayMatterEngines = NonNullable<NonNullable<Parameters<typeof matter>[1]>["
 // gray-matter's own `.d.ts` does not model an `undefined` engine value, so
 // this cast is narrowly scoped to match that actual runtime behavior, not
 // to bypass the type system generally.
-const MITIGATED_ENGINES = { javascript: undefined } as unknown as GrayMatterEngines;
+const MITIGATED_ENGINES = {
+  javascript: undefined,
+} as unknown as GrayMatterEngines;
 
 /**
  * The one place `gray-matter`'s `matter()` is invoked, so the `javascript`
@@ -153,7 +161,10 @@ const CLOSING_DELIMITER_RE = /\r?\n---(?:\r?\n|$)/;
  * silently swallows the rest of the file as frontmatter with no error), so
  * this function is the actual structural validator.
  */
-function splitTicketFile(raw: string, path: string | undefined): TicketFileSplit {
+function splitTicketFile(
+  raw: string,
+  path: string | undefined,
+): TicketFileSplit {
   const openMatch = OPENING_DELIMITER_RE.exec(raw);
   if (!openMatch) {
     throw new CanKanError(
@@ -211,7 +222,10 @@ function formatYamlErrorMessage(
   path: string | undefined,
   linePos: { line: number; col: number } | undefined,
 ): string {
-  const location = [path, linePos ? `line ${linePos.line}, column ${linePos.col}` : undefined]
+  const location = [
+    path,
+    linePos ? `line ${linePos.line}, column ${linePos.col}` : undefined,
+  ]
     .filter((part): part is string => part !== undefined)
     .join(", ");
   return location
@@ -252,7 +266,10 @@ function containsAlias(doc: Document): boolean {
 // byte-identically, not reject it.
 const MAX_FRONTMATTER_LENGTH = 64 * 1024;
 
-function parseFrontmatterData(frontmatterText: string, path: string | undefined) {
+function parseFrontmatterData(
+  frontmatterText: string,
+  path: string | undefined,
+) {
   if (frontmatterText.length > MAX_FRONTMATTER_LENGTH) {
     throw new CanKanError(
       TicketErrorCodes.FRONTMATTER_TOO_LARGE,
@@ -316,7 +333,10 @@ function parseFrontmatterData(frontmatterText: string, path: string | undefined)
   return { doc, data };
 }
 
-function validateFrontmatter(data: unknown, path: string | undefined): TicketFrontmatter {
+function validateFrontmatter(
+  data: unknown,
+  path: string | undefined,
+): TicketFrontmatter {
   const result = ticketFrontmatterSchema.safeParse(data);
   if (!result.success) {
     // zod never echoes input values in its issue messages, so these are
@@ -365,7 +385,9 @@ export function parseTicketFile(raw: string, path?: string): ParsedTicket {
   if (raw.length > MAX_RAW_LENGTH) {
     throw new CanKanError(
       TicketErrorCodes.FRONTMATTER_TOO_LARGE,
-      path ? `Ticket file at ${path} exceeds ${MAX_RAW_LENGTH} characters` : `Ticket file exceeds ${MAX_RAW_LENGTH} characters`,
+      path
+        ? `Ticket file at ${path} exceeds ${MAX_RAW_LENGTH} characters`
+        : `Ticket file exceeds ${MAX_RAW_LENGTH} characters`,
     );
   }
   callMatter(raw, path);
@@ -390,7 +412,10 @@ function requireSplit(ticket: ParsedTicket): TicketFileSplit {
     // guards against a hand-built object smuggled past the type system. A
     // caller error, not malformed frontmatter, so it raises the shared
     // `USAGE` code rather than a `ticket/`-local one.
-    throw new CanKanError(ErrorCodes.USAGE, "Not a ticket parsed by parseTicketFile");
+    throw new CanKanError(
+      ErrorCodes.USAGE,
+      "Not a ticket parsed by parseTicketFile",
+    );
   }
   return ticket.split;
 }
@@ -458,14 +483,20 @@ export function setScalarField(
     // but the brief has MCP supplying field names later, and this is
     // exactly the "report which rule failed, not the value" pattern
     // `filename.ts`'s `assertSafeId` already follows for the same reason.
-    throw new CanKanError(ErrorCodes.USAGE, "Field name is not a valid single-line YAML key", {
-      details: { reason: "not a valid single-line YAML key" },
-    });
+    throw new CanKanError(
+      ErrorCodes.USAGE,
+      "Field name is not a valid single-line YAML key",
+      {
+        details: { reason: "not a valid single-line YAML key" },
+      },
+    );
   }
 
   const split = requireSplit(ticket);
   const { map } = findTopLevelPair(split.frontmatterText);
-  const pair = map?.items.find((item) => isScalar(item.key) && item.key.value === key);
+  const pair = map?.items.find(
+    (item) => isScalar(item.key) && item.key.value === key,
+  );
 
   if (pair?.value && !isScalar(pair.value)) {
     throw new CanKanError(
@@ -499,7 +530,9 @@ export function setScalarField(
       start === end && charBeforeValue !== " " && charBeforeValue !== "\t";
     const replacement = needsLeadingSpace ? ` ${newValueText}` : newValueText;
     newFrontmatterText =
-      split.frontmatterText.slice(0, start) + replacement + split.frontmatterText.slice(end);
+      split.frontmatterText.slice(0, start) +
+      replacement +
+      split.frontmatterText.slice(end);
   } else {
     newFrontmatterText = `${split.frontmatterText}${key}: ${newValueText}${newline}`;
   }
@@ -536,7 +569,9 @@ export function setSequenceField(
 
   const split = requireSplit(ticket);
   const { map } = findTopLevelPair(split.frontmatterText);
-  const pair = map?.items.find((item) => isScalar(item.key) && item.key.value === key);
+  const pair = map?.items.find(
+    (item) => isScalar(item.key) && item.key.value === key,
+  );
 
   if (pair?.value && !isSeq(pair.value)) {
     throw new CanKanError(
@@ -545,15 +580,24 @@ export function setSequenceField(
       { details: { reason: "field is not a sequence" } },
     );
   }
+  if (pair?.value && isSeq(pair.value) && !isRangedNode(pair.value)) {
+    throw new CanKanError(
+      ErrorCodes.USAGE,
+      "Field sequence has no source range; refusing to append a duplicate field",
+      { details: { reason: "field sequence has no source range" } },
+    );
+  }
 
   const flow = `[${values.map(flowScalarText).join(", ")}]`;
   const newline = detectNewline(split);
 
   let newFrontmatterText: string;
-  if (pair?.value && isRangedNode(pair.value)) {
+  if (pair?.value && isSeq(pair.value) && isRangedNode(pair.value)) {
     const [start, end] = pair.value.range;
     newFrontmatterText =
-      split.frontmatterText.slice(0, start) + flow + split.frontmatterText.slice(end);
+      split.frontmatterText.slice(0, start) +
+      flow +
+      split.frontmatterText.slice(end);
   } else {
     newFrontmatterText = `${split.frontmatterText}${key}: ${flow}${newline}`;
   }
@@ -601,7 +645,9 @@ export function setCankanBlock(
 ): ParsedTicket {
   const split = requireSplit(ticket);
   const { map } = findTopLevelPair(split.frontmatterText);
-  const pair = map?.items.find((item) => isScalar(item.key) && item.key.value === "cankan");
+  const pair = map?.items.find(
+    (item) => isScalar(item.key) && item.key.value === "cankan",
+  );
   const newline = detectNewline(split);
 
   const replacementText =
@@ -610,7 +656,12 @@ export function setCankanBlock(
       : `cankan:${newline}${indentBlock(stringify(block, { lineWidth: 0 }), newline)}${newline}`;
 
   let newFrontmatterText: string;
-  if (pair && isRangedNode(pair.key) && pair.value && isRangedNode(pair.value)) {
+  if (
+    pair &&
+    isRangedNode(pair.key) &&
+    pair.value &&
+    isRangedNode(pair.value)
+  ) {
     const start = pair.key.range[0];
     // `range[2]` (valueEnd) rather than `range[1]` (end): it chains through
     // to the next sibling key's start (or end of the frontmatter text if
@@ -619,7 +670,9 @@ export function setCankanBlock(
     // at `range[1]` to leave the trailing newline untouched.
     const end = pair.value.range[2];
     newFrontmatterText =
-      split.frontmatterText.slice(0, start) + replacementText + split.frontmatterText.slice(end);
+      split.frontmatterText.slice(0, start) +
+      replacementText +
+      split.frontmatterText.slice(end);
   } else if (block === undefined) {
     // No `cankan:` block present and asked to remove it: nothing to do.
     newFrontmatterText = split.frontmatterText;
@@ -630,7 +683,9 @@ export function setCankanBlock(
   return reparseWithFrontmatter(ticket, split, newFrontmatterText);
 }
 
-function isRangedNode(node: ParsedNode | Scalar): node is (ParsedNode | Scalar) & { range: [number, number, number] } {
+function isRangedNode(
+  node: ParsedNode | Scalar,
+): node is (ParsedNode | Scalar) & { range: [number, number, number] } {
   return Array.isArray((node as { range?: unknown }).range);
 }
 

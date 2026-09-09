@@ -14,22 +14,11 @@ import {
 import { getCommandSpec } from "../src/registry";
 import { buildContext } from "../src/context";
 import { initRepo } from "../src/commands/init";
+import { makeContext } from "./helpers";
 import { setConfigValue } from "../src/commands/config";
 import { writeFixtureTickets } from "../../test-utils/src/fixtureTickets";
 import { makeTempRepo } from "../../test-utils/src/tempRepo";
 import { withEnv } from "../../test-utils/src/withEnv";
-
-async function makeContext(
-  repoDir: string,
-): Promise<ReturnType<typeof buildContext>> {
-  await initRepo({
-    cwd: repoDir,
-    noWizard: true,
-    noBackers: true,
-    env: process.env,
-  });
-  return buildContext({ cwd: repoDir, json: true });
-}
 
 test("M3.5 explicit claim enforces require_ready (default blocks, false allows)", async () => {
   const repo = await makeTempRepo();
@@ -403,6 +392,105 @@ test("M3.5 actors --active groups by event parent, falling back to actor-derived
           { parent: "alice", tickets: ["ck-a"] },
           { parent: "codex:bob", tickets: ["ck-b"] },
         ]);
+      } finally {
+        context.core.dispose();
+      }
+    });
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("M3.5 claimNext honors a named queue's filter and order", async () => {
+  const repo = await makeTempRepo();
+  try {
+    await withEnv(undefined, async () => {
+      await mkdir(join(repo.dir, "backlog", "tasks"), { recursive: true });
+      await writeFixtureTickets(join(repo.dir, "backlog", "tasks"), [
+        { id: "ck-a", title: "A", status: "To Do", body: "A" },
+        { id: "ck-b", title: "B", status: "To Do", body: "B" },
+      ]);
+      await initRepo({
+        cwd: repo.dir,
+        noWizard: true,
+        noBackers: true,
+        env: process.env,
+      });
+      await setConfigValue({
+        repoRoot: repo.dir,
+        key: "queues.focus",
+        rawValue: "{filter: {labels: [urgent]}, order: [title:desc]}",
+        target: "repo",
+        env: process.env,
+      });
+      const context = await buildContext({ cwd: repo.dir, json: true });
+      try {
+        const first = await context.core.store.get("ck-a");
+        const second = await context.core.store.get("ck-b");
+        if (first === undefined || second === undefined) {
+          throw new Error("fixture ticket missing");
+        }
+        await context.core.store.write(
+          core.ticket.setSequenceField(first.ticket, "labels", ["urgent"]),
+        );
+        await context.core.store.write(
+          core.ticket.setSequenceField(second.ticket, "labels", ["urgent"]),
+        );
+
+        const result = await claimNext(
+          context.core,
+          context.board,
+          context.actor.id,
+          context.config,
+          { queue: "focus" },
+        );
+        expect(result?.ticket).toBe("ck-b");
+      } finally {
+        context.core.dispose();
+      }
+    });
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("M3.5 actors active duration filters old live leases", async () => {
+  const repo = await makeTempRepo();
+  try {
+    await withEnv(undefined, async () => {
+      await mkdir(join(repo.dir, "backlog", "tasks"), { recursive: true });
+      await writeFixtureTickets(join(repo.dir, "backlog", "tasks"), [
+        { id: "ck-a", title: "A", status: "To Do", body: "A" },
+      ]);
+      await initRepo({
+        cwd: repo.dir,
+        noWizard: true,
+        noBackers: true,
+        env: process.env,
+      });
+      await setConfigValue({
+        repoRoot: repo.dir,
+        key: "claims.lease",
+        rawValue: "4h",
+        target: "repo",
+        env: process.env,
+      });
+      const context = await buildContext({ cwd: repo.dir, json: true });
+      try {
+        const claimedAt = Date.now() - 2 * 60 * 60 * 1000;
+        await core.claims.claim({
+          board: context.board,
+          ticket: "ck-a",
+          actor: context.actor.id,
+          now: claimedAt,
+        });
+
+        expect(
+          await activeActors(context.core, context.board, context.config, "1h"),
+        ).toEqual([]);
+        expect(
+          await activeActors(context.core, context.board, context.config, "3h"),
+        ).toEqual([{ parent: context.actor.id, tickets: ["ck-a"] }]);
       } finally {
         context.core.dispose();
       }

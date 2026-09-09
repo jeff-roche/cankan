@@ -36,16 +36,17 @@ export {
   coordReadyCommand,
   coordReleaseCommand,
   coordRenewCommand,
+  listActors,
   mine,
   parseLimitOption,
   releaseAll,
   renewAll,
   resolveAssignActors,
   runExpireSweep,
-  serializeAssignees,
 } from "./commands/coord";
 export type {
   ActiveActorGroup,
+  ActorGroup,
   ClaimExplicitOptions,
   ClaimNextOptions,
   CoordListOptions,

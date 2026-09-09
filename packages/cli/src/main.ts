@@ -7,6 +7,16 @@ import {
 } from "./context";
 import { configCommand } from "./commands/config";
 import { initCommand } from "./commands/init";
+import {
+  coordActorsCommand,
+  coordAssignCommand,
+  coordClaimCommand,
+  coordExpireCommand,
+  coordMineCommand,
+  coordReadyCommand,
+  coordReleaseCommand,
+  coordRenewCommand,
+} from "./commands/coord";
 import { defineCommand } from "./registry";
 
 export { globalArgs } from "./context";
@@ -27,7 +37,19 @@ export const noopCommand = defineCommand({
 export const rootCommand = defineCommand({
   meta: { name: "cankan", description: "Coordinate work across boards" },
   args: globalArgs,
-  subCommands: { config: configCommand, init: initCommand, noop: noopCommand },
+  subCommands: {
+    config: configCommand,
+    init: initCommand,
+    noop: noopCommand,
+    ready: coordReadyCommand,
+    claim: coordClaimCommand,
+    renew: coordRenewCommand,
+    release: coordReleaseCommand,
+    assign: coordAssignCommand,
+    mine: coordMineCommand,
+    actors: coordActorsCommand,
+    expire: coordExpireCommand,
+  },
   default: "noop",
 });
 

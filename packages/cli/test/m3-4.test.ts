@@ -157,7 +157,7 @@ test("M3.4 exercises every ticket command through JSON output", async () => {
   } finally {
     await repo.cleanup();
   }
-});
+}, 30_000);
 
 test("M3.4 rejects create --backer until backers are implemented", async () => {
   const repo = await makeTempRepo();

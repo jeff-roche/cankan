@@ -2,7 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { isCanKanError } from "../../src/errors";
 import { firstSeen } from "../../src/events/index";
 import type { EventId, EventRecord } from "../../src/events/index";
-import { foldState, observeAndFold, resolveAliasTargetForTesting, resolveAllAliasTargets } from "../../src/state/fold";
+import {
+  foldState,
+  observeAndFold,
+  resolveAliasTargetForTesting,
+  resolveAllAliasTargets,
+} from "../../src/state/fold";
 import { StateErrorCodes } from "../../src/state/errors";
 // `@jeff-roche/cankan-test-utils` is not a declared dependency of
 // `packages/core/package.json` — a relative import to the source file is
@@ -21,7 +26,11 @@ import { fixedEventId, fixtureEvent, makeStoredTicket } from "./testHelpers";
 describe("foldState — status precedence (Ruling R6)", () => {
   test("no events: resolved status is the frontmatter status", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
-    const state = foldState([ticket], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const state = foldState([ticket], [], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets).toHaveLength(1);
     expect(state.tickets[0]).toMatchObject({
@@ -40,8 +49,16 @@ describe("foldState — status precedence (Ruling R6)", () => {
 
   test("a move event overrides the frontmatter status", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
-    const move = fixtureEvent({ event: "move", ticket: "ck-1", from: "To Do", to: "In Progress" }, "2026-01", 0);
-    const state = foldState([ticket], [move], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const move = fixtureEvent(
+      { event: "move", ticket: "ck-1", from: "To Do", to: "In Progress" },
+      "2026-01",
+      0,
+    );
+    const state = foldState([ticket], [move], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.statusFromFrontmatter).toBe("To Do");
     expect(state.tickets[0]?.statusFromEvents).toBe("In Progress");
@@ -54,7 +71,12 @@ describe("foldState — status precedence (Ruling R6)", () => {
     // claim never touches status, and status never touches claim/lease.
     const ticket = makeStoredTicket("ck-1", "Done");
     const claim = fixtureEvent(
-      { event: "claim", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      {
+        event: "claim",
+        ticket: "ck-1",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(1),
+      },
       "2026-01",
       0,
     );
@@ -67,14 +89,28 @@ describe("foldState — status precedence (Ruling R6)", () => {
     expect(state.tickets[0]?.status).toBe("Done");
     expect(state.tickets[0]?.statusFromFrontmatter).toBe("Done");
     expect(state.tickets[0]?.lease?.expired).toBe(false);
-    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe("claude-code:alice/wt-auth");
+    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe(
+      "claude-code:alice/wt-auth",
+    );
   });
 
   test("an external-write AFTER a move resets the base: the move no longer wins", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
-    const move = fixtureEvent({ event: "move", ticket: "ck-1", from: "To Do", to: "In Progress" }, "2026-01", 0);
-    const externalWrite = fixtureEvent({ event: "external-write", ticket: "ck-1" }, "2026-01", 1);
-    const state = foldState([ticket], [move, externalWrite], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const move = fixtureEvent(
+      { event: "move", ticket: "ck-1", from: "To Do", to: "In Progress" },
+      "2026-01",
+      0,
+    );
+    const externalWrite = fixtureEvent(
+      { event: "external-write", ticket: "ck-1" },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [move, externalWrite], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.statusFromEvents).toBeUndefined();
     expect(state.tickets[0]?.status).toBe("To Do");
@@ -82,9 +118,21 @@ describe("foldState — status precedence (Ruling R6)", () => {
 
   test("an external-write BEFORE a move: the move (being newer) still wins", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
-    const externalWrite = fixtureEvent({ event: "external-write", ticket: "ck-1" }, "2026-01", 0);
-    const move = fixtureEvent({ event: "move", ticket: "ck-1", from: "To Do", to: "Done" }, "2026-01", 1);
-    const state = foldState([ticket], [externalWrite, move], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const externalWrite = fixtureEvent(
+      { event: "external-write", ticket: "ck-1" },
+      "2026-01",
+      0,
+    );
+    const move = fixtureEvent(
+      { event: "move", ticket: "ck-1", from: "To Do", to: "Done" },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [externalWrite, move], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.statusFromEvents).toBe("Done");
     expect(state.tickets[0]?.status).toBe("Done");
@@ -92,10 +140,22 @@ describe("foldState — status precedence (Ruling R6)", () => {
 
   test("events supplied out of (month,line) order still fold correctly — array index is not chain position", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
-    const moveA = fixtureEvent({ event: "move", ticket: "ck-1", from: "To Do", to: "First" }, "2026-01", 0);
-    const moveB = fixtureEvent({ event: "move", ticket: "ck-1", from: "First", to: "Second" }, "2026-01", 1);
+    const moveA = fixtureEvent(
+      { event: "move", ticket: "ck-1", from: "To Do", to: "First" },
+      "2026-01",
+      0,
+    );
+    const moveB = fixtureEvent(
+      { event: "move", ticket: "ck-1", from: "First", to: "Second" },
+      "2026-01",
+      1,
+    );
     // moveB (line 1, chain-later) passed BEFORE moveA (line 0) in the array.
-    const state = foldState([ticket], [moveB, moveA], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const state = foldState([ticket], [moveB, moveA], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.status).toBe("Second");
   });
@@ -104,8 +164,16 @@ describe("foldState — status precedence (Ruling R6)", () => {
 describe("foldState — close (Ruling R14)", () => {
   test("a close event sets closed+closeReason and leaves status untouched", () => {
     const ticket = makeStoredTicket("ck-1", "In Progress");
-    const close = fixtureEvent({ event: "close", ticket: "ck-1", reason: "duplicate" }, "2026-01", 0);
-    const state = foldState([ticket], [close], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const close = fixtureEvent(
+      { event: "close", ticket: "ck-1", reason: "duplicate" },
+      "2026-01",
+      0,
+    );
+    const state = foldState([ticket], [close], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.status).toBe("In Progress");
     expect(state.tickets[0]?.closed).toBe(true);
@@ -114,9 +182,21 @@ describe("foldState — close (Ruling R14)", () => {
 
   test("closed is sticky across a later move — CONCEPT.md:529's close-moves-to-last-column is that move's own side effect, not a reopen", () => {
     const ticket = makeStoredTicket("ck-1", "In Progress");
-    const close = fixtureEvent({ event: "close", ticket: "ck-1", reason: "wontfix" }, "2026-01", 0);
-    const move = fixtureEvent({ event: "move", ticket: "ck-1", from: "In Progress", to: "Done" }, "2026-01", 1);
-    const state = foldState([ticket], [close, move], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const close = fixtureEvent(
+      { event: "close", ticket: "ck-1", reason: "wontfix" },
+      "2026-01",
+      0,
+    );
+    const move = fixtureEvent(
+      { event: "move", ticket: "ck-1", from: "In Progress", to: "Done" },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [close, move], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.closed).toBe(true);
     expect(state.tickets[0]?.closeReason).toBe("wontfix");
@@ -125,11 +205,67 @@ describe("foldState — close (Ruling R14)", () => {
 
   test("the most recent of multiple close events supplies closeReason", () => {
     const ticket = makeStoredTicket("ck-1", "In Progress");
-    const first = fixtureEvent({ event: "close", ticket: "ck-1", reason: "first" }, "2026-01", 0);
-    const second = fixtureEvent({ event: "close", ticket: "ck-1", reason: "second" }, "2026-01", 1);
-    const state = foldState([ticket], [first, second], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const first = fixtureEvent(
+      { event: "close", ticket: "ck-1", reason: "first" },
+      "2026-01",
+      0,
+    );
+    const second = fixtureEvent(
+      { event: "close", ticket: "ck-1", reason: "second" },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [first, second], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.closeReason).toBe("second");
+  });
+
+  test("a reopen after close clears the closed lifecycle state by chain position", () => {
+    const ticket = makeStoredTicket("ck-1", "In Progress");
+    const close = fixtureEvent(
+      { event: "close", ticket: "ck-1", reason: "temporary" },
+      "2026-01",
+      0,
+    );
+    const reopen = fixtureEvent(
+      { event: "reopen", ticket: "ck-1" },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [reopen, close], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
+
+    expect(state.tickets[0]?.closed).toBe(false);
+    expect(state.tickets[0]?.closeReason).toBeUndefined();
+  });
+
+  test("a close after reopen remains closed", () => {
+    const ticket = makeStoredTicket("ck-1", "In Progress");
+    const reopen = fixtureEvent(
+      { event: "reopen", ticket: "ck-1" },
+      "2026-01",
+      0,
+    );
+    const close = fixtureEvent(
+      { event: "close", ticket: "ck-1", reason: "done" },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [reopen, close], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
+
+    expect(state.tickets[0]?.closed).toBe(true);
+    expect(state.tickets[0]?.closeReason).toBe("done");
   });
 });
 
@@ -137,7 +273,12 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
   test("THE key test: lease_until far in the future is ignored — firstSeen decides expiry, not the event's own display value", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
     const claim = fixtureEvent(
-      { event: "claim", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      {
+        event: "claim",
+        ticket: "ck-1",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(1),
+      },
       "2026-01",
       0,
     );
@@ -150,7 +291,9 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
       firstSeen: new Map([[claim.event.id, 0]]),
     });
 
-    expect(state.tickets[0]?.lease?.leaseUntilDisplay).toBe("2099-01-01T00:00:00Z");
+    expect(state.tickets[0]?.lease?.leaseUntilDisplay).toBe(
+      "2099-01-01T00:00:00Z",
+    );
     expect(state.tickets[0]?.lease?.expired).toBe(true);
     expect(state.tickets[0]?.lease?.expiresAtMs).toBe(1_000);
   });
@@ -158,12 +301,22 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
   test("a renew genuinely extends the lease: anchored on the renew's own firstSeen, not the original claim's", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
     const claim = fixtureEvent(
-      { event: "claim", ticket: "ck-1", lease_until: "2026-01-01T02:00:00Z", id: fixedEventId(1) },
+      {
+        event: "claim",
+        ticket: "ck-1",
+        lease_until: "2026-01-01T02:00:00Z",
+        id: fixedEventId(1),
+      },
       "2026-01",
       0,
     );
     const renew = fixtureEvent(
-      { event: "renew", ticket: "ck-1", lease_until: "2026-01-01T04:00:00Z", id: fixedEventId(2) },
+      {
+        event: "renew",
+        ticket: "ck-1",
+        lease_until: "2026-01-01T04:00:00Z",
+        id: fixedEventId(2),
+      },
       "2026-01",
       1,
     );
@@ -185,14 +338,23 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
   test("a missing firstSeen entry surfaces as expired-or-unknown, never as 'not expired'", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
     const claim = fixtureEvent(
-      { event: "claim", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      {
+        event: "claim",
+        ticket: "ck-1",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(1),
+      },
       "2026-01",
       0,
     );
     // No entry for claim.event.id in firstSeen at all — this reader never
     // observed it (e.g. it appeared in a `read()` window this reader
     // skipped observing for).
-    const state = foldState([ticket], [claim], { now: 0, leaseTtlMs: 1_000_000, firstSeen: new Map() });
+    const state = foldState([ticket], [claim], {
+      now: 0,
+      leaseTtlMs: 1_000_000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.lease?.firstSeenMs).toBeUndefined();
     expect(state.tickets[0]?.lease?.expiresAtMs).toBeUndefined();
@@ -202,27 +364,49 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
   test("expiry boundary is inclusive: now === expiresAtMs counts as expired", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
     const claim = fixtureEvent(
-      { event: "claim", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      {
+        event: "claim",
+        ticket: "ck-1",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(1),
+      },
       "2026-01",
       0,
     );
     const firstSeen = new Map([[claim.event.id, 1_000]]);
 
-    const atBoundary = foldState([ticket], [claim], { now: 1_500, leaseTtlMs: 500, firstSeen });
+    const atBoundary = foldState([ticket], [claim], {
+      now: 1_500,
+      leaseTtlMs: 500,
+      firstSeen,
+    });
     expect(atBoundary.tickets[0]?.lease?.expired).toBe(true);
 
-    const justBefore = foldState([ticket], [claim], { now: 1_499, leaseTtlMs: 500, firstSeen });
+    const justBefore = foldState([ticket], [claim], {
+      now: 1_499,
+      leaseTtlMs: 500,
+      firstSeen,
+    });
     expect(justBefore.tickets[0]?.lease?.expired).toBe(false);
   });
 
   test("release ends a lease outright, regardless of expiry", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
     const claim = fixtureEvent(
-      { event: "claim", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      {
+        event: "claim",
+        ticket: "ck-1",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(1),
+      },
       "2026-01",
       0,
     );
-    const release = fixtureEvent({ event: "release", ticket: "ck-1" }, "2026-01", 1);
+    const release = fixtureEvent(
+      { event: "release", ticket: "ck-1" },
+      "2026-01",
+      1,
+    );
     const state = foldState([ticket], [claim, release], {
       now: 0,
       leaseTtlMs: 1_000_000,
@@ -235,11 +419,20 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
   test("expire ends a lease outright", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
     const claim = fixtureEvent(
-      { event: "claim", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      {
+        event: "claim",
+        ticket: "ck-1",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(1),
+      },
       "2026-01",
       0,
     );
-    const expireEvent = fixtureEvent({ event: "expire", ticket: "ck-1" }, "2026-01", 1);
+    const expireEvent = fixtureEvent(
+      { event: "expire", ticket: "ck-1" },
+      "2026-01",
+      1,
+    );
     const state = foldState([ticket], [claim, expireEvent], {
       now: 0,
       leaseTtlMs: 1_000_000,
@@ -252,11 +445,20 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
   test("close ends a lease outright (CONCEPT.md:529: close releases the claim)", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
     const claim = fixtureEvent(
-      { event: "claim", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      {
+        event: "claim",
+        ticket: "ck-1",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(1),
+      },
       "2026-01",
       0,
     );
-    const close = fixtureEvent({ event: "close", ticket: "ck-1" }, "2026-01", 1);
+    const close = fixtureEvent(
+      { event: "close", ticket: "ck-1" },
+      "2026-01",
+      1,
+    );
     const state = foldState([ticket], [claim, close], {
       now: 0,
       leaseTtlMs: 1_000_000,
@@ -287,7 +489,9 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
     });
 
     expect(state.tickets[0]?.lease?.kind).toBe("takeover");
-    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe("claude-code:bob/wt-x");
+    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe(
+      "claude-code:bob/wt-x",
+    );
     expect(state.tickets[0]?.lease?.expired).toBe(false);
   });
 
@@ -301,7 +505,12 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
     // security review) — the wrong direction to fail for a mutex.
     const ticket = makeStoredTicket("ck-1", "To Do");
     const renew = fixtureEvent(
-      { event: "renew", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      {
+        event: "renew",
+        ticket: "ck-1",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(1),
+      },
       "2026-01",
       0,
     );
@@ -324,7 +533,12 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
     // lose their own claim to a second actor purely from window truncation.
     const ticket = makeStoredTicket("ck-1", "To Do");
     const renewInWindow = fixtureEvent(
-      { event: "renew", ticket: "ck-1", actor: "claude-code:alice/wt-a", lease_until: "2099-01-01T00:00:00Z" },
+      {
+        event: "renew",
+        ticket: "ck-1",
+        actor: "claude-code:alice/wt-a",
+        lease_until: "2099-01-01T00:00:00Z",
+      },
       "2026-01",
       0,
     );
@@ -334,20 +548,36 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
       firstSeen: new Map([[renewInWindow.event.id, 0]]),
     });
 
-    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe("claude-code:alice/wt-a");
+    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe(
+      "claude-code:alice/wt-a",
+    );
     expect(state.tickets[0]?.lease?.expired).toBe(false);
   });
 
   test("M1: a renew after the incumbent has already ended (release) also mints nothing", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
     const claim = fixtureEvent(
-      { event: "claim", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(1) },
+      {
+        event: "claim",
+        ticket: "ck-1",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(1),
+      },
       "2026-01",
       0,
     );
-    const release = fixtureEvent({ event: "release", ticket: "ck-1" }, "2026-01", 1);
+    const release = fixtureEvent(
+      { event: "release", ticket: "ck-1" },
+      "2026-01",
+      1,
+    );
     const dangling = fixtureEvent(
-      { event: "renew", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z", id: fixedEventId(2) },
+      {
+        event: "renew",
+        ticket: "ck-1",
+        lease_until: "2099-01-01T00:00:00Z",
+        id: fixedEventId(2),
+      },
       "2026-01",
       2,
     );
@@ -401,7 +631,9 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
     // all — it neither extended the lease nor reassigned it.
     expect(state.tickets[0]?.lease?.eventId).toBe(claim.event.id);
     expect(state.tickets[0]?.lease?.kind).toBe("claim");
-    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe("claude-code:alice/wt-a");
+    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe(
+      "claude-code:alice/wt-a",
+    );
   });
 
   test("M2: a renew from the SAME actor still genuinely extends the lease (contrast case)", () => {
@@ -483,7 +715,9 @@ describe("foldState — lease expiry (the reader's own clock, never the event's)
     });
 
     expect(state.tickets[0]?.lease?.eventId).toBe(bobClaim.event.id);
-    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe("claude-code:bob/wt-b");
+    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe(
+      "claude-code:bob/wt-b",
+    );
   });
 });
 
@@ -494,7 +728,13 @@ describe("foldState — alias resolution does not blow up quadratically (I2, sec
     for (let i = 0; i < n; i++) {
       const from = `a${i}`;
       const to = i === n - 1 ? finalId : `a${i + 1}`;
-      events.push(fixtureEvent({ event: "alias", ticket: "ck-x", from, to, id: fixedEventId(i) }, "2026-01", i));
+      events.push(
+        fixtureEvent(
+          { event: "alias", ticket: "ck-x", from, to, id: fixedEventId(i) },
+          "2026-01",
+          i,
+        ),
+      );
     }
     return events;
   }
@@ -621,25 +861,43 @@ describe("foldState — tie-break stability (Ruling R12/M2.7 contract 1): (month
       ]),
     });
 
-    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe("claude-code:bob/wt-x");
+    expect(state.tickets[0]?.lease?.actor as string | undefined).toBe(
+      "claude-code:bob/wt-x",
+    );
     expect(state.tickets[0]?.lease?.kind).toBe("takeover");
   });
 
   test("the same trap for the status walk: (month,line) order wins over id order", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
     const moveA = fixtureEvent(
-      { event: "move", ticket: "ck-1", from: "To Do", to: "A", id: fixedEventId(999) },
+      {
+        event: "move",
+        ticket: "ck-1",
+        from: "To Do",
+        to: "A",
+        id: fixedEventId(999),
+      },
       "2026-01",
       0,
     );
     const moveB = fixtureEvent(
-      { event: "move", ticket: "ck-1", from: "A", to: "B", id: fixedEventId(1) },
+      {
+        event: "move",
+        ticket: "ck-1",
+        from: "A",
+        to: "B",
+        id: fixedEventId(1),
+      },
       "2026-01",
       1,
     );
     expect(moveB.event.id < moveA.event.id).toBe(true);
 
-    const state = foldState([ticket], [moveA, moveB], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const state = foldState([ticket], [moveA, moveB], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.status).toBe("B");
   });
@@ -648,38 +906,78 @@ describe("foldState — tie-break stability (Ruling R12/M2.7 contract 1): (month
 describe("foldState — orphaned events (Ruling R15): reported, never dropped", () => {
   test("a claim on a ticket with no matching file is reported, not silently lost", () => {
     const claim = fixtureEvent(
-      { event: "claim", ticket: "ck-ghost", lease_until: "2099-01-01T00:00:00Z" },
+      {
+        event: "claim",
+        ticket: "ck-ghost",
+        lease_until: "2099-01-01T00:00:00Z",
+      },
       "2026-01",
       0,
     );
-    const state = foldState([], [claim], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const state = foldState([], [claim], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets).toHaveLength(0);
-    expect(state.orphanedEvents.map((o) => ({ ...o, ticketId: o.ticketId as string }))).toEqual([
+    expect(
+      state.orphanedEvents.map((o) => ({
+        ...o,
+        ticketId: o.ticketId as string,
+      })),
+    ).toEqual([
       {
         ticketId: "ck-ghost",
         eventCount: 1,
         cause: "no-matching-ticket",
-        reason: "no ticket file in this checkout matches this event's ticket id",
+        reason:
+          "no ticket file in this checkout matches this event's ticket id",
       },
     ]);
   });
 
   test("orphaned events are counted per distinct ticket id, case-insensitively", () => {
-    const claim = fixtureEvent({ event: "claim", ticket: "CK-GHOST", lease_until: "2099-01-01T00:00:00Z" }, "2026-01", 0);
-    const comment = fixtureEvent({ event: "comment", ticket: "ck-ghost", text: "hi" }, "2026-01", 1);
-    const state = foldState([], [claim, comment], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const claim = fixtureEvent(
+      {
+        event: "claim",
+        ticket: "CK-GHOST",
+        lease_until: "2099-01-01T00:00:00Z",
+      },
+      "2026-01",
+      0,
+    );
+    const comment = fixtureEvent(
+      { event: "comment", ticket: "ck-ghost", text: "hi" },
+      "2026-01",
+      1,
+    );
+    const state = foldState([], [claim, comment], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.orphanedEvents).toHaveLength(1);
-    expect(state.orphanedEvents[0]?.ticketId as string | undefined).toBe("ck-ghost");
+    expect(state.orphanedEvents[0]?.ticketId as string | undefined).toBe(
+      "ck-ghost",
+    );
     expect(state.orphanedEvents[0]?.eventCount).toBe(2);
     expect(state.orphanedEvents[0]?.cause).toBe("no-matching-ticket");
   });
 
   test("events for a known ticket are not counted as orphaned", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
-    const move = fixtureEvent({ event: "move", ticket: "ck-1", from: "To Do", to: "Done" }, "2026-01", 0);
-    const state = foldState([ticket], [move], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const move = fixtureEvent(
+      { event: "move", ticket: "ck-1", from: "To Do", to: "Done" },
+      "2026-01",
+      0,
+    );
+    const state = foldState([ticket], [move], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.orphanedEvents).toHaveLength(0);
   });
@@ -695,11 +993,17 @@ describe("foldState — duplicate normalized ticket ids (Ruling D1, fix round 5,
   test("two tickets sharing a normalized id are excluded from `tickets` and surfaced in `duplicateTicketIds`", () => {
     const lower = makeStoredTicket("ck-1", "To Do");
     const upper = makeStoredTicket("CK-1", "Done");
-    const state = foldState([lower, upper], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const state = foldState([lower, upper], [], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets).toHaveLength(0);
     expect(state.duplicateTicketIds).toHaveLength(1);
-    expect(state.duplicateTicketIds[0]?.ticketId as string | undefined).toBe("ck-1");
+    expect(state.duplicateTicketIds[0]?.ticketId as string | undefined).toBe(
+      "ck-1",
+    );
     expect([...(state.duplicateTicketIds[0]?.paths ?? [])].sort()).toEqual(
       [lower.path, upper.path].sort(),
     );
@@ -713,11 +1017,17 @@ describe("foldState — duplicate normalized ticket ids (Ruling D1, fix round 5,
       "2026-01",
       0,
     );
-    const state = foldState([lower, upper], [claim], { now: 0, leaseTtlMs: 1000, firstSeen: new Map([[claim.event.id, 0]]) });
+    const state = foldState([lower, upper], [claim], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map([[claim.event.id, 0]]),
+    });
 
     expect(state.tickets).toHaveLength(0);
     expect(state.orphanedEvents).toHaveLength(1);
-    expect(state.orphanedEvents[0]?.ticketId as string | undefined).toBe("ck-1");
+    expect(state.orphanedEvents[0]?.ticketId as string | undefined).toBe(
+      "ck-1",
+    );
     // Fix round 6: this must say "duplicated," not "missing" — two real
     // files declare this id, which is the opposite fact from no file at
     // all declaring it, with the opposite remedy.
@@ -729,7 +1039,11 @@ describe("foldState — duplicate normalized ticket ids (Ruling D1, fix round 5,
     const lower = makeStoredTicket("ck-1", "To Do");
     const upper = makeStoredTicket("CK-1", "Done");
     const fine = makeStoredTicket("ck-2", "To Do");
-    const state = foldState([lower, upper, fine], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const state = foldState([lower, upper, fine], [], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets.map((t) => t.id as string)).toEqual(["ck-2"]);
     expect(state.duplicateTicketIds).toHaveLength(1);
@@ -740,12 +1054,32 @@ describe("foldState — duplicate normalized ticket ids (Ruling D1, fix round 5,
     const upper = makeStoredTicket("CK-1", "Done");
     const fine = makeStoredTicket("ck-2", "To Do");
 
-    const forward = foldState([lower, upper, fine], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
-    const reversed = foldState([fine, upper, lower], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const forward = foldState([lower, upper, fine], [], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
+    const reversed = foldState([fine, upper, lower], [], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
-    expect(reversed.tickets.map((t) => t.id as string)).toEqual(forward.tickets.map((t) => t.id as string));
-    expect(reversed.duplicateTicketIds.map((d) => ({ ...d, ticketId: d.ticketId as string, paths: [...d.paths].sort() }))).toEqual(
-      forward.duplicateTicketIds.map((d) => ({ ...d, ticketId: d.ticketId as string, paths: [...d.paths].sort() })),
+    expect(reversed.tickets.map((t) => t.id as string)).toEqual(
+      forward.tickets.map((t) => t.id as string),
+    );
+    expect(
+      reversed.duplicateTicketIds.map((d) => ({
+        ...d,
+        ticketId: d.ticketId as string,
+        paths: [...d.paths].sort(),
+      })),
+    ).toEqual(
+      forward.duplicateTicketIds.map((d) => ({
+        ...d,
+        ticketId: d.ticketId as string,
+        paths: [...d.paths].sort(),
+      })),
     );
   });
 });
@@ -753,8 +1087,16 @@ describe("foldState — duplicate normalized ticket ids (Ruling D1, fix round 5,
 describe("foldState — alias map", () => {
   test("a single-hop alias resolves to the current ticket", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
-    const alias = fixtureEvent({ event: "alias", ticket: "ck-1", from: "TASK-12", to: "ck-1" }, "2026-01", 0);
-    const state = foldState([ticket], [alias], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const alias = fixtureEvent(
+      { event: "alias", ticket: "ck-1", from: "TASK-12", to: "ck-1" },
+      "2026-01",
+      0,
+    );
+    const state = foldState([ticket], [alias], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.aliases).toEqual(["task-12"]);
   });
@@ -765,10 +1107,24 @@ describe("foldState — alias map", () => {
     // known alias (on-disk casing) — the event-derived lowercase "task-12"
     // must not duplicate it, but the event-derived "ck-1" (a genuinely new
     // alias the frontmatter doesn't know about) must still show up.
-    const ticket = makeStoredTicket("ck-2", "To Do", { cankan: { aliases: ["TASK-12"] } });
-    const hop1 = fixtureEvent({ event: "alias", ticket: "ck-1", from: "TASK-12", to: "ck-1" }, "2026-01", 0);
-    const hop2 = fixtureEvent({ event: "alias", ticket: "ck-2", from: "ck-1", to: "ck-2" }, "2026-01", 1);
-    const state = foldState([ticket], [hop1, hop2], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const ticket = makeStoredTicket("ck-2", "To Do", {
+      cankan: { aliases: ["TASK-12"] },
+    });
+    const hop1 = fixtureEvent(
+      { event: "alias", ticket: "ck-1", from: "TASK-12", to: "ck-1" },
+      "2026-01",
+      0,
+    );
+    const hop2 = fixtureEvent(
+      { event: "alias", ticket: "ck-2", from: "ck-1", to: "ck-2" },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [hop1, hop2], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.aliases).toEqual(["TASK-12", "ck-1"]);
   });
@@ -802,16 +1158,32 @@ describe("foldState — alias map", () => {
       line: 0,
       position: 0,
     } as unknown as EventRecord;
-    const state = foldState([ticket], [selfLoop], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const state = foldState([ticket], [selfLoop], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.aliases).toEqual(["ck-9"]);
   });
 
   test("a cycle in the alias data (a<->b, neither a real ticket) does not hang and resolves to nothing", () => {
     const ticket = makeStoredTicket("ck-1", "To Do");
-    const aToB = fixtureEvent({ event: "alias", ticket: "ck-x", from: "a", to: "b" }, "2026-01", 0);
-    const bToA = fixtureEvent({ event: "alias", ticket: "ck-x", from: "b", to: "a" }, "2026-01", 1);
-    const state = foldState([ticket], [aToB, bToA], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const aToB = fixtureEvent(
+      { event: "alias", ticket: "ck-x", from: "a", to: "b" },
+      "2026-01",
+      0,
+    );
+    const bToA = fixtureEvent(
+      { event: "alias", ticket: "ck-x", from: "b", to: "a" },
+      "2026-01",
+      1,
+    );
+    const state = foldState([ticket], [aToB, bToA], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.aliases).toEqual([]);
   });
@@ -831,16 +1203,32 @@ describe("foldState — alias map", () => {
     const forwardFirst = foldState(
       [ticket],
       [
-        fixtureEvent({ event: "alias", ticket: "ck-x", from: "a", to: "b" }, "2026-01", 0),
-        fixtureEvent({ event: "alias", ticket: "ck-x", from: "b", to: "a" }, "2026-01", 1),
+        fixtureEvent(
+          { event: "alias", ticket: "ck-x", from: "a", to: "b" },
+          "2026-01",
+          0,
+        ),
+        fixtureEvent(
+          { event: "alias", ticket: "ck-x", from: "b", to: "a" },
+          "2026-01",
+          1,
+        ),
       ],
       { now: 0, leaseTtlMs: 1000, firstSeen: new Map() },
     );
     const backwardFirst = foldState(
       [ticket],
       [
-        fixtureEvent({ event: "alias", ticket: "ck-x", from: "b", to: "a" }, "2026-01", 0),
-        fixtureEvent({ event: "alias", ticket: "ck-x", from: "a", to: "b" }, "2026-01", 1),
+        fixtureEvent(
+          { event: "alias", ticket: "ck-x", from: "b", to: "a" },
+          "2026-01",
+          0,
+        ),
+        fixtureEvent(
+          { event: "alias", ticket: "ck-x", from: "a", to: "b" },
+          "2026-01",
+          1,
+        ),
       ],
       { now: 0, leaseTtlMs: 1000, firstSeen: new Map() },
     );
@@ -851,7 +1239,9 @@ describe("foldState — alias map", () => {
     // "b" is listed as one of "a"'s aliases. Net: `a.eventAliases` is
     // `["b"]`, contributed by the `b -> a` edge alone.
     expect(forwardFirst.tickets[0]?.aliases).toEqual(["b"]);
-    expect(backwardFirst.tickets[0]?.aliases).toEqual(forwardFirst.tickets[0]?.aliases);
+    expect(backwardFirst.tickets[0]?.aliases).toEqual(
+      forwardFirst.tickets[0]?.aliases,
+    );
   });
 
   test("a real ticket sitting IN a 3-node alias cycle: per-node semantics are pinned, not incidental", () => {
@@ -869,10 +1259,26 @@ describe("foldState — alias map", () => {
     // three; a path-compression bug that collapsed the whole cycle to one
     // representative would instead produce all three.
     const ticket = makeStoredTicket("c", "To Do");
-    const aToB = fixtureEvent({ event: "alias", ticket: "ck-x", from: "a", to: "b" }, "2026-01", 0);
-    const bToC = fixtureEvent({ event: "alias", ticket: "ck-x", from: "b", to: "c" }, "2026-01", 1);
-    const cToA = fixtureEvent({ event: "alias", ticket: "ck-x", from: "c", to: "a" }, "2026-01", 2);
-    const state = foldState([ticket], [aToB, bToC, cToA], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const aToB = fixtureEvent(
+      { event: "alias", ticket: "ck-x", from: "a", to: "b" },
+      "2026-01",
+      0,
+    );
+    const bToC = fixtureEvent(
+      { event: "alias", ticket: "ck-x", from: "b", to: "c" },
+      "2026-01",
+      1,
+    );
+    const cToA = fixtureEvent(
+      { event: "alias", ticket: "ck-x", from: "c", to: "a" },
+      "2026-01",
+      2,
+    );
+    const state = foldState([ticket], [aToB, bToC, cToA], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets[0]?.aliases).toEqual(["a"]);
   });
@@ -899,25 +1305,45 @@ describe("foldState — alias map", () => {
     // to land on the same cached target) is what actually exercises that
     // branch — verified by deliberately reintroducing the mutant locally,
     // confirming this test then fails, and reverting (see the task report).
-    function agreesForEveryNode(pairs: ReadonlyArray<readonly [string, string]>, knownTicketIds: readonly string[]): void {
+    function agreesForEveryNode(
+      pairs: ReadonlyArray<readonly [string, string]>,
+      knownTicketIds: readonly string[],
+    ): void {
       const edges = new Map(pairs); // for the reference walk only — `.get()` doesn't care about insertion order
-      const knownTickets = knownTicketIds.map((id) => makeStoredTicket(id, "To Do"));
+      const knownTickets = knownTicketIds.map((id) =>
+        makeStoredTicket(id, "To Do"),
+      );
 
-      function checkInEventOrder(orderedPairs: ReadonlyArray<readonly [string, string]>): void {
+      function checkInEventOrder(
+        orderedPairs: ReadonlyArray<readonly [string, string]>,
+      ): void {
         const events = orderedPairs.map(([from, to], i) =>
-          fixtureEvent({ event: "alias", ticket: "ck-x", from, to }, "2026-01", i),
+          fixtureEvent(
+            { event: "alias", ticket: "ck-x", from, to },
+            "2026-01",
+            i,
+          ),
         );
-        const state = foldState(knownTickets, events, { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
-        const aliasesByTicket = new Map(state.tickets.map((t) => [t.id as string, t.aliases]));
+        const state = foldState(knownTickets, events, {
+          now: 0,
+          leaseTtlMs: 1000,
+          firstSeen: new Map(),
+        });
+        const aliasesByTicket = new Map(
+          state.tickets.map((t) => [t.id as string, t.aliases]),
+        );
 
         for (const from of edges.keys()) {
           const expectedTarget = resolveAliasTargetForTesting(edges, from);
           for (const knownId of knownTicketIds) {
             const shouldBeListed = knownId === expectedTarget;
-            const isListed = (aliasesByTicket.get(knownId) ?? []).includes(from);
-            expect(isListed, `${from} -> ${expectedTarget} (checked against known ticket ${knownId})`).toBe(
-              shouldBeListed,
+            const isListed = (aliasesByTicket.get(knownId) ?? []).includes(
+              from,
             );
+            expect(
+              isListed,
+              `${from} -> ${expectedTarget} (checked against known ticket ${knownId})`,
+            ).toBe(shouldBeListed);
           }
         }
       }
@@ -975,7 +1401,13 @@ describe("foldState — alias map", () => {
     // resolved node — the shape most directly designed to force the
     // adoption branch (a second component's walk lands on a sink an
     // earlier component already validated).
-    agreesForEveryNode([["p", "s"], ["q", "s"]], ["s"]);
+    agreesForEveryNode(
+      [
+        ["p", "s"],
+        ["q", "s"],
+      ],
+      ["s"],
+    );
   });
 });
 
@@ -983,7 +1415,11 @@ describe("foldState — output ordering and options validation", () => {
   test("tickets are sorted by normalized id, independent of input order", () => {
     const b = makeStoredTicket("ck-b", "To Do");
     const a = makeStoredTicket("ck-a", "To Do");
-    const state = foldState([b, a], [], { now: 0, leaseTtlMs: 1000, firstSeen: new Map() });
+    const state = foldState([b, a], [], {
+      now: 0,
+      leaseTtlMs: 1000,
+      firstSeen: new Map(),
+    });
 
     expect(state.tickets.map((t) => t.id as string)).toEqual(["ck-a", "ck-b"]);
   });
@@ -997,7 +1433,9 @@ describe("foldState — output ordering and options validation", () => {
       } catch (error) {
         threw = true;
         expect(isCanKanError(error)).toBe(true);
-        expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.INVALID_LEASE_TTL);
+        expect(isCanKanError(error) && error.code).toBe(
+          StateErrorCodes.INVALID_LEASE_TTL,
+        );
       }
       expect(threw).toBe(true);
     },
@@ -1013,7 +1451,12 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
         "2026-01",
         0,
       );
-      const state = await observeAndFold("test-board-key-1", [ticket], [claim], { now: 1000, leaseTtlMs: 10_000 });
+      const state = await observeAndFold(
+        "test-board-key-1",
+        [ticket],
+        [claim],
+        { now: 1000, leaseTtlMs: 10_000 },
+      );
 
       expect(state.tickets[0]?.lease?.firstSeenMs).toBe(1000);
       expect(state.tickets[0]?.lease?.expired).toBe(false);
@@ -1030,14 +1473,20 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
       );
       const boardKey = "test-board-key-2";
 
-      const first = await observeAndFold(boardKey, [ticket], [claim], { now: 1000, leaseTtlMs: 500 });
+      const first = await observeAndFold(boardKey, [ticket], [claim], {
+        now: 1000,
+        leaseTtlMs: 500,
+      });
       expect(first.tickets[0]?.lease?.firstSeenMs).toBe(1000);
       expect(first.tickets[0]?.lease?.expired).toBe(false);
 
       // Same event, observed again much later. If `observe()` moved the
       // recorded time to this call's `now`, the lease would read as live
       // forever. First-write-wins means it must now read as expired.
-      const second = await observeAndFold(boardKey, [ticket], [claim], { now: 100_000, leaseTtlMs: 500 });
+      const second = await observeAndFold(boardKey, [ticket], [claim], {
+        now: 100_000,
+        leaseTtlMs: 500,
+      });
       expect(second.tickets[0]?.lease?.firstSeenMs).toBe(1000);
       expect(second.tickets[0]?.lease?.expired).toBe(true);
     });
@@ -1052,7 +1501,10 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
         0,
       );
       const boardKey = "test-board-key-3";
-      const state = await observeAndFold(boardKey, [ticket], [renew], { now: 1000, leaseTtlMs: 10_000 });
+      const state = await observeAndFold(boardKey, [ticket], [renew], {
+        now: 1000,
+        leaseTtlMs: 10_000,
+      });
 
       // L8 (security review, corrects an over-tightened M1): the fold only
       // ever sees this window — the renew's own claim may have simply aged
@@ -1070,11 +1522,20 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
     await withEnv(undefined, async () => {
       const ticket = makeStoredTicket("ck-1", "To Do");
       const takeover = fixtureEvent(
-        { event: "takeover", ticket: "ck-1", lease_until: "2099-01-01T00:00:00Z" },
+        {
+          event: "takeover",
+          ticket: "ck-1",
+          lease_until: "2099-01-01T00:00:00Z",
+        },
         "2026-01",
         0,
       );
-      const state = await observeAndFold("test-board-key-4", [ticket], [takeover], { now: 1000, leaseTtlMs: 10_000 });
+      const state = await observeAndFold(
+        "test-board-key-4",
+        [ticket],
+        [takeover],
+        { now: 1000, leaseTtlMs: 10_000 },
+      );
 
       expect(state.tickets[0]?.lease?.kind).toBe("takeover");
       expect(state.tickets[0]?.lease?.expired).toBe(false);
@@ -1088,7 +1549,9 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
         await observeAndFold("test-board-key-5", [], [], { leaseTtlMs: 0 });
       } catch (error) {
         threw = true;
-        expect(isCanKanError(error) && error.code).toBe(StateErrorCodes.INVALID_LEASE_TTL);
+        expect(isCanKanError(error) && error.code).toBe(
+          StateErrorCodes.INVALID_LEASE_TTL,
+        );
       }
       expect(threw).toBe(true);
     });
@@ -1097,13 +1560,20 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
   test("I3 (security review): an orphaned claim (no matching ticket file) is never observed", async () => {
     await withEnv(undefined, async () => {
       const claim = fixtureEvent(
-        { event: "claim", ticket: "ck-ghost", lease_until: "2099-01-01T00:00:00Z" },
+        {
+          event: "claim",
+          ticket: "ck-ghost",
+          lease_until: "2099-01-01T00:00:00Z",
+        },
         "2026-01",
         0,
       );
       const boardKey = "test-board-key-6";
 
-      const state = await observeAndFold(boardKey, [], [claim], { now: 1000, leaseTtlMs: 10_000 });
+      const state = await observeAndFold(boardKey, [], [claim], {
+        now: 1000,
+        leaseTtlMs: 10_000,
+      });
 
       expect(state.orphanedEvents).toHaveLength(1);
       // No observation record was ever written for this id — `foldState`
@@ -1117,10 +1587,17 @@ describe("observeAndFold — the thin async wrapper (Ruling R7)", () => {
   test("code review minor: observeAndFold does NOT observe release/close/expire ids (only the three anchor kinds)", async () => {
     await withEnv(undefined, async () => {
       const ticket = makeStoredTicket("ck-1", "To Do");
-      const release = fixtureEvent({ event: "release", ticket: "ck-1" }, "2026-01", 0);
+      const release = fixtureEvent(
+        { event: "release", ticket: "ck-1" },
+        "2026-01",
+        0,
+      );
       const boardKey = "test-board-key-7";
 
-      const state = await observeAndFold(boardKey, [ticket], [release], { now: 1000, leaseTtlMs: 10_000 });
+      const state = await observeAndFold(boardKey, [ticket], [release], {
+        now: 1000,
+        leaseTtlMs: 10_000,
+      });
 
       expect(state.tickets[0]?.lease).toBeUndefined();
       // If `observeAndFold` over-observed (every lease-affecting kind,

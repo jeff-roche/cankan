@@ -174,3 +174,28 @@ export async function close(params: CloseParams): Promise<TicketEventResult> {
   await dispatchHooks(ctx, "close", stored.id, params.actor);
   return { ticket: stored.id, eventId: appended.event.id };
 }
+
+export interface ReopenParams {
+  readonly board: BoardRef;
+  readonly ticket: string;
+  readonly actor: ActorId;
+  readonly now?: number;
+}
+
+export async function reopen(params: ReopenParams): Promise<TicketEventResult> {
+  const now = params.now ?? Date.now();
+  const ctx = await resolveContext(params.board, now);
+  const stored = await requireTicket(ctx.store, params.ticket);
+  const appended = await append(
+    ctx.adapter,
+    ctx.ref,
+    {
+      event: "reopen",
+      ts: new Date(now).toISOString(),
+      actor: params.actor,
+      ticket: stored.id,
+    },
+    { now },
+  );
+  return { ticket: stored.id, eventId: appended.event.id };
+}

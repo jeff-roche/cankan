@@ -152,18 +152,12 @@
  * board's `columns` config, which this fold deliberately does not receive
  * and must not fetch. A `close` event instead sets a separate `closed:
  * true` (plus `closeReason?`) and leaves `status` alone. `closed` is
- * **sticky**: once any `close` event is observed for a ticket, `closed`
+ * **sticky** until a later `reopen`: once any `close` event is observed for a ticket, `closed`
  * stays `true` regardless of any later `move` — CONCEPT.md:529 says
  * `cankan close` "moves to last column," so a `move` landing *after* the
  * close in `(month, line)` order is that same close's own side effect, not
- * evidence of a reopen. **Gap, not fixed here:** CONCEPT.md:486/530 names a
- * `reopen` event kind and a `cankan reopen` command, but R1's twelve event
- * kinds (`events/schema.ts`) do not include `reopen` — there is currently no
- * event this fold could use to ever clear `closed` back to `false`. A
- * reopened ticket therefore still folds to `closed: true`, and
- * `queries.ts`'s `blockedBy` would treat it as satisfied when it may not be
- * — flagged for whichever dispatch adds a `reopen` event kind, not solved by
- * inventing one here.
+ * evidence of a reopen. A later `reopen` event explicitly clears the closed
+ * lifecycle state; the most recent lifecycle event wins by chain position.
  *
  * **Ruling R15 — events for tickets with no file are reported, never
  * dropped.** A `claim` on a ticket whose file was deleted, or which is not
@@ -270,7 +264,12 @@
  *   authorization decision, and no caller should either.
  */
 
-import { type Event, type EventId, type EventRecord, observe } from "../events/index";
+import {
+  type Event,
+  type EventId,
+  type EventRecord,
+  observe,
+} from "../events/index";
 import {
   type CankanBlock,
   normalizeTicketIdForComparison,
@@ -288,9 +287,18 @@ import { StateErrorCodes } from "./errors";
 /** The three event kinds that start or extend a lease (Ruling R7). */
 type LeaseAnchorKind = "claim" | "takeover" | "renew";
 
-const LEASE_ANCHOR_KINDS: ReadonlySet<string> = new Set<LeaseAnchorKind>(["claim", "takeover", "renew"]);
+const LEASE_ANCHOR_KINDS: ReadonlySet<string> = new Set<LeaseAnchorKind>([
+  "claim",
+  "takeover",
+  "renew",
+]);
 /** Every event kind that can end a lease outright, alongside the three above — the full set a ticket's most recent member of decides whether a lease is currently live. */
-const LEASE_AFFECTING_KINDS: ReadonlySet<string> = new Set([...LEASE_ANCHOR_KINDS, "release", "close", "expire"]);
+const LEASE_AFFECTING_KINDS: ReadonlySet<string> = new Set([
+  ...LEASE_ANCHOR_KINDS,
+  "release",
+  "close",
+  "expire",
+]);
 
 /**
  * A ticket's current lease, folded from the most recent `claim`/`takeover`/
@@ -353,7 +361,7 @@ export interface TicketState {
   readonly statusFromEvents: string | undefined;
   /** `statusFromEvents ?? statusFromFrontmatter` — the resolved status a caller should display by default. */
   readonly status: string;
-  /** `true` once any `close` event has been observed for this ticket — sticky (Ruling R14; see this file's own comment for the `reopen` gap). */
+  /** `true` when the most recent close/reopen lifecycle event is `close`. */
   readonly closed: boolean;
   /** The most recent `close` event's `reason`, if any close event carried one. */
   readonly closeReason: string | undefined;
@@ -417,7 +425,9 @@ export interface TicketState {
  * opposite for each: create the missing ticket, vs. delete or rename one of
  * the colliding files.
  */
-export type OrphanedTicketEventsCause = "no-matching-ticket" | "duplicate-ticket-id";
+export type OrphanedTicketEventsCause =
+  | "no-matching-ticket"
+  | "duplicate-ticket-id";
 
 /** One ticket id that had events pointing at it but no single `StoredTicket` they could be folded onto (Ruling R15, extended by Ruling D1). */
 export interface OrphanedTicketEvents {
@@ -589,7 +599,9 @@ function joinEventsToTickets(
   tickets: readonly StoredTicket[],
   events: readonly EventRecord[],
 ): JoinResult {
-  const knownIds = new Set<TicketIdLookupKey>(tickets.map((t) => normalizeTicketIdForComparison(t.id)));
+  const knownIds = new Set<TicketIdLookupKey>(
+    tickets.map((t) => normalizeTicketIdForComparison(t.id)),
+  );
   const byTicket = new Map<TicketIdLookupKey, EventRecord[]>();
   const orphaned = new Map<TicketIdLookupKey, number>();
 
@@ -708,12 +720,18 @@ type LeaseAnchorEvent = Extract<Event, { event: LeaseAnchorKind }>;
  * closing note) is what makes tolerating this bounded disagreement
  * acceptable rather than a mutual-exclusion violation in its own right.
  */
-function resolveLeaseAnchor(leaseAffecting: readonly EventRecord[]): LeaseAnchorEvent | undefined {
+function resolveLeaseAnchor(
+  leaseAffecting: readonly EventRecord[],
+): LeaseAnchorEvent | undefined {
   let anchor: LeaseAnchorEvent | undefined;
 
   for (let i = 0; i < leaseAffecting.length; i++) {
     const event = (leaseAffecting[i] as EventRecord).event;
-    if (event.event === "release" || event.event === "close" || event.event === "expire") {
+    if (
+      event.event === "release" ||
+      event.event === "close" ||
+      event.event === "expire"
+    ) {
       anchor = undefined;
     } else if (event.event === "claim" || event.event === "takeover") {
       anchor = event;
@@ -733,14 +751,17 @@ function foldLease(
   now: number,
   leaseTtlMs: number,
 ): LeaseState | undefined {
-  const leaseAffecting = sortedByChainPosition(bucket.filter((r) => LEASE_AFFECTING_KINDS.has(r.event.event)));
+  const leaseAffecting = sortedByChainPosition(
+    bucket.filter((r) => LEASE_AFFECTING_KINDS.has(r.event.event)),
+  );
   const anchor = resolveLeaseAnchor(leaseAffecting);
   if (anchor === undefined) {
     return undefined;
   }
 
   const firstSeenMs = firstSeenMap.get(anchor.id);
-  const expiresAtMs = firstSeenMs === undefined ? undefined : firstSeenMs + leaseTtlMs;
+  const expiresAtMs =
+    firstSeenMs === undefined ? undefined : firstSeenMs + leaseTtlMs;
   const expired = expiresAtMs === undefined ? true : now >= expiresAtMs;
 
   return {
@@ -766,7 +787,9 @@ interface StatusFold {
 
 function foldStatusAndClose(bucket: readonly EventRecord[]): StatusFold {
   const statusEvents = sortedByChainPosition(
-    bucket.filter((r) => r.event.event === "move" || r.event.event === "external-write"),
+    bucket.filter(
+      (r) => r.event.event === "move" || r.event.event === "external-write",
+    ),
   );
 
   let statusFromEvents: string | undefined;
@@ -781,10 +804,17 @@ function foldStatusAndClose(bucket: readonly EventRecord[]): StatusFold {
     }
   }
 
-  const closeEvents = sortedByChainPosition(bucket.filter((r) => r.event.event === "close"));
-  const closed = closeEvents.length > 0;
-  const lastClose = closeEvents[closeEvents.length - 1];
-  const closeReason = lastClose !== undefined && lastClose.event.event === "close" ? lastClose.event.reason : undefined;
+  const lifecycleEvents = sortedByChainPosition(
+    bucket.filter(
+      (r) => r.event.event === "close" || r.event.event === "reopen",
+    ),
+  );
+  const lastLifecycle = lifecycleEvents[lifecycleEvents.length - 1];
+  const closed = lastLifecycle?.event.event === "close";
+  const closeReason =
+    lastLifecycle?.event.event === "close"
+      ? lastLifecycle.event.reason
+      : undefined;
 
   return { statusFromEvents, closed, closeReason };
 }
@@ -860,7 +890,9 @@ function foldStatusAndClose(bucket: readonly EventRecord[]): StatusFold {
  * re-exported from `state/index.ts`; `buildAliasEventIndex` below is the
  * only production caller.
  */
-export function resolveAllAliasTargets(edges: ReadonlyMap<string, string>): Map<string, string> {
+export function resolveAllAliasTargets(
+  edges: ReadonlyMap<string, string>,
+): Map<string, string> {
   const resolved = new Map<string, string>();
 
   function resolveFrom(start: string): void {
@@ -939,7 +971,11 @@ export function resolveAllAliasTargets(edges: ReadonlyMap<string, string>): Map<
  * walk started from, which is what makes memoizing it across every tail
  * node in one shot correct.
  */
-function resolveCycleAndTail(resolved: Map<string, string>, path: readonly string[], cycleStart: number): void {
+function resolveCycleAndTail(
+  resolved: Map<string, string>,
+  path: readonly string[],
+  cycleStart: number,
+): void {
   const cycle = path.slice(cycleStart);
   const tail = path.slice(0, cycleStart);
 
@@ -964,7 +1000,10 @@ function resolveCycleAndTail(resolved: Map<string, string>, path: readonly strin
  * the two agree, node by node, rather than trusting the memoized version's
  * self-description.
  */
-export function resolveAliasTargetForTesting(edges: ReadonlyMap<string, string>, start: string): string {
+export function resolveAliasTargetForTesting(
+  edges: ReadonlyMap<string, string>,
+  start: string,
+): string {
   let current = start;
   const visited = new Set<string>([current]);
   for (;;) {
@@ -990,7 +1029,9 @@ function buildAliasEventIndex(
   events: readonly EventRecord[],
   knownIds: ReadonlySet<TicketIdLookupKey>,
 ): Map<TicketIdLookupKey, string[]> {
-  const aliasEvents = sortedByChainPosition(events.filter((r) => r.event.event === "alias"));
+  const aliasEvents = sortedByChainPosition(
+    events.filter((r) => r.event.event === "alias"),
+  );
   const edges = new Map<string, string>();
   for (const record of aliasEvents) {
     const event = record.event;
@@ -1025,7 +1066,10 @@ function buildAliasEventIndex(
   return result;
 }
 
-function mergeAliases(frontmatterAliases: readonly string[], eventAliases: readonly string[]): string[] {
+function mergeAliases(
+  frontmatterAliases: readonly string[],
+  eventAliases: readonly string[],
+): string[] {
   const seen = new Set<TicketIdLookupKey>();
   const merged: string[] = [];
   for (const alias of [...frontmatterAliases, ...eventAliases]) {
@@ -1077,7 +1121,9 @@ function partitionByDuplicateId(tickets: readonly StoredTicket[]): {
       duplicates.push({ ticketId, paths: group.map((t) => t.path).sort() });
     }
   }
-  duplicates.sort((a, b) => (a.ticketId < b.ticketId ? -1 : a.ticketId > b.ticketId ? 1 : 0));
+  duplicates.sort((a, b) =>
+    a.ticketId < b.ticketId ? -1 : a.ticketId > b.ticketId ? 1 : 0,
+  );
 
   return { unique, duplicates };
 }
@@ -1090,17 +1136,21 @@ export function foldState(
   validateLeaseTtlMs(options.leaseTtlMs);
   const { now, leaseTtlMs, firstSeen } = options;
 
-  const { unique: uniqueTickets, duplicates: duplicateTicketIds } = partitionByDuplicateId(tickets);
+  const { unique: uniqueTickets, duplicates: duplicateTicketIds } =
+    partitionByDuplicateId(tickets);
 
   const { byTicket, orphaned } = joinEventsToTickets(uniqueTickets, events);
-  const knownIds = new Set<TicketIdLookupKey>(uniqueTickets.map((t) => normalizeTicketIdForComparison(t.id)));
+  const knownIds = new Set<TicketIdLookupKey>(
+    uniqueTickets.map((t) => normalizeTicketIdForComparison(t.id)),
+  );
   const aliasEventIndex = buildAliasEventIndex(events, knownIds);
 
   const ticketStates: TicketState[] = uniqueTickets.map((stored) => {
     const key = normalizeTicketIdForComparison(stored.id);
     const bucket = byTicket.get(key) ?? [];
     const lease = foldLease(bucket, firstSeen, now, leaseTtlMs);
-    const { statusFromEvents, closed, closeReason } = foldStatusAndClose(bucket);
+    const { statusFromEvents, closed, closeReason } =
+      foldStatusAndClose(bucket);
     const statusFromFrontmatter = stored.ticket.frontmatter.status;
     const frontmatterAliases = stored.ticket.frontmatter.cankan?.aliases ?? [];
     const eventAliases = aliasEventIndex.get(key) ?? [];
@@ -1150,10 +1200,13 @@ export function foldState(
         ticketId,
         eventCount,
         cause: "no-matching-ticket" as const,
-        reason: "no ticket file in this checkout matches this event's ticket id",
+        reason:
+          "no ticket file in this checkout matches this event's ticket id",
       };
     })
-    .sort((a, b) => (a.ticketId < b.ticketId ? -1 : a.ticketId > b.ticketId ? 1 : 0));
+    .sort((a, b) =>
+      a.ticketId < b.ticketId ? -1 : a.ticketId > b.ticketId ? 1 : 0,
+    );
 
   return { tickets: ticketStates, orphanedEvents, duplicateTicketIds };
 }
@@ -1211,7 +1264,11 @@ export async function observeAndFold(
   // lease to), so observing them here would be the identical unreclaimable
   // write I3 already exists to prevent, just reached via a colliding id
   // instead of a missing one.
-  const knownIds = new Set<TicketIdLookupKey>(partitionByDuplicateId(tickets).unique.map((t) => normalizeTicketIdForComparison(t.id)));
+  const knownIds = new Set<TicketIdLookupKey>(
+    partitionByDuplicateId(tickets).unique.map((t) =>
+      normalizeTicketIdForComparison(t.id),
+    ),
+  );
   const idsToObserve = new Set<EventId>();
   for (const record of events) {
     if (!LEASE_ANCHOR_KINDS.has(record.event.event)) {
@@ -1229,5 +1286,9 @@ export async function observeAndFold(
     firstSeenMap.set(eventId, seenAt);
   }
 
-  return foldState(tickets, events, { now, leaseTtlMs: options.leaseTtlMs, firstSeen: firstSeenMap });
+  return foldState(tickets, events, {
+    now,
+    leaseTtlMs: options.leaseTtlMs,
+    firstSeen: firstSeenMap,
+  });
 }

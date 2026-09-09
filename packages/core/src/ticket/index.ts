@@ -23,9 +23,10 @@ export type {
   CloseParams,
   CreateParams,
   MoveParams,
+  ReopenParams,
   TicketEventResult,
 } from "./operations";
-export { close, create, move } from "./operations";
+export { close, create, move, reopen } from "./operations";
 export {
   type CankanBlock,
   type TicketFrontmatter,

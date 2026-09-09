@@ -21,14 +21,19 @@ test("M3.1 resolves a repo context and git actor fallback", async () => {
           expect(context.board.root).toBe(repo.dir);
           expect(context.actor.id).toBe("CanKan Test");
           expect(context.actor.source).toBe("git");
-          expect(contextSummary(context).output).toEqual({ mode: "json", quiet: false, verbose: false });
+          expect(contextSummary(context).output).toEqual({
+            mode: "json",
+            quiet: false,
+            verbose: false,
+          });
         } finally {
           context.core.dispose();
         }
       } finally {
         if (previousActor === undefined) delete process.env.CANKAN_ACTOR;
         else process.env.CANKAN_ACTOR = previousActor;
-        if (previousIdentity === undefined) delete process.env.CANKAN_IDENTITY__NAME;
+        if (previousIdentity === undefined)
+          delete process.env.CANKAN_IDENTITY__NAME;
         else process.env.CANKAN_IDENTITY__NAME = previousIdentity;
       }
     });
@@ -39,10 +44,38 @@ test("M3.1 resolves a repo context and git actor fallback", async () => {
 
 test("M3.1 output renders JSON and plain values", () => {
   const lines: string[] = [];
-  createOutput({ json: true, write: (line) => lines.push(line) }).write({ ok: true });
+  createOutput({ json: true, write: (line) => lines.push(line) }).write({
+    ok: true,
+  });
   expect(lines).toEqual(['{"ok":true}']);
 
   const plain: string[] = [];
-  createOutput({ plain: true, write: (line) => plain.push(line) }).write("ready");
+  createOutput({ plain: true, write: (line) => plain.push(line) }).write(
+    "ready",
+  );
   expect(plain).toEqual(["ready"]);
+});
+
+test("M3.1 strips terminal control characters from human-readable output", () => {
+  const lines: string[] = [];
+  createOutput({ plain: true, write: (line) => lines.push(line) }).write(
+    "safe\u001b]52;c;secret\u0007",
+  );
+  expect(lines).toEqual(["safe]52;c;secret"]);
+});
+
+test("M3.1 sanitizes human-readable object keys as well as values", () => {
+  const lines: string[] = [];
+  createOutput({ plain: true, write: (line) => lines.push(line) }).write({
+    "\u001b]8;;evil": "value",
+  });
+  expect(lines).toEqual(["]8;;evil\tvalue"]);
+});
+
+test("M3.1 escapes row and field separators inside human-readable values", () => {
+  const lines: string[] = [];
+  createOutput({ plain: true, write: (line) => lines.push(line) }).write(
+    "row\nspoof\tfield",
+  );
+  expect(lines).toEqual(["row\\nspoof\\tfield"]);
 });

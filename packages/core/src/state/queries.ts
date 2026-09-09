@@ -6,7 +6,10 @@
  * line reserves "combines ticket files and events" for `fold.ts` alone).
  */
 
-import { normalizeTicketIdForComparison, type TicketIdLookupKey } from "../store/index";
+import {
+  normalizeTicketIdForComparison,
+  type TicketIdLookupKey,
+} from "../store/index";
 import { CanKanError } from "../errors";
 import type { ActorId, TicketId } from "../types";
 import { StateErrorCodes } from "./errors";
@@ -17,7 +20,9 @@ import type { BoardState, TicketState } from "./fold";
  * Ruling R6's precedence rule already applied by the fold), not by
  * `statusFromFrontmatter` or `statusFromEvents` individually.
  */
-export function byStatus(state: BoardState): ReadonlyMap<string, readonly TicketState[]> {
+export function byStatus(
+  state: BoardState,
+): ReadonlyMap<string, readonly TicketState[]> {
   const grouped = new Map<string, TicketState[]>();
   for (const ticket of state.tickets) {
     const bucket = grouped.get(ticket.status);
@@ -38,7 +43,9 @@ export function byStatus(state: BoardState): ReadonlyMap<string, readonly Ticket
  * doc) is excluded here, exactly as it would be from `ready`'s "unclaimed"
  * check.
  */
-export function claimedBy(state: BoardState): ReadonlyMap<ActorId, readonly TicketState[]> {
+export function claimedBy(
+  state: BoardState,
+): ReadonlyMap<ActorId, readonly TicketState[]> {
   const grouped = new Map<ActorId, TicketState[]>();
   for (const ticket of state.tickets) {
     if (ticket.lease === undefined || ticket.lease.expired) {
@@ -128,12 +135,17 @@ function looksCrossBoard(id: string): boolean {
  * unresolved — the same fail-safe "still outstanding" direction as any
  * other unresolved id.
  */
-function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLookupKey, TicketState> {
+function buildIdentifierIndex(
+  tickets: readonly TicketState[],
+): Map<TicketIdLookupKey, TicketState> {
   const CONFLICT = Symbol("conflict");
   const index = new Map<TicketIdLookupKey, TicketState | typeof CONFLICT>();
 
   function addTier(keysFor: (ticket: TicketState) => readonly string[]): void {
-    const claimedThisTier = new Map<TicketIdLookupKey, TicketState | typeof CONFLICT>();
+    const claimedThisTier = new Map<
+      TicketIdLookupKey,
+      TicketState | typeof CONFLICT
+    >();
     for (const ticket of tickets) {
       for (const rawKey of keysFor(ticket)) {
         const key = normalizeTicketIdForComparison(rawKey);
@@ -184,14 +196,9 @@ function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLook
  * treated as still outstanding.
  *
  * **`closed` is event-only evidence, writable by anyone with push access to
- * the coordination ref, and — because no `reopen` event kind exists yet
- * (see `fold.ts`'s own `close`/`reopen` note) — irreversible.** Any
- * contributor appending one `close` event naming the blocker flips this
- * function's readiness verdict for every ticket that names it as a `blocks`
- * dep, permanently, regardless of what the blocker's own ticket file says.
- * This is not solvable at this layer without a `reopen` kind or a
- * corroborating signal this fold does not have — flagged here rather than
- * silently trusted (security review, Ruling I1 path A).
+ * the coordination ref.** A later `reopen` event can restore the blocker, so
+ * a forged close is no longer permanent; this remains advisory readiness data,
+ * not an authorization boundary.
  *
  * **Path A composes with the `eventAliases` tier (Ruling A6) into something
  * strictly larger than either alone — fix round 5, security review.** A6 on
@@ -203,7 +210,8 @@ function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLook
  * already-closed-or-closable ticket, then push an
  * `alias {from: <the unresolvable dep id>, to: <that closed ticket>}` — the
  * dep now resolves and reads satisfied. Two events, no repo write, and —
- * because `closed` cannot be reversed without a `reopen` kind — permanent.
+ * because `closed` can be reversed by a later `reopen` event — recoverable,
+ * although the attacker can still steer readiness until that recovery lands.
  * Each half was disclosed individually above and in
  * `BlockingDependency.resolvedTicket`'s own doc; stated here because the
  * union is what actually matters and neither half's own disclosure said so.
@@ -238,7 +246,10 @@ function buildIdentifierIndex(tickets: readonly TicketState[]): Map<TicketIdLook
  * detection across the whole graph is `dep add`'s job (CONCEPT.md §6), not
  * this query's.
  */
-export function blockedBy(state: BoardState, ticketId: TicketId): readonly BlockingDependency[] {
+export function blockedBy(
+  state: BoardState,
+  ticketId: TicketId,
+): readonly BlockingDependency[] {
   const key = normalizeTicketIdForComparison(ticketId);
 
   // Ruling D1 (fix round 6, security/code review): check
@@ -272,7 +283,9 @@ export function blockedBy(state: BoardState, ticketId: TicketId): readonly Block
   // `TICKET_ID_AMBIGUOUS` code as the `duplicateTicketIds` check above —
   // both are the identical fact (this id is ambiguous), reached by two
   // different routes.
-  const matches = state.tickets.filter((t) => normalizeTicketIdForComparison(t.id) === key);
+  const matches = state.tickets.filter(
+    (t) => normalizeTicketIdForComparison(t.id) === key,
+  );
   if (matches.length === 0) {
     throw new CanKanError(
       StateErrorCodes.TICKET_NOT_IN_BOARD_STATE,
@@ -298,7 +311,9 @@ export function blockedBy(state: BoardState, ticketId: TicketId): readonly Block
   const outstanding: BlockingDependency[] = [];
   for (const dep of deps) {
     if (dep.type !== "blocks") continue;
-    const resolvedTicket = looksCrossBoard(dep.id) ? undefined : index.get(normalizeTicketIdForComparison(dep.id));
+    const resolvedTicket = looksCrossBoard(dep.id)
+      ? undefined
+      : index.get(normalizeTicketIdForComparison(dep.id));
     const satisfied = resolvedTicket?.closed === true;
     if (!satisfied) {
       outstanding.push({ rawId: dep.id, resolvedTicket });

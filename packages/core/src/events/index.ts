@@ -34,6 +34,7 @@ export type {
   ParseEventOptions,
   ParseEventResult,
   ReleaseEvent,
+  ReopenEvent,
   RenewEvent,
   TakeoverEvent,
 } from "./schema";
@@ -46,7 +47,13 @@ export { EventErrorCodes } from "./errors";
 // No downstream task's brief asks for any of them as a standalone utility
 // (constraint 7).
 export { append, read } from "./log";
-export type { AppendedEvent, AppendOptions, EventCandidate, EventRecord, ReadOptions } from "./log";
+export type {
+  AppendedEvent,
+  AppendOptions,
+  EventCandidate,
+  EventRecord,
+  ReadOptions,
+} from "./log";
 
 export { initRef } from "./ref";
 export type { InitRefOptions } from "./ref";

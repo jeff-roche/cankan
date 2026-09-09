@@ -19,7 +19,11 @@
 import { monotonicFactory } from "ulid";
 import { CanKanError, isCanKanError } from "../errors";
 import type { CasRetryOptions, GitAdapter, RefSha } from "../git/index";
-import { GitErrorCodes, validateCoordinationRef, withCasRetry } from "../git/index";
+import {
+  GitErrorCodes,
+  validateCoordinationRef,
+  withCasRetry,
+} from "../git/index";
 import { EventErrorCodes } from "./errors";
 import { canonicalizeTicketId, isValidEventId, parseEvent } from "./schema";
 import type { Event, EventId, EventValidationIssue } from "./schema";
@@ -130,7 +134,9 @@ const MAX_BACKOFF_MS = 60_000;
  * (`git/retry.ts`'s `defaultBackoffMs`, capped at 1 second) is already
  * safe by construction and does not need wrapping.
  */
-function withValidatedBackoff(casRetry: CasRetryOptions | undefined): CasRetryOptions | undefined {
+function withValidatedBackoff(
+  casRetry: CasRetryOptions | undefined,
+): CasRetryOptions | undefined {
   const userBackoffMs = casRetry?.backoffMs;
   if (userBackoffMs === undefined) {
     return casRetry;
@@ -161,7 +167,11 @@ function withValidatedBackoff(casRetry: CasRetryOptions | undefined): CasRetryOp
  * this is a parameter-shape check, not a git-state check.
  */
 function validateTrailingMonths(trailingMonths: number): void {
-  if (!Number.isInteger(trailingMonths) || trailingMonths < 1 || trailingMonths > MAX_TRAILING_MONTHS) {
+  if (
+    !Number.isInteger(trailingMonths) ||
+    trailingMonths < 1 ||
+    trailingMonths > MAX_TRAILING_MONTHS
+  ) {
     throw new CanKanError(
       EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
       `trailingMonths must be an integer in [1, ${MAX_TRAILING_MONTHS}]`,
@@ -245,7 +255,13 @@ export function validateNowForDateFormatting(now: number): void {
     throw new CanKanError(
       EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
       `now must be within Date's representable range [-${MAX_DATE_MS}, ${MAX_DATE_MS}], got ${typeof now === "number" ? now : typeof now}`,
-      { details: { now: typeof now === "number" ? now : null, minValue: -MAX_DATE_MS, maxValue: MAX_DATE_MS } },
+      {
+        details: {
+          now: typeof now === "number" ? now : null,
+          minValue: -MAX_DATE_MS,
+          maxValue: MAX_DATE_MS,
+        },
+      },
     );
   }
 }
@@ -263,7 +279,13 @@ function validateNowForMinting(now: number): void {
     throw new CanKanError(
       EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
       `now must be within ulid's encodable range [0, ${MAX_ULID_TIME_MS}], got ${typeof now === "number" ? now : typeof now}`,
-      { details: { now: typeof now === "number" ? now : null, minValue: 0, maxValue: MAX_ULID_TIME_MS } },
+      {
+        details: {
+          now: typeof now === "number" ? now : null,
+          minValue: 0,
+          maxValue: MAX_ULID_TIME_MS,
+        },
+      },
     );
   }
 }
@@ -311,7 +333,10 @@ function validateSince(since: string): void {
     // `details` at all: report that the check failed, never the value
     // that failed it — the same discipline `ticket/filename.ts`'s
     // `assertSafeId` already applies.
-    throw new CanKanError(EventErrorCodes.EVENT_LOG_INVALID_WINDOW, "since must be a valid ULID event id");
+    throw new CanKanError(
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+      "since must be a valid ULID event id",
+    );
   }
 }
 
@@ -338,9 +363,13 @@ function validateSince(since: string): void {
  */
 function validateTicketFilter(ticket: string): void {
   if (typeof ticket !== "string") {
-    throw new CanKanError(EventErrorCodes.EVENT_LOG_INVALID_WINDOW, `ticket filter must be a string, got ${typeof ticket}`, {
-      details: { type: typeof ticket },
-    });
+    throw new CanKanError(
+      EventErrorCodes.EVENT_LOG_INVALID_WINDOW,
+      `ticket filter must be a string, got ${typeof ticket}`,
+      {
+        details: { type: typeof ticket },
+      },
+    );
   }
 }
 
@@ -357,7 +386,10 @@ function validateTicketFilter(ticket: string): void {
  * pure "compute the keys" helper with no error-raising responsibility of
  * its own.
  */
-function trailingMonthKeysOldestFirst(nowMs: number, trailingMonths: number): string[] {
+function trailingMonthKeysOldestFirst(
+  nowMs: number,
+  trailingMonths: number,
+): string[] {
   const keys: string[] = [];
   const d = new Date(nowMs);
   let year = d.getUTCFullYear();
@@ -421,12 +453,18 @@ const EVENTS_PREFIX = "events";
  * `diagnose()` (this is `read()`'s own fail-closed obligation, not a
  * non-aborting diagnostic).
  */
-async function isEventsPrefixBlocked(adapter: GitAdapter, validatedRef: string): Promise<boolean> {
+async function isEventsPrefixBlocked(
+  adapter: GitAdapter,
+  validatedRef: string,
+): Promise<boolean> {
   let existing: string | null;
   try {
     existing = await adapter.readBlobFromRef(validatedRef, EVENTS_PREFIX);
   } catch (cause) {
-    if (isCanKanError(cause) && cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS) {
+    if (
+      isCanKanError(cause) &&
+      cause.code === GitErrorCodes.GIT_BLOB_AMBIGUOUS
+    ) {
       const mode = cause.details?.mode;
       // Only a genuine directory (`040000`) is healthy — a symlink
       // (`120000`), a gitlink (`160000`), or any other shape sharing this
@@ -439,7 +477,11 @@ async function isEventsPrefixBlocked(adapter: GitAdapter, validatedRef: string):
   return existing !== null; // A real blob (non-null content, no throw) is blocked.
 }
 
-async function assertEventsPrefixUsable(adapter: GitAdapter, validatedRef: string, head: string): Promise<void> {
+async function assertEventsPrefixUsable(
+  adapter: GitAdapter,
+  validatedRef: string,
+  head: string,
+): Promise<void> {
   if (await isEventsPrefixBlocked(adapter, validatedRef)) {
     throw new CanKanError(
       EventErrorCodes.EVENT_LOG_EVENTS_PREFIX_BLOCKED,
@@ -617,7 +659,9 @@ export const MAX_AGGREGATE_READ_BYTES = 256 * 1024 * 1024;
 /** Flattens `EventValidationIssue[]` into plain strings (fix round 1, S5) — see the call sites' comments for why. */
 function renderIssues(issues: readonly EventValidationIssue[]): string[] {
   return issues.map((issue) =>
-    issue.path.length > 0 ? `${issue.path}: ${issue.message} (${issue.code})` : `${issue.message} (${issue.code})`,
+    issue.path.length > 0
+      ? `${issue.path}: ${issue.message} (${issue.code})`
+      : `${issue.message} (${issue.code})`,
   );
 }
 
@@ -693,7 +737,9 @@ const injectedClockUlidFactory = monotonicFactory();
  * generic alias, so `T` is a naked type parameter and the conditional does
  * distribute, producing a real per-kind union.
  */
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> & { readonly id?: EventId } : never;
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
+  ? Omit<T, K> & { readonly id?: EventId }
+  : never;
 export type EventCandidate = DistributiveOmit<Event, "id">;
 
 /**
@@ -729,7 +775,10 @@ function validateExpectedParent(expectedParent: unknown): void {
   if (expectedParent === undefined || expectedParent === null) {
     return;
   }
-  if (typeof expectedParent !== "string" || !SHA_SHAPE_PATTERN.test(expectedParent)) {
+  if (
+    typeof expectedParent !== "string" ||
+    !SHA_SHAPE_PATTERN.test(expectedParent)
+  ) {
     throw new CanKanError(
       EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
       `expectedParent must be undefined, null, or a 40-hex git object id, got ${typeof expectedParent === "string" ? "a malformed string" : typeof expectedParent}`,
@@ -1019,8 +1068,14 @@ export async function appendCore(
   options: AppendOptions,
   hooks: AppendHooks,
 ): Promise<AppendedEvent> {
-  if (options.onAppend !== undefined && typeof options.onAppend !== "function") {
-    throw new CanKanError(EventErrorCodes.EVENT_APPEND_INVALID_OPTION, "onAppend must be a function");
+  if (
+    options.onAppend !== undefined &&
+    typeof options.onAppend !== "function"
+  ) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+      "onAppend must be a function",
+    );
   }
   // Fix round 2 (Low, consistent with read()'s own reordering): the fm10
   // ref gate runs before any parameter-shape check, so a call carrying both
@@ -1046,13 +1101,23 @@ export async function appendCore(
   // same past-`isCanKanError` shape closed for `ticket` (fix round 4).
   // Its *return* value needed no separate check: a malformed minted id
   // already lands as `EVENT_APPEND_REJECTED` via `parseEvent`.
-  if (options.ulidFactory !== undefined && typeof options.ulidFactory !== "function") {
-    throw new CanKanError(EventErrorCodes.EVENT_APPEND_INVALID_OPTION, `ulidFactory must be a function, got ${typeof options.ulidFactory}`, {
-      details: { type: typeof options.ulidFactory },
-    });
+  if (
+    options.ulidFactory !== undefined &&
+    typeof options.ulidFactory !== "function"
+  ) {
+    throw new CanKanError(
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+      `ulidFactory must be a function, got ${typeof options.ulidFactory}`,
+      {
+        details: { type: typeof options.ulidFactory },
+      },
+    );
   }
-  const mint = options.ulidFactory ?? (options.now !== undefined ? injectedClockUlidFactory : defaultUlidFactory);
-  const maxExistingBlobBytes = options.maxExistingBlobBytes ?? MAX_MONTH_BLOB_BYTES;
+  const mint =
+    options.ulidFactory ??
+    (options.now !== undefined ? injectedClockUlidFactory : defaultUlidFactory);
+  const maxExistingBlobBytes =
+    options.maxExistingBlobBytes ?? MAX_MONTH_BLOB_BYTES;
   // Fix round 2 (Low) / fix round 4, Low 2: `NaN` would otherwise silently
   // disable the size cap (`existingBytes > NaN` is always `false`), and a
   // negative value would refuse even an empty month — see
@@ -1066,11 +1131,22 @@ export async function appendCore(
   // passed the pre-fix check and silently disabled the cap, TypeScript's
   // own type on this option notwithstanding (a boundary function is
   // reachable from less-strict callers than `tsc` polices).
-  if (typeof maxExistingBlobBytes !== "number" || Number.isNaN(maxExistingBlobBytes) || maxExistingBlobBytes < 0) {
+  if (
+    typeof maxExistingBlobBytes !== "number" ||
+    Number.isNaN(maxExistingBlobBytes) ||
+    maxExistingBlobBytes < 0
+  ) {
     throw new CanKanError(
       EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
       `maxExistingBlobBytes must be a non-negative number (or Infinity), got ${typeof maxExistingBlobBytes === "number" ? maxExistingBlobBytes : typeof maxExistingBlobBytes}`,
-      { details: { maxExistingBlobBytes: typeof maxExistingBlobBytes === "number" ? maxExistingBlobBytes : null } },
+      {
+        details: {
+          maxExistingBlobBytes:
+            typeof maxExistingBlobBytes === "number"
+              ? maxExistingBlobBytes
+              : null,
+        },
+      },
     );
   }
   // Fix round 5, Low D: `casRetry` itself being `null` slips past every
@@ -1081,7 +1157,10 @@ export async function appendCore(
   // before any of the field-level checks that would otherwise silently
   // treat `null` as "no override supplied."
   if (options.casRetry === null) {
-    throw new CanKanError(EventErrorCodes.EVENT_APPEND_INVALID_OPTION, "casRetry must be an object, got null");
+    throw new CanKanError(
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+      "casRetry must be an object, got null",
+    );
   }
   // Fix round 3 sweep, Ruling R27: `casRetry.maxAttempts` is forwarded
   // as-is to `withCasRetry` (`git/retry.ts`), which does not validate it
@@ -1089,7 +1168,12 @@ export async function appendCore(
   // failure shapes (`Infinity` hangs forever; `NaN`/`<= 0` fails every
   // attempt immediately) an unvalidated value produces.
   const casMaxAttempts = options.casRetry?.maxAttempts;
-  if (casMaxAttempts !== undefined && (!Number.isInteger(casMaxAttempts) || casMaxAttempts < 1 || casMaxAttempts > MAX_CAS_ATTEMPTS)) {
+  if (
+    casMaxAttempts !== undefined &&
+    (!Number.isInteger(casMaxAttempts) ||
+      casMaxAttempts < 1 ||
+      casMaxAttempts > MAX_CAS_ATTEMPTS)
+  ) {
     // Fix round 3 (Ruling R31/R32): `casMaxAttempts` is not yet known to be
     // a number here — `Number.isInteger` returns `false`, not a throw, for
     // any non-number — so interpolating it directly or copying it verbatim
@@ -1102,7 +1186,13 @@ export async function appendCore(
     throw new CanKanError(
       EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
       `casRetry.maxAttempts must be an integer in [1, ${MAX_CAS_ATTEMPTS}], got ${typeof casMaxAttempts === "number" ? casMaxAttempts : typeof casMaxAttempts}`,
-      { details: { maxAttempts: typeof casMaxAttempts === "number" ? casMaxAttempts : null, max: MAX_CAS_ATTEMPTS } },
+      {
+        details: {
+          maxAttempts:
+            typeof casMaxAttempts === "number" ? casMaxAttempts : null,
+          max: MAX_CAS_ATTEMPTS,
+        },
+      },
     );
   }
   // Fix round 5, High B: `casRetry.backoffMs`'s own *type*, checked here —
@@ -1118,9 +1208,13 @@ export async function appendCore(
   // matching every other option-shape check in this function.
   const casBackoffMs = options.casRetry?.backoffMs;
   if (casBackoffMs !== undefined && typeof casBackoffMs !== "function") {
-    throw new CanKanError(EventErrorCodes.EVENT_APPEND_INVALID_OPTION, `casRetry.backoffMs must be a function, got ${typeof casBackoffMs}`, {
-      details: { type: typeof casBackoffMs },
-    });
+    throw new CanKanError(
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+      `casRetry.backoffMs must be a function, got ${typeof casBackoffMs}`,
+      {
+        details: { type: typeof casBackoffMs },
+      },
+    );
   }
   // Fix round 5, Low D: `casRetry.sleep`'s own type — its *behavior* once
   // confirmed to be a function remains entirely the caller's
@@ -1132,9 +1226,13 @@ export async function appendCore(
   // for.
   const casSleep = options.casRetry?.sleep;
   if (casSleep !== undefined && typeof casSleep !== "function") {
-    throw new CanKanError(EventErrorCodes.EVENT_APPEND_INVALID_OPTION, `casRetry.sleep must be a function, got ${typeof casSleep}`, {
-      details: { type: typeof casSleep },
-    });
+    throw new CanKanError(
+      EventErrorCodes.EVENT_APPEND_INVALID_OPTION,
+      `casRetry.sleep must be a function, got ${typeof casSleep}`,
+      {
+        details: { type: typeof casSleep },
+      },
+    );
   }
   // M2.10 slice 0: `expectedParent`'s own shape, checked here alongside
   // every other option-shape check — see `validateExpectedParent`'s doc
@@ -1193,21 +1291,32 @@ export async function appendCore(
   try {
     line = JSON.stringify(withId);
   } catch (cause) {
-    throw new CanKanError(EventErrorCodes.EVENT_APPEND_REJECTED, "event could not be serialized to JSON before append", {
-      cause,
-      details: { reason: "unserializable" },
-    });
+    throw new CanKanError(
+      EventErrorCodes.EVENT_APPEND_REJECTED,
+      "event could not be serialized to JSON before append",
+      {
+        cause,
+        details: { reason: "unserializable" },
+      },
+    );
   }
   const parsed = parseEvent(line, { now });
   if (!parsed.ok) {
-    throw new CanKanError(EventErrorCodes.EVENT_APPEND_REJECTED, "event failed schema validation before append", {
-      // Fix round 1, S5: flattened to strings — `errors.ts`'s flatness
-      // policy ("JSON primitives, or arrays of them") applies to `details`,
-      // and `EventValidationIssue[]` is an array of objects that would
-      // otherwise stay aliased to zod's own (mutable) issue objects despite
-      // this error's shallow freeze.
-      details: { reason: parsed.error.reason, issues: renderIssues(parsed.error.issues) },
-    });
+    throw new CanKanError(
+      EventErrorCodes.EVENT_APPEND_REJECTED,
+      "event failed schema validation before append",
+      {
+        // Fix round 1, S5: flattened to strings — `errors.ts`'s flatness
+        // policy ("JSON primitives, or arrays of them") applies to `details`,
+        // and `EventValidationIssue[]` is an array of objects that would
+        // otherwise stay aliased to zod's own (mutable) issue objects despite
+        // this error's shallow freeze.
+        details: {
+          reason: parsed.error.reason,
+          issues: renderIssues(parsed.error.issues),
+        },
+      },
+    );
   }
   const event = parsed.event;
   const month = monthKeyUtc(now);
@@ -1237,7 +1346,13 @@ export async function appendCore(
       throw new CanKanError(
         EventErrorCodes.EVENT_APPEND_STALE_PARENT,
         "expectedParent no longer matches the ref's current tip; re-read and re-check before appending again",
-        { details: { ref: validatedRef, expectedParent, actualParent: parentSha } },
+        {
+          details: {
+            ref: validatedRef,
+            expectedParent,
+            actualParent: parentSha,
+          },
+        },
       );
     }
 
@@ -1265,9 +1380,20 @@ export async function appendCore(
       // is only ever populated when `parentSha !== null`, a few lines
       // above), and it is module-derived (this function's own `readRef`
       // result), never peer-authored content.
-      throw new CanKanError(EventErrorCodes.EVENT_LOG_BLOB_TOO_LARGE, `month file exceeds the maximum blob size, refusing to extend it: ${path}`, {
-        details: { ref: validatedRef, commit: parentSha, month, path, bytes: existingBytes, maxBytes: maxExistingBlobBytes },
-      });
+      throw new CanKanError(
+        EventErrorCodes.EVENT_LOG_BLOB_TOO_LARGE,
+        `month file exceeds the maximum blob size, refusing to extend it: ${path}`,
+        {
+          details: {
+            ref: validatedRef,
+            commit: parentSha,
+            month,
+            path,
+            bytes: existingBytes,
+            maxBytes: maxExistingBlobBytes,
+          },
+        },
+      );
     }
 
     // The "check" half of read-check-build, generalized: this attempt's
@@ -1301,7 +1427,7 @@ export async function appendCore(
       parent: parentSha,
       // Commit message carries only values this function itself validated —
       // `event.id` (ULID grammar, no escape-capable character) and
-      // `event.event` (one of twelve fixed literals) — never a caller-
+      // `event.event` (one of the fixed literals) — never a caller-
       // supplied free-text field.
       message: `event ${event.id} ${event.event}`,
       files: [{ path, content: newContent }],
@@ -1310,7 +1436,10 @@ export async function appendCore(
     if (outcome.outcome === "applied") {
       try {
         const result = options.onAppend?.();
-        if (result !== undefined && typeof (result as unknown as { then?: unknown }).then === "function") {
+        if (
+          result !== undefined &&
+          typeof (result as unknown as { then?: unknown }).then === "function"
+        ) {
           void (result as unknown as Promise<unknown>).catch(() => undefined);
         }
       } catch {
@@ -1360,7 +1489,14 @@ export async function appendCore(
       throw new CanKanError(
         EventErrorCodes.EVENT_APPEND_STALE_PARENT,
         "expectedParent's compare-and-swap was rejected by a concurrent writer; re-read and re-check before appending again",
-        { details: { ref: validatedRef, expectedParent, actualParent, actualParentUnread } },
+        {
+          details: {
+            ref: validatedRef,
+            expectedParent,
+            actualParent,
+            actualParentUnread,
+          },
+        },
       );
     }
     return { done: false };
@@ -1550,7 +1686,11 @@ export interface ReadOptions {
  * `ref.ts`'s `initRef`'s job; syncing it from a remote is the sync layer's.
  * An absent ref genuinely has no events yet, and `[]` says exactly that.
  */
-export async function read(adapter: GitAdapter, ref: string, options: ReadOptions | null = {}): Promise<readonly EventRecord[]> {
+export async function read(
+  adapter: GitAdapter,
+  ref: string,
+  options: ReadOptions | null = {},
+): Promise<readonly EventRecord[]> {
   // Fix round 3 (Ruling R31/R32, orchestrator security review): a default
   // parameter does not apply to an explicit `null` — confirmed by probe,
   // `read(adapter, ref, null)` previously threw a raw `TypeError` on
@@ -1610,7 +1750,10 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
   // Keyed by event id, to the raw line text it was first seen as — the
   // dedup comparison basis (obligation B, decided below) — and the index
   // into `records` where its one surviving record lives.
-  const seen = new Map<EventId, { readonly rawLine: string; readonly recordIndex: number }>();
+  const seen = new Map<
+    EventId,
+    { readonly rawLine: string; readonly recordIndex: number }
+  >();
   const records: EventRecord[] = [];
   let nextPosition = 0;
   // Fix round 1, S2: the sum of every trailing month's blob size in this
@@ -1627,16 +1770,36 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
 
     const rawBytes = Buffer.byteLength(raw, "utf8");
     if (rawBytes > MAX_MONTH_BLOB_BYTES) {
-      throw new CanKanError(EventErrorCodes.EVENT_LOG_BLOB_TOO_LARGE, `month file exceeds the maximum blob size: ${path}`, {
-        details: { ref: validatedRef, commit: head, month, path, bytes: rawBytes, maxBytes: MAX_MONTH_BLOB_BYTES },
-      });
+      throw new CanKanError(
+        EventErrorCodes.EVENT_LOG_BLOB_TOO_LARGE,
+        `month file exceeds the maximum blob size: ${path}`,
+        {
+          details: {
+            ref: validatedRef,
+            commit: head,
+            month,
+            path,
+            bytes: rawBytes,
+            maxBytes: MAX_MONTH_BLOB_BYTES,
+          },
+        },
+      );
     }
     aggregateBytes += rawBytes;
     if (aggregateBytes > MAX_AGGREGATE_READ_BYTES) {
       throw new CanKanError(
         EventErrorCodes.EVENT_LOG_AGGREGATE_TOO_LARGE,
         `the aggregated read window exceeds the maximum total size across ${months.length} month(s)`,
-        { details: { ref: validatedRef, commit: head, month, path, aggregateBytes, maxAggregateBytes: MAX_AGGREGATE_READ_BYTES } },
+        {
+          details: {
+            ref: validatedRef,
+            commit: head,
+            month,
+            path,
+            aggregateBytes,
+            maxAggregateBytes: MAX_AGGREGATE_READ_BYTES,
+          },
+        },
       );
     }
 
@@ -1648,9 +1811,21 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
       // therefore before `JSON.parse` — ever sees this line.
       const lineBytes = Buffer.byteLength(rawLine, "utf8");
       if (lineBytes > MAX_LINE_BYTES) {
-        throw new CanKanError(EventErrorCodes.EVENT_LOG_LINE_TOO_LARGE, `event log line exceeds the maximum size: ${path}:${line}`, {
-          details: { ref: validatedRef, commit: head, month, path, line, bytes: lineBytes, maxBytes: MAX_LINE_BYTES },
-        });
+        throw new CanKanError(
+          EventErrorCodes.EVENT_LOG_LINE_TOO_LARGE,
+          `event log line exceeds the maximum size: ${path}:${line}`,
+          {
+            details: {
+              ref: validatedRef,
+              commit: head,
+              month,
+              path,
+              line,
+              bytes: lineBytes,
+              maxBytes: MAX_LINE_BYTES,
+            },
+          },
+        );
       }
 
       const parsed = parseEvent(rawLine, { now });
@@ -1700,17 +1875,21 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
           continue; // The same event, appended twice — folded into the one record already recorded.
         }
         const first = records[previous.recordIndex];
-        throw new CanKanError(EventErrorCodes.EVENT_LOG_DUPLICATE_ID_CONFLICT, `duplicate event id with differing content: ${event.id}`, {
-          details: {
-            ref: validatedRef,
-            commit: head,
-            id: event.id,
-            firstMonth: first?.month,
-            firstLine: first?.line,
-            month,
-            line,
+        throw new CanKanError(
+          EventErrorCodes.EVENT_LOG_DUPLICATE_ID_CONFLICT,
+          `duplicate event id with differing content: ${event.id}`,
+          {
+            details: {
+              ref: validatedRef,
+              commit: head,
+              id: event.id,
+              firstMonth: first?.month,
+              firstLine: first?.line,
+              month,
+              line,
+            },
           },
-        });
+        );
       }
 
       seen.set(event.id, { rawLine, recordIndex: records.length });
@@ -1720,7 +1899,8 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
   }
 
   const since = opts.since;
-  const ticket = opts.ticket === undefined ? undefined : canonicalizeTicketId(opts.ticket);
+  const ticket =
+    opts.ticket === undefined ? undefined : canonicalizeTicketId(opts.ticket);
   const actor = opts.actor;
 
   const filtered = records.filter((record) => {
@@ -1736,5 +1916,7 @@ export async function read(adapter: GitAdapter, ref: string, options: ReadOption
     return true;
   });
 
-  return filtered.sort((a, b) => (a.event.id < b.event.id ? -1 : a.event.id > b.event.id ? 1 : 0));
+  return filtered.sort((a, b) =>
+    a.event.id < b.event.id ? -1 : a.event.id > b.event.id ? 1 : 0,
+  );
 }
